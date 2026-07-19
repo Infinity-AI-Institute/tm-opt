@@ -6,3 +6,5 @@ experiments/*.log
 baseline_vllm.log
 serve.log
 build/
+*.safetensors
+*.whl
