@@ -1,0 +1,12 @@
+{
+  "experiment_id": "exp-0001",
+  "hypothesis": "MoE grouped-GEMM tile 128x64 instead of 128x128 improves decode at high concurrency",
+  "base_branch": "main",
+  "patch_file": "experiments/patches/exp-0001.patch",
+  "build_cmd": "cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j",
+  "serve_cmd": "./build/inkling_serve --model /workspace/models/inkling-nvfp4 --port {port}",
+  "model_name": "inkling",
+  "model_dir": "/workspace/models/inkling-nvfp4",
+  "concurrency": 128,
+  "max_tokens": 256
+}
