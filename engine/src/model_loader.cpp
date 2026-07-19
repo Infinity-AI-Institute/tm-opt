@@ -10,9 +10,11 @@
  *         target, header-only). Chosen over a bespoke parser: config parsing
  *         is startup-only, correctness-critical, and not performance-relevant.
  */
-#include <cstdio>      //for fprintf
-#include <cstdlib>     //for abort
-#include <fstream>     //for std::ifstream
+#include <cstdio> 
+#include <cmath>     
+#include <cstdlib>     
+#include <fstream>   
+#include <algorithm>  
 #include <nlohmann/json.hpp>  //for json parsing (FetchContent target)
 
 #include "tmopt/config.h"
@@ -52,6 +54,25 @@ struct Verifier {
             std::fprintf(stderr, "[config] MISMATCH %-28s checkpoint=%s header=%s\n",
                          key, j.at(key).dump().c_str(),
                          json(expected).dump().c_str());
+            ++mismatches;
+        }
+    }
+
+
+    void check(const json &j, const char *key, float expected)
+    {
+        if (!j.contains(key)) {
+            std::fprintf(stderr, "[config] MISSING  %-28s (expected %g)\n",
+                         key, expected);
+            ++mismatches;
+            return;
+        }
+        const double got = j.at(key).get<double>();
+        const double rel = std::fabs(got - expected) /
+                           std::max(std::fabs(got), 1e-30);
+        if (rel > 1e-6) {   //float has ~7 significant digits; 1e-6 rel is strict
+            std::fprintf(stderr, "[config] MISMATCH %-28s checkpoint=%.17g header=%.9g\n",
+                         key, got, expected);
             ++mismatches;
         }
     }
