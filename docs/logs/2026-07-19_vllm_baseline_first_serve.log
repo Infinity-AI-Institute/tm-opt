@@ -1,0 +1,869 @@
+(venv) root@70e466497cb1:/# bash /workspace/tm-opt/scripts/serve_vllm_baseline.sh
+(APIServer pid=26253) INFO 07-19 02:16:00 [api_utils.py:345]
+(APIServer pid=26253) INFO 07-19 02:16:00 [api_utils.py:345]        █     █     █▄   ▄█
+(APIServer pid=26253) INFO 07-19 02:16:00 [api_utils.py:345]  ▄▄ ▄█ █     █     █ ▀▄▀ █  version 0.23.1rc1.dev1270+g9243e0124
+(APIServer pid=26253) INFO 07-19 02:16:00 [api_utils.py:345]   █▄█▀ █     █     █     █  model   /workspace/models/inkling-nvfp4
+(APIServer pid=26253) INFO 07-19 02:16:00 [api_utils.py:345]    ▀▀  ▀▀▀▀▀ ▀▀▀▀▀ ▀     ▀
+(APIServer pid=26253) INFO 07-19 02:16:00 [api_utils.py:345]
+(APIServer pid=26253) INFO 07-19 02:16:00 [api_utils.py:273] non-default args: {'model_tag': '/workspace/models/inkling-nvfp4', 'port': 8106, 'model': '/workspace/models/inkling-nvfp4', 'tokenizer_mode': 'inkling', 'tru
+st_remote_code': True, 'max_model_len': 16384, 'reasoning_parser': 'inkling', 'tensor_parallel_size': 4}
+(APIServer pid=26253) INFO 07-19 02:16:00 [model.py:623] Resolved architecture: InklingForConditionalGeneration
+(APIServer pid=26253) INFO 07-19 02:16:00 [model.py:1788] Using max model len 16384
+(APIServer pid=26253) WARNING 07-19 02:16:01 [torch_utils.py:355] WARNING: Unknown kv_cache_quant_algo 'none' in model config. Supported values: ['fp8', 'nvfp4']. Falling back to 'auto'.
+(APIServer pid=26253) INFO 07-19 02:16:01 [scheduler.py:252] Chunked prefill is enabled with max_num_batched_tokens=8192.
+(APIServer pid=26253) WARNING 07-19 02:16:01 [modelopt.py:1034] Detected ModelOpt NVFP4 checkpoint (quant_algo=NVFP4). Please note that the format is experimental and could change in future.
+(APIServer pid=26253) INFO 07-19 02:16:01 [vllm.py:1109] Asynchronous scheduling is enabled.
+(APIServer pid=26253) INFO 07-19 02:16:01 [vllm.py:1197] Auto-enabling VLLM_USE_BREAKABLE_CUDAGRAPH=1. Set VLLM_USE_BREAKABLE_CUDAGRAPH=0 to opt out.
+(APIServer pid=26253) WARNING 07-19 02:16:01 [vllm.py:1203] VLLM_USE_BREAKABLE_CUDAGRAPH is set, disabling vLLM's torch.compile pipeline. Equivalent to -cc.mode=none.
+(APIServer pid=26253) WARNING 07-19 02:16:01 [vllm.py:1213] Inductor compilation was disabled by user settings, optimizations settings that are only active during inductor compilation will be ignored.
+(APIServer pid=26253) INFO 07-19 02:16:01 [kernel.py:295] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native'])
+(APIServer pid=26253) WARNING 07-19 02:16:01 [vllm.py:2227] Model Runner V2 does not yet support the thinking_token_budget request parameter. Set VLLM_USE_V2_MODEL_RUNNER=0 if this is required.
+(APIServer pid=26253) INFO 07-19 02:16:09 [compilation.py:329] Enabled custom fusions: norm_quant, act_quant, allreduce_rms
+(EngineCore pid=27010) INFO 07-19 02:16:16 [core.py:116] Initializing a V1 LLM engine (v0.23.1rc1.dev1270+g9243e0124) with config: model='/workspace/models/inkling-nvfp4', speculative_config=None, tokenizer='/workspace/
+models/inkling-nvfp4', skip_tokenizer_init=False, tokenizer_mode=inkling, revision=None, tokenizer_revision=None, trust_remote_code=True, dtype=torch.bfloat16, max_seq_len=16384, download_dir=None, load_format=auto, ten
+sor_parallel_size=4, pipeline_parallel_size=1, data_parallel_size=1, decode_context_parallel_size=1, dcp_comm_backend=ag_rs, disable_custom_all_reduce=False, quantization=modelopt_fp4, quantization_config=None, enforce_
+eager=False, enable_return_routed_experts=False, kv_cache_dtype=auto, device_config=cuda, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_any_whitespace=False, disable_additional_properties=Fal
+se, reasoning_parser='inkling', reasoning_parser_plugin='', enable_in_reasoning=False), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=N
+one, kv_cache_metrics=False, kv_cache_metrics_sample=0.01, cudagraph_metrics=False, enable_layerwise_nvtx_tracing=False, enable_mfu_metrics=False, enable_mm_processor_stats=False, enable_logging_iteration_details=False,
+ jit_monitor_mode='warn', jit_monitor_verbose=False), seed=0, served_model_name=/workspace/models/inkling-nvfp4, enable_prefix_caching=True, enable_chunked_prefill=True, pooler_config=None, compilation_config={'mode': <
+CompilationMode.NONE: 0>, 'debug_dump_path': None, 'cache_dir': '', 'compile_cache_save_format': 'binary', 'backend': 'inductor', 'custom_ops': ['all'], 'ir_enable_torch_wrap': False, 'splitting_ops': [], 'compile_mm_en
+coder': False, 'cudagraph_mm_encoder': False, 'encoder_cudagraph_token_budgets': [], 'encoder_cudagraph_max_vision_items_per_batch': 0, 'encoder_cudagraph_max_frames_per_batch': None, 'compile_sizes': [], 'compile_range
+s_endpoints': [5461, 8192], 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'size_asserts': False, 'alignment_asserts': False, 'scalar_asserts': False, 'combo_kernels': True, 'benchmark_combo_kernel'
+: True}, 'inductor_passes': {}, 'cudagraph_mode': <CUDAGraphMode.FULL_AND_PIECEWISE: (2, 1)>, 'cudagraph_num_of_warmups': 1, 'cudagraph_capture_sizes': [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112,
+120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256, 272, 288, 304, 320, 336, 352, 368, 384, 400, 416, 432, 448, 464, 480, 496, 512], 'cudagraph_copy_inputs': False, 'cudagraph_speci
+alize_lora': True, 'use_inductor_graph_partition': False, 'pass_config': {'fuse_norm_quant': True, 'fuse_act_quant': True, 'fuse_attn_quant': False, 'enable_sp': False, 'fuse_gemm_comms': False, 'fuse_allreduce_rms': Tr
+ue, 'enable_qk_norm_rope_fusion': False, 'fuse_rope_kvcache_cat_mla': False, 'fuse_act_padding': False, 'fuse_qk_norm_rope_kvcache': False}, 'max_cudagraph_capture_size': 512, 'dynamic_shapes_config': {'type': <DynamicS
+hapesType.BACKED: 'backed'>, 'evaluate_guards': False, 'assume_32_bit_indexing': False}, 'local_cache_dir': None, 'fast_moe_cold_start': False, 'static_all_moe_layers': []}, kernel_config=KernelConfig(ir_op_priority=IrO
+pPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native']), enable_flashinfer_autotune=True, enable_cutedsl_warmup=True, enable_bf16x3_router_gemm=False, moe_backend='auto', linear_backend='
+auto')
+(EngineCore pid=27010) WARNING 07-19 02:16:16 [multiproc_executor.py:1070] Reducing Torch parallelism from 172 threads to 1 to avoid unnecessary CPU contention. Set OMP_NUM_THREADS in the external environment to tune th
+is value as needed.
+(EngineCore pid=27010) INFO 07-19 02:16:16 [multiproc_executor.py:140] DP group leader: node_rank=0, node_rank_within_dp=0, master_addr=127.0.0.1, mq_connect_ip=172.19.0.2 (local), world_size=4, local_world_size=4
+(Worker pid=27292) INFO 07-19 02:16:29 [parallel_state.py:1615] world_size=4 rank=0 local_rank=0 distributed_init_method=tcp://127.0.0.1:52587 backend=nccl
+(Worker pid=27294) INFO 07-19 02:16:29 [parallel_state.py:1615] world_size=4 rank=2 local_rank=2 distributed_init_method=tcp://127.0.0.1:52587 backend=nccl
+(Worker pid=27293) INFO 07-19 02:16:30 [parallel_state.py:1615] world_size=4 rank=1 local_rank=1 distributed_init_method=tcp://127.0.0.1:52587 backend=nccl
+(Worker pid=27295) INFO 07-19 02:16:30 [parallel_state.py:1615] world_size=4 rank=3 local_rank=3 distributed_init_method=tcp://127.0.0.1:52587 backend=nccl
+(Worker pid=27292) INFO 07-19 02:16:30 [pynccl.py:113] vLLM is using nccl==2.28.9
+(Worker pid=27292) INFO 07-19 02:16:33 [cuda_communicator.py:264] Using ['CUSTOM', 'SYMM_MEM', 'PYNCCL'] all-reduce backends (in dispatch order) for group 'tp:0' out of potential backends: ['NCCL_SYMM_MEM', 'QUICK_REDUC
+E', 'FLASHINFER', 'AITER_CUSTOM', 'CUSTOM', 'SYMM_MEM', 'PYNCCL'].
+(Worker pid=27292) INFO 07-19 02:16:34 [cuda_communicator.py:264] Using ['PYNCCL'] all-reduce backends (in dispatch order) for group 'ep:0' out of potential backends: ['NCCL_SYMM_MEM', 'QUICK_REDUCE', 'FLASHINFER', 'AIT
+ER_CUSTOM', 'CUSTOM', 'SYMM_MEM', 'PYNCCL'].
+(Worker pid=27292) INFO 07-19 02:16:34 [parallel_state.py:1950] rank 0 in world size 4 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, EP rank 0, EPLB rank N/A
+(Worker pid=27292) INFO 07-19 02:16:34 [gpu_worker.py:378] Using V2 Model Runner
+(Worker_TP2 pid=27294) INFO 07-19 02:16:35 [model_runner.py:281] Loading model from scratch...
+(Worker_TP3 pid=27295) INFO 07-19 02:16:35 [model_runner.py:281] Loading model from scratch...
+(Worker_TP0 pid=27292) INFO 07-19 02:16:35 [model_runner.py:281] Loading model from scratch...
+(Worker_TP1 pid=27293) INFO 07-19 02:16:35 [model_runner.py:281] Loading model from scratch...
+(Worker_TP0 pid=27292) INFO 07-19 02:16:35 [unquantized.py:302] Using FlashInfer CUTLASS Unquantized MoE backend out of potential backends: ['FlashInfer TRTLLM', 'FlashInfer CUTLASS', 'TRITON', 'BATCHED_TRITON'].
+(Worker_TP0 pid=27292) INFO 07-19 02:16:35 [nvfp4.py:285] Using 'FLASHINFER_TRTLLM' NvFp4 MoE backend out of potential backends: ['FLASHINFER_TRTLLM', 'FLASHINFER_CUTEDSL', 'FLASHINFER_CUTEDSL_BATCHED', 'FLASHINFER_CUTL
+ASS', 'VLLM_CUTLASS', 'MARLIN', 'HUMMING', 'EMULATION'].
+(Worker_TP0 pid=27292) INFO 07-19 02:16:41 [weight_utils.py:869] Filesystem type for checkpoints: XFS. Checkpoint size: 551.35 GiB. Available RAM: 3947.42 GiB.
+(Worker_TP0 pid=27292) INFO 07-19 02:16:41 [weight_utils.py:892] Auto-prefetch is disabled because the filesystem (XFS) is not a recognized network FS (NFS/Lustre). If you want to force prefetching, start vLLM with --sa
+fetensors-load-strategy=prefetch.
+Loading safetensors checkpoint shards:   0% Completed | 0/34 [00:00<?, ?it/s]
+Loading safetensors checkpoint shards:   3% Completed | 1/34 [00:03<02:03,  3.73s/it]
+Loading safetensors checkpoint shards:   6% Completed | 2/34 [00:05<01:14,  2.34s/it]
+Loading safetensors checkpoint shards:   9% Completed | 3/34 [00:06<00:57,  1.86s/it]
+Loading safetensors checkpoint shards:  12% Completed | 4/34 [00:07<00:45,  1.53s/it]
+Loading safetensors checkpoint shards:  15% Completed | 5/34 [00:08<00:39,  1.35s/it]
+Loading safetensors checkpoint shards:  18% Completed | 6/34 [00:09<00:33,  1.19s/it]
+Loading safetensors checkpoint shards:  21% Completed | 7/34 [00:10<00:32,  1.21s/it]
+Loading safetensors checkpoint shards:  24% Completed | 8/34 [00:12<00:33,  1.29s/it]
+Loading safetensors checkpoint shards:  26% Completed | 9/34 [00:12<00:28,  1.13s/it]
+Loading safetensors checkpoint shards:  29% Completed | 10/34 [00:14<00:30,  1.28s/it]
+Loading safetensors checkpoint shards:  32% Completed | 11/34 [00:15<00:26,  1.14s/it]
+Loading safetensors checkpoint shards:  35% Completed | 12/34 [00:15<00:21,  1.02it/s]
+Loading safetensors checkpoint shards:  38% Completed | 13/34 [00:17<00:21,  1.04s/it]
+Loading safetensors checkpoint shards:  41% Completed | 14/34 [00:18<00:20,  1.02s/it]
+Loading safetensors checkpoint shards:  44% Completed | 15/34 [00:18<00:18,  1.04it/s]
+Loading safetensors checkpoint shards:  47% Completed | 16/34 [00:19<00:16,  1.08it/s]
+Loading safetensors checkpoint shards:  50% Completed | 17/34 [00:20<00:17,  1.00s/it]
+Loading safetensors checkpoint shards:  53% Completed | 18/34 [00:22<00:17,  1.12s/it]
+Loading safetensors checkpoint shards:  56% Completed | 19/34 [00:23<00:15,  1.04s/it]
+Loading safetensors checkpoint shards:  59% Completed | 20/34 [00:24<00:15,  1.11s/it]
+Loading safetensors checkpoint shards:  62% Completed | 21/34 [00:25<00:14,  1.11s/it]
+Loading safetensors checkpoint shards:  65% Completed | 22/34 [00:26<00:12,  1.08s/it]
+Loading safetensors checkpoint shards:  68% Completed | 23/34 [00:27<00:10,  1.03it/s]
+Loading safetensors checkpoint shards:  71% Completed | 24/34 [00:27<00:09,  1.10it/s]
+Loading safetensors checkpoint shards:  74% Completed | 25/34 [00:29<00:08,  1.00it/s]
+Loading safetensors checkpoint shards:  76% Completed | 26/34 [00:30<00:08,  1.08s/it]
+Loading safetensors checkpoint shards:  79% Completed | 27/34 [00:31<00:07,  1.12s/it]
+Loading safetensors checkpoint shards:  82% Completed | 28/34 [00:32<00:06,  1.11s/it]
+Loading safetensors checkpoint shards:  85% Completed | 29/34 [00:34<00:06,  1.23s/it]
+Loading safetensors checkpoint shards:  88% Completed | 30/34 [00:34<00:03,  1.09it/s]
+Loading safetensors checkpoint shards:  91% Completed | 31/34 [00:34<00:02,  1.25it/s]
+Loading safetensors checkpoint shards:  94% Completed | 32/34 [00:35<00:01,  1.27it/s]
+Loading safetensors checkpoint shards:  97% Completed | 33/34 [00:35<00:00,  1.68it/s]
+Loading safetensors checkpoint shards: 100% Completed | 34/34 [00:35<00:00,  1.06s/it]
+(Worker_TP0 pid=27292)
+(Worker_TP0 pid=27292) INFO 07-19 02:17:17 [default_loader.py:430] Loading weights took 35.91 seconds
+(Worker_TP0 pid=27292) INFO 07-19 02:17:17 [unquantized.py:374] Using MoEPrepareAndFinalizeNoDPEPModular
+(Worker_TP0 pid=27292) INFO 07-19 02:17:17 [unquantized.py:375] Using FlashInferExperts MoE backend
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901] WorkerProc failed to start.
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901] Traceback (most recent call last):
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/flashinfer/jit/cpp_ext.py", line 368, in run_ninja
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901]     subprocess.run(
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901]   File "/usr/lib/python3.12/subprocess.py", line 571, in run
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901]     raise CalledProcessError(retcode, process.args,
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901] subprocess.CalledProcessError: Command '['ninja', '-v', '-C', '/root/.cache/flashinfer/0.6.13/103a/cached_ops/fp4_quantization_103', '-f', '/root/.
+cache/flashinfer/0.6.13/103a/cached_ops/fp4_quantization_103/build.ninja']' returned non-zero exit status 1.
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901]
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901] The above exception was the direct cause of the following exception:
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901]
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901] Traceback (most recent call last):
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/vllm/v1/executor/multiproc_executor.py", line 868, in worker_main
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901]     worker = WorkerProc(*args, **kwargs)
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901]              ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/vllm/tracing/otel.py", line 178, in sync_wrapper
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901]     return func(*args, **kwargs)
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901]            ^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/vllm/v1/executor/multiproc_executor.py", line 637, in __init__
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901]     self.worker.load_model()
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/vllm/v1/worker/gpu_worker.py", line 431, in load_model
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901]     self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/vllm/v1/worker/gpu/model_runner.py", line 283, in load_model
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901]     self.model = model_loader.load_model(
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901]                  ^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/vllm/tracing/otel.py", line 178, in sync_wrapper
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901]     return func(*args, **kwargs)
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901]            ^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/vllm/model_executor/model_loader/base_loader.py", line 80, in load_model
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901]     process_weights_after_loading(model, model_config, target_device)
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/vllm/model_executor/model_loader/utils.py", line 113, in process_weights_after_loading
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901]     quant_method.process_weights_after_loading(module)
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/vllm/model_executor/layers/quantization/modelopt.py", line 1581, in process_weights_after_load
+ing
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901]     ) = convert_to_nvfp4_moe_kernel_format(
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901]         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/vllm/model_executor/layers/fused_moe/oracle/nvfp4.py", line 351, in convert_to_nvfp4_moe_kerne
+l_format
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901]     ) = prepare_nvfp4_moe_layer_for_fi_or_cutlass(
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901]         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/vllm/model_executor/layers/quantization/utils/flashinfer_fp4_moe.py", line 370, in prepare_nvf
+p4_moe_layer_for_fi_or_cutlass
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901]     w13, w13_scale, w2, w2_scale = prepare_static_weights_for_trtllm_fp4_moe(
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901]                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/vllm/model_executor/layers/quantization/utils/flashinfer_fp4_moe.py", line 230, in prepare_sta
+tic_weights_for_trtllm_fp4_moe
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901]     nvfp4_block_scale_interleave(
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/flashinfer/quantization/fp4_quantization.py", line 1094, in block_scale_interleave
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901]     return get_fp4_quantization_module(device_arch).block_scale_interleave_sm100(
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/flashinfer/quantization/fp4_quantization.py", line 247, in get_fp4_quantization_module
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901]     module = backend_modules[backend]().build_and_load()
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901]              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/flashinfer/jit/core.py", line 316, in build_and_load
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901]     self.build(verbose, need_lock=False)
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/flashinfer/jit/core.py", line 302, in build
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901]     run_ninja(self.build_dir, self.ninja_path, verbose)
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/flashinfer/jit/cpp_ext.py", line 380, in run_ninja
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901]     raise RuntimeError(msg) from e
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901] RuntimeError: Ninja build failed. Ninja output:
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901] ninja: Entering directory `/root/.cache/flashinfer/0.6.13/103a/cached_ops/fp4_quantization_103'
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901] [1/2]  /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile -MF /root/.cache/flashinfer/0.6.13/103a/cached_ops/fp4_quantization_103/kernel
+s_quantization.cuda.o.d -DPy_LIMITED_API=0x03090000 -D_GLIBCXX_USE_CXX11_ABI=1 -I/workspace/venv/lib/python3.12/site-packages/flashinfer/data/csrc/nv_internal -I/workspace/venv/lib/python3.12/site-packages/flashinfer/da
+ta/csrc/nv_internal/include -I/workspace/venv/lib/python3.12/site-packages/flashinfer/data/cccl/cub -I/workspace/venv/lib/python3.12/site-packages/flashinfer/data/cccl/libcudacxx/include -I/workspace/venv/lib/python3.12
+/site-packages/flashinfer/data/cccl/thrust -isystem /usr/include/python3.12 -isystem /usr/local/cuda/include -isystem /workspace/venv/lib/python3.12/site-packages/tvm_ffi/include -isystem /workspace/venv/lib/python3.12/
+site-packages/tvm_ffi/include -isystem /workspace/venv/lib/python3.12/site-packages/flashinfer/data/include -isystem /workspace/venv/lib/python3.12/site-packages/flashinfer/data/csrc -isystem /workspace/venv/lib/python3
+.12/site-packages/flashinfer/data/cutlass/include -isystem /workspace/venv/lib/python3.12/site-packages/flashinfer/data/cutlass/tools/util/include -isystem /workspace/venv/lib/python3.12/site-packages/flashinfer/data/sp
+dlog/include --compiler-options=-fPIC --expt-relaxed-constexpr -static-global-template-stub=false -DFLASHINFER_ENABLE_FP8_E8M0 -DFLASHINFER_ENABLE_FP4_E2M1 -std=c++17 --threads=1 -use_fast_math -Xfatbin=-compress-all -D
+FLASHINFER_ENABLE_F16 -DFLASHINFER_ENABLE_BF16 -DFLASHINFER_ENABLE_FP8_E4M3 -DFLASHINFER_ENABLE_FP8_E5M2 -DNDEBUG -O3 -gencode=arch=compute_103a,code=sm_103a -DFLASHINFER_ENABLE_FP8_E8M0 -DFLASHINFER_ENABLE_FP4_E2M1 -DE
+NABLE_BF16 -DENABLE_FP8 -DENABLE_FP4 -c /workspace/venv/lib/python3.12/site-packages/flashinfer/data/csrc/nv_internal/cpp/kernels/quantization.cu -o /root/.cache/flashinfer/0.6.13/103a/cached_ops/fp4_quantization_103/ke
+rnels_quantization.cuda.o
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901] FAILED: [code=1] /root/.cache/flashinfer/0.6.13/103a/cached_ops/fp4_quantization_103/kernels_quantization.cuda.o
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901]  /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile -MF /root/.cache/flashinfer/0.6.13/103a/cached_ops/fp4_quantization_103/kernels_quan
+tization.cuda.o.d -DPy_LIMITED_API=0x03090000 -D_GLIBCXX_USE_CXX11_ABI=1 -I/workspace/venv/lib/python3.12/site-packages/flashinfer/data/csrc/nv_internal -I/workspace/venv/lib/python3.12/site-packages/flashinfer/data/csr
+c/nv_internal/include -I/workspace/venv/lib/python3.12/site-packages/flashinfer/data/cccl/cub -I/workspace/venv/lib/python3.12/site-packages/flashinfer/data/cccl/libcudacxx/include -I/workspace/venv/lib/python3.12/site-
+packages/flashinfer/data/cccl/thrust -isystem /usr/include/python3.12 -isystem /usr/local/cuda/include -isystem /workspace/venv/lib/python3.12/site-packages/tvm_ffi/include -isystem /workspace/venv/lib/python3.12/site-p
+ackages/tvm_ffi/include -isystem /workspace/venv/lib/python3.12/site-packages/flashinfer/data/include -isystem /workspace/venv/lib/python3.12/site-packages/flashinfer/data/csrc -isystem /workspace/venv/lib/python3.12/si
+te-packages/flashinfer/data/cutlass/include -isystem /workspace/venv/lib/python3.12/site-packages/flashinfer/data/cutlass/tools/util/include -isystem /workspace/venv/lib/python3.12/site-packages/flashinfer/data/spdlog/i
+nclude --compiler-options=-fPIC --expt-relaxed-constexpr -static-global-template-stub=false -DFLASHINFER_ENABLE_FP8_E8M0 -DFLASHINFER_ENABLE_FP4_E2M1 -std=c++17 --threads=1 -use_fast_math -Xfatbin=-compress-all -DFLASHI
+NFER_ENABLE_F16 -DFLASHINFER_ENABLE_BF16 -DFLASHINFER_ENABLE_FP8_E4M3 -DFLASHINFER_ENABLE_FP8_E5M2 -DNDEBUG -O3 -gencode=arch=compute_103a,code=sm_103a -DFLASHINFER_ENABLE_FP8_E8M0 -DFLASHINFER_ENABLE_FP4_E2M1 -DENABLE_
+BF16 -DENABLE_FP8 -DENABLE_FP4 -c /workspace/venv/lib/python3.12/site-packages/flashinfer/data/csrc/nv_internal/cpp/kernels/quantization.cu -o /root/.cache/flashinfer/0.6.13/103a/cached_ops/fp4_quantization_103/kernels_
+quantization.cuda.o
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901] nvcc fatal   : Unsupported gpu architecture 'compute_103a'
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901] ninja: build stopped: subcommand failed.
+(Worker_TP3 pid=27295) ERROR 07-19 02:17:26 [multiproc_executor.py:901]
+(EngineCore pid=27010) INFO 07-19 02:17:26 [multiproc_executor.py:429] [shutdown] Executor: waiting for worker exit count=4
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901] WorkerProc failed to start.
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901] Traceback (most recent call last):
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/flashinfer/jit/cpp_ext.py", line 368, in run_ninja
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     subprocess.run(
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/usr/lib/python3.12/subprocess.py", line 571, in run
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     raise CalledProcessError(retcode, process.args,
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901] subprocess.CalledProcessError: Command '['ninja', '-v', '-C', '/root/.cache/flashinfer/0.6.13/103a/cached_ops/fp4_quantization_103', '-f', '/root/.
+cache/flashinfer/0.6.13/103a/cached_ops/fp4_quantization_103/build.ninja']' returned non-zero exit status 1.
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901]
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901] The above exception was the direct cause of the following exception:
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901]
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901] Traceback (most recent call last):
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/vllm/v1/executor/multiproc_executor.py", line 868, in worker_main
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     worker = WorkerProc(*args, **kwargs)
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901]              ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/vllm/tracing/otel.py", line 178, in sync_wrapper
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     return func(*args, **kwargs)
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901]            ^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/vllm/v1/executor/multiproc_executor.py", line 637, in __init__
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     self.worker.load_model()
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/vllm/v1/worker/gpu_worker.py", line 431, in load_model
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/vllm/v1/worker/gpu/model_runner.py", line 283, in load_model
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     self.model = model_loader.load_model(
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901]                  ^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/vllm/tracing/otel.py", line 178, in sync_wrapper
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     return func(*args, **kwargs)
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901]            ^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/vllm/model_executor/model_loader/base_loader.py", line 80, in load_model
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     process_weights_after_loading(model, model_config, target_device)
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/vllm/model_executor/model_loader/utils.py", line 113, in process_weights_after_loading
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     quant_method.process_weights_after_loading(module)
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/vllm/model_executor/layers/quantization/modelopt.py", line 1581, in process_weights_after_load
+ing
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     ) = convert_to_nvfp4_moe_kernel_format(
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901]         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/vllm/model_executor/layers/fused_moe/oracle/nvfp4.py", line 351, in convert_to_nvfp4_moe_kerne
+l_format
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     ) = prepare_nvfp4_moe_layer_for_fi_or_cutlass(
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901]         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/vllm/model_executor/layers/quantization/utils/flashinfer_fp4_moe.py", line 370, in prepare_nvf
+p4_moe_layer_for_fi_or_cutlass
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     w13, w13_scale, w2, w2_scale = prepare_static_weights_for_trtllm_fp4_moe(
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901]                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/vllm/model_executor/layers/quantization/utils/flashinfer_fp4_moe.py", line 230, in prepare_sta
+tic_weights_for_trtllm_fp4_moe
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     nvfp4_block_scale_interleave(
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/flashinfer/quantization/fp4_quantization.py", line 1094, in block_scale_interleave
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     return get_fp4_quantization_module(device_arch).block_scale_interleave_sm100(
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/flashinfer/quantization/fp4_quantization.py", line 247, in get_fp4_quantization_module
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     module = backend_modules[backend]().build_and_load()
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901]              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/flashinfer/jit/core.py", line 316, in build_and_load
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     self.build(verbose, need_lock=False)
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/flashinfer/jit/core.py", line 302, in build
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     run_ninja(self.build_dir, self.ninja_path, verbose)
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/flashinfer/jit/cpp_ext.py", line 380, in run_ninja
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     raise RuntimeError(msg) from e
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901] RuntimeError: Ninja build failed. Ninja output:
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901] ninja: Entering directory `/root/.cache/flashinfer/0.6.13/103a/cached_ops/fp4_quantization_103'
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901] [1/2]  /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile -MF /root/.cache/flashinfer/0.6.13/103a/cached_ops/fp4_quantization_103/kernel
+s_quantization.cuda.o.d -DPy_LIMITED_API=0x03090000 -D_GLIBCXX_USE_CXX11_ABI=1 -I/workspace/venv/lib/python3.12/site-packages/flashinfer/data/csrc/nv_internal -I/workspace/venv/lib/python3.12/site-packages/flashinfer/da
+ta/csrc/nv_internal/include -I/workspace/venv/lib/python3.12/site-packages/flashinfer/data/cccl/cub -I/workspace/venv/lib/python3.12/site-packages/flashinfer/data/cccl/libcudacxx/include -I/workspace/venv/lib/python3.12
+/site-packages/flashinfer/data/cccl/thrust -isystem /usr/include/python3.12 -isystem /usr/local/cuda/include -isystem /workspace/venv/lib/python3.12/site-packages/tvm_ffi/include -isystem /workspace/venv/lib/python3.12/
+site-packages/tvm_ffi/include -isystem /workspace/venv/lib/python3.12/site-packages/flashinfer/data/include -isystem /workspace/venv/lib/python3.12/site-packages/flashinfer/data/csrc -isystem /workspace/venv/lib/python3
+.12/site-packages/flashinfer/data/cutlass/include -isystem /workspace/venv/lib/python3.12/site-packages/flashinfer/data/cutlass/tools/util/include -isystem /workspace/venv/lib/python3.12/site-packages/flashinfer/data/sp
+dlog/include --compiler-options=-fPIC --expt-relaxed-constexpr -static-global-template-stub=false -DFLASHINFER_ENABLE_FP8_E8M0 -DFLASHINFER_ENABLE_FP4_E2M1 -std=c++17 --threads=1 -use_fast_math -Xfatbin=-compress-all -D
+FLASHINFER_ENABLE_F16 -DFLASHINFER_ENABLE_BF16 -DFLASHINFER_ENABLE_FP8_E4M3 -DFLASHINFER_ENABLE_FP8_E5M2 -DNDEBUG -O3 -gencode=arch=compute_103a,code=sm_103a -DFLASHINFER_ENABLE_FP8_E8M0 -DFLASHINFER_ENABLE_FP4_E2M1 -DE
+NABLE_BF16 -DENABLE_FP8 -DENABLE_FP4 -c /workspace/venv/lib/python3.12/site-packages/flashinfer/data/csrc/nv_internal/cpp/kernels/quantization.cu -o /root/.cache/flashinfer/0.6.13/103a/cached_ops/fp4_quantization_103/ke
+rnels_quantization.cuda.o
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901] FAILED: [code=1] /root/.cache/flashinfer/0.6.13/103a/cached_ops/fp4_quantization_103/kernels_quantization.cuda.o
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901]  /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile -MF /root/.cache/flashinfer/0.6.13/103a/cached_ops/fp4_quantization_103/kernels_quan
+tization.cuda.o.d -DPy_LIMITED_API=0x03090000 -D_GLIBCXX_USE_CXX11_ABI=1 -I/workspace/venv/lib/python3.12/site-packages/flashinfer/data/csrc/nv_internal -I/workspace/venv/lib/python3.12/site-packages/flashinfer/data/csr
+c/nv_internal/include -I/workspace/venv/lib/python3.12/site-packages/flashinfer/data/cccl/cub -I/workspace/venv/lib/python3.12/site-packages/flashinfer/data/cccl/libcudacxx/include -I/workspace/venv/lib/python3.12/site-
+packages/flashinfer/data/cccl/thrust -isystem /usr/include/python3.12 -isystem /usr/local/cuda/include -isystem /workspace/venv/lib/python3.12/site-packages/tvm_ffi/include -isystem /workspace/venv/lib/python3.12/site-p
+ackages/tvm_ffi/include -isystem /workspace/venv/lib/python3.12/site-packages/flashinfer/data/include -isystem /workspace/venv/lib/python3.12/site-packages/flashinfer/data/csrc -isystem /workspace/venv/lib/python3.12/si
+te-packages/flashinfer/data/cutlass/include -isystem /workspace/venv/lib/python3.12/site-packages/flashinfer/data/cutlass/tools/util/include -isystem /workspace/venv/lib/python3.12/site-packages/flashinfer/data/spdlog/i
+nclude --compiler-options=-fPIC --expt-relaxed-constexpr -static-global-template-stub=false -DFLASHINFER_ENABLE_FP8_E8M0 -DFLASHINFER_ENABLE_FP4_E2M1 -std=c++17 --threads=1 -use_fast_math -Xfatbin=-compress-all -DFLASHI
+NFER_ENABLE_F16 -DFLASHINFER_ENABLE_BF16 -DFLASHINFER_ENABLE_FP8_E4M3 -DFLASHINFER_ENABLE_FP8_E5M2 -DNDEBUG -O3 -gencode=arch=compute_103a,code=sm_103a -DFLASHINFER_ENABLE_FP8_E8M0 -DFLASHINFER_ENABLE_FP4_E2M1 -DENABLE_
+BF16 -DENABLE_FP8 -DENABLE_FP4 -c /workspace/venv/lib/python3.12/site-packages/flashinfer/data/csrc/nv_internal/cpp/kernels/quantization.cu -o /root/.cache/flashinfer/0.6.13/103a/cached_ops/fp4_quantization_103/kernels_
+quantization.cuda.o
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901] nvcc fatal   : Unsupported gpu architecture 'compute_103a'
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901] ninja: build stopped: subcommand failed.
+(Worker_TP2 pid=27294) ERROR 07-19 02:17:27 [multiproc_executor.py:901]
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901] WorkerProc failed to start.
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901] Traceback (most recent call last):
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/flashinfer/jit/cpp_ext.py", line 368, in run_ninja
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     subprocess.run(
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/usr/lib/python3.12/subprocess.py", line 571, in run
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     raise CalledProcessError(retcode, process.args,
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901] subprocess.CalledProcessError: Command '['ninja', '-v', '-C', '/root/.cache/flashinfer/0.6.13/103a/cached_ops/fp4_quantization_103', '-f', '/root/.
+cache/flashinfer/0.6.13/103a/cached_ops/fp4_quantization_103/build.ninja']' returned non-zero exit status 1.
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901]
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901] The above exception was the direct cause of the following exception:
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901]
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901] Traceback (most recent call last):
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/vllm/v1/executor/multiproc_executor.py", line 868, in worker_main
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     worker = WorkerProc(*args, **kwargs)
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901]              ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/vllm/tracing/otel.py", line 178, in sync_wrapper
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     return func(*args, **kwargs)
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901]            ^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/vllm/v1/executor/multiproc_executor.py", line 637, in __init__
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     self.worker.load_model()
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/vllm/v1/worker/gpu_worker.py", line 431, in load_model
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/vllm/v1/worker/gpu/model_runner.py", line 283, in load_model
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     self.model = model_loader.load_model(
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901]                  ^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/vllm/tracing/otel.py", line 178, in sync_wrapper
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     return func(*args, **kwargs)
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901]            ^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/vllm/model_executor/model_loader/base_loader.py", line 80, in load_model
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     process_weights_after_loading(model, model_config, target_device)
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/vllm/model_executor/model_loader/utils.py", line 113, in process_weights_after_loading
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     quant_method.process_weights_after_loading(module)
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/vllm/model_executor/layers/quantization/modelopt.py", line 1581, in process_weights_after_load
+ing
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     ) = convert_to_nvfp4_moe_kernel_format(
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901]         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/vllm/model_executor/layers/fused_moe/oracle/nvfp4.py", line 351, in convert_to_nvfp4_moe_kerne
+l_format
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     ) = prepare_nvfp4_moe_layer_for_fi_or_cutlass(
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901]         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/vllm/model_executor/layers/quantization/utils/flashinfer_fp4_moe.py", line 370, in prepare_nvf
+p4_moe_layer_for_fi_or_cutlass
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     w13, w13_scale, w2, w2_scale = prepare_static_weights_for_trtllm_fp4_moe(
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901]                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/vllm/model_executor/layers/quantization/utils/flashinfer_fp4_moe.py", line 230, in prepare_sta
+tic_weights_for_trtllm_fp4_moe
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     nvfp4_block_scale_interleave(
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/flashinfer/quantization/fp4_quantization.py", line 1094, in block_scale_interleave
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     return get_fp4_quantization_module(device_arch).block_scale_interleave_sm100(
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/flashinfer/quantization/fp4_quantization.py", line 247, in get_fp4_quantization_module
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     module = backend_modules[backend]().build_and_load()
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901]              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/flashinfer/jit/core.py", line 316, in build_and_load
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     self.build(verbose, need_lock=False)
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/flashinfer/jit/core.py", line 302, in build
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     run_ninja(self.build_dir, self.ninja_path, verbose)
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/flashinfer/jit/cpp_ext.py", line 380, in run_ninja
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     raise RuntimeError(msg) from e
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901] RuntimeError: Ninja build failed. Ninja output:
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901] ninja: Entering directory `/root/.cache/flashinfer/0.6.13/103a/cached_ops/fp4_quantization_103'
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901] [1/8]  /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile -MF /root/.cache/flashinfer/0.6.13/103a/cached_ops/fp4_quantization_103/kernel
+s_quantization.cuda.o.d -DPy_LIMITED_API=0x03090000 -D_GLIBCXX_USE_CXX11_ABI=1 -I/workspace/venv/lib/python3.12/site-packages/flashinfer/data/csrc/nv_internal -I/workspace/venv/lib/python3.12/site-packages/flashinfer/da
+ta/csrc/nv_internal/include -I/workspace/venv/lib/python3.12/site-packages/flashinfer/data/cccl/cub -I/workspace/venv/lib/python3.12/site-packages/flashinfer/data/cccl/libcudacxx/include -I/workspace/venv/lib/python3.12
+/site-packages/flashinfer/data/cccl/thrust -isystem /usr/include/python3.12 -isystem /usr/local/cuda/include -isystem /workspace/venv/lib/python3.12/site-packages/tvm_ffi/include -isystem /workspace/venv/lib/python3.12/
+site-packages/tvm_ffi/include -isystem /workspace/venv/lib/python3.12/site-packages/flashinfer/data/include -isystem /workspace/venv/lib/python3.12/site-packages/flashinfer/data/csrc -isystem /workspace/venv/lib/python3
+.12/site-packages/flashinfer/data/cutlass/include -isystem /workspace/venv/lib/python3.12/site-packages/flashinfer/data/cutlass/tools/util/include -isystem /workspace/venv/lib/python3.12/site-packages/flashinfer/data/sp
+dlog/include --compiler-options=-fPIC --expt-relaxed-constexpr -static-global-template-stub=false -DFLASHINFER_ENABLE_FP8_E8M0 -DFLASHINFER_ENABLE_FP4_E2M1 -std=c++17 --threads=1 -use_fast_math -Xfatbin=-compress-all -D
+FLASHINFER_ENABLE_F16 -DFLASHINFER_ENABLE_BF16 -DFLASHINFER_ENABLE_FP8_E4M3 -DFLASHINFER_ENABLE_FP8_E5M2 -DNDEBUG -O3 -gencode=arch=compute_103a,code=sm_103a -DFLASHINFER_ENABLE_FP8_E8M0 -DFLASHINFER_ENABLE_FP4_E2M1 -DE
+NABLE_BF16 -DENABLE_FP8 -DENABLE_FP4 -c /workspace/venv/lib/python3.12/site-packages/flashinfer/data/csrc/nv_internal/cpp/kernels/quantization.cu -o /root/.cache/flashinfer/0.6.13/103a/cached_ops/fp4_quantization_103/ke
+rnels_quantization.cuda.o
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901] FAILED: [code=1] /root/.cache/flashinfer/0.6.13/103a/cached_ops/fp4_quantization_103/kernels_quantization.cuda.o
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901]  /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile -MF /root/.cache/flashinfer/0.6.13/103a/cached_ops/fp4_quantization_103/kernels_quan
+tization.cuda.o.d -DPy_LIMITED_API=0x03090000 -D_GLIBCXX_USE_CXX11_ABI=1 -I/workspace/venv/lib/python3.12/site-packages/flashinfer/data/csrc/nv_internal -I/workspace/venv/lib/python3.12/site-packages/flashinfer/data/csr
+c/nv_internal/include -I/workspace/venv/lib/python3.12/site-packages/flashinfer/data/cccl/cub -I/workspace/venv/lib/python3.12/site-packages/flashinfer/data/cccl/libcudacxx/include -I/workspace/venv/lib/python3.12/site-
+packages/flashinfer/data/cccl/thrust -isystem /usr/include/python3.12 -isystem /usr/local/cuda/include -isystem /workspace/venv/lib/python3.12/site-packages/tvm_ffi/include -isystem /workspace/venv/lib/python3.12/site-p
+ackages/tvm_ffi/include -isystem /workspace/venv/lib/python3.12/site-packages/flashinfer/data/include -isystem /workspace/venv/lib/python3.12/site-packages/flashinfer/data/csrc -isystem /workspace/venv/lib/python3.12/si
+te-packages/flashinfer/data/cutlass/include -isystem /workspace/venv/lib/python3.12/site-packages/flashinfer/data/cutlass/tools/util/include -isystem /workspace/venv/lib/python3.12/site-packages/flashinfer/data/spdlog/i
+nclude --compiler-options=-fPIC --expt-relaxed-constexpr -static-global-template-stub=false -DFLASHINFER_ENABLE_FP8_E8M0 -DFLASHINFER_ENABLE_FP4_E2M1 -std=c++17 --threads=1 -use_fast_math -Xfatbin=-compress-all -DFLASHI
+NFER_ENABLE_F16 -DFLASHINFER_ENABLE_BF16 -DFLASHINFER_ENABLE_FP8_E4M3 -DFLASHINFER_ENABLE_FP8_E5M2 -DNDEBUG -O3 -gencode=arch=compute_103a,code=sm_103a -DFLASHINFER_ENABLE_FP8_E8M0 -DFLASHINFER_ENABLE_FP4_E2M1 -DENABLE_
+BF16 -DENABLE_FP8 -DENABLE_FP4 -c /workspace/venv/lib/python3.12/site-packages/flashinfer/data/csrc/nv_internal/cpp/kernels/quantization.cu -o /root/.cache/flashinfer/0.6.13/103a/cached_ops/fp4_quantization_103/kernels_
+quantization.cuda.o
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901] nvcc fatal   : Unsupported gpu architecture 'compute_103a'
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901] [2/8]  c++ -MMD -MF /root/.cache/flashinfer/0.6.13/103a/cached_ops/fp4_quantization_103/common_tllmException.o.d -DPy_LIMITED_API=0x03090000 -D_GLI
+BCXX_USE_CXX11_ABI=1 -I/workspace/venv/lib/python3.12/site-packages/flashinfer/data/csrc/nv_internal -I/workspace/venv/lib/python3.12/site-packages/flashinfer/data/csrc/nv_internal/include -I/workspace/venv/lib/python3.
+12/site-packages/flashinfer/data/cccl/cub -I/workspace/venv/lib/python3.12/site-packages/flashinfer/data/cccl/libcudacxx/include -I/workspace/venv/lib/python3.12/site-packages/flashinfer/data/cccl/thrust -isystem /usr/i
+nclude/python3.12 -isystem /usr/local/cuda/include -isystem /workspace/venv/lib/python3.12/site-packages/tvm_ffi/include -isystem /workspace/venv/lib/python3.12/site-packages/tvm_ffi/include -isystem /workspace/venv/lib
+/python3.12/site-packages/flashinfer/data/include -isystem /workspace/venv/lib/python3.12/site-packages/flashinfer/data/csrc -isystem /workspace/venv/lib/python3.12/site-packages/flashinfer/data/cutlass/include -isystem
+ /workspace/venv/lib/python3.12/site-packages/flashinfer/data/cutlass/tools/util/include -isystem /workspace/venv/lib/python3.12/site-packages/flashinfer/data/spdlog/include -fPIC -std=c++17 -Wno-switch-bool -DNDEBUG -O
+3 -DENABLE_BF16 -DENABLE_FP8 -DENABLE_FP4 -c /workspace/venv/lib/python3.12/site-packages/flashinfer/data/csrc/nv_internal/cpp/common/tllmException.cpp -o /root/.cache/flashinfer/0.6.13/103a/cached_ops/fp4_quantization_
+103/common_tllmException.o
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901] [3/8]  c++ -MMD -MF /root/.cache/flashinfer/0.6.13/103a/cached_ops/fp4_quantization_103/common_stringUtils.o.d -DPy_LIMITED_API=0x03090000 -D_GLIBC
+XX_USE_CXX11_ABI=1 -I/workspace/venv/lib/python3.12/site-packages/flashinfer/data/csrc/nv_internal -I/workspace/venv/lib/python3.12/site-packages/flashinfer/data/csrc/nv_internal/include -I/workspace/venv/lib/python3.12
+/site-packages/flashinfer/data/cccl/cub -I/workspace/venv/lib/python3.12/site-packages/flashinfer/data/cccl/libcudacxx/include -I/workspace/venv/lib/python3.12/site-packages/flashinfer/data/cccl/thrust -isystem /usr/inc
+lude/python3.12 -isystem /usr/local/cuda/include -isystem /workspace/venv/lib/python3.12/site-packages/tvm_ffi/include -isystem /workspace/venv/lib/python3.12/site-packages/tvm_ffi/include -isystem /workspace/venv/lib/p
+ython3.12/site-packages/flashinfer/data/include -isystem /workspace/venv/lib/python3.12/site-packages/flashinfer/data/csrc -isystem /workspace/venv/lib/python3.12/site-packages/flashinfer/data/cutlass/include -isystem /
+workspace/venv/lib/python3.12/site-packages/flashinfer/data/cutlass/tools/util/include -isystem /workspace/venv/lib/python3.12/site-packages/flashinfer/data/spdlog/include -fPIC -std=c++17 -Wno-switch-bool -DNDEBUG -O3
+-DENABLE_BF16 -DENABLE_FP8 -DENABLE_FP4 -c /workspace/venv/lib/python3.12/site-packages/flashinfer/data/csrc/nv_internal/cpp/common/stringUtils.cpp -o /root/.cache/flashinfer/0.6.13/103a/cached_ops/fp4_quantization_103/
+common_stringUtils.o
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901] [4/8]  c++ -MMD -MF /root/.cache/flashinfer/0.6.13/103a/cached_ops/fp4_quantization_103/common_logger.o.d -DPy_LIMITED_API=0x03090000 -D_GLIBCXX_US
+E_CXX11_ABI=1 -I/workspace/venv/lib/python3.12/site-packages/flashinfer/data/csrc/nv_internal -I/workspace/venv/lib/python3.12/site-packages/flashinfer/data/csrc/nv_internal/include -I/workspace/venv/lib/python3.12/site
+-packages/flashinfer/data/cccl/cub -I/workspace/venv/lib/python3.12/site-packages/flashinfer/data/cccl/libcudacxx/include -I/workspace/venv/lib/python3.12/site-packages/flashinfer/data/cccl/thrust -isystem /usr/include/
+python3.12 -isystem /usr/local/cuda/include -isystem /workspace/venv/lib/python3.12/site-packages/tvm_ffi/include -isystem /workspace/venv/lib/python3.12/site-packages/tvm_ffi/include -isystem /workspace/venv/lib/python
+3.12/site-packages/flashinfer/data/include -isystem /workspace/venv/lib/python3.12/site-packages/flashinfer/data/csrc -isystem /workspace/venv/lib/python3.12/site-packages/flashinfer/data/cutlass/include -isystem /works
+pace/venv/lib/python3.12/site-packages/flashinfer/data/cutlass/tools/util/include -isystem /workspace/venv/lib/python3.12/site-packages/flashinfer/data/spdlog/include -fPIC -std=c++17 -Wno-switch-bool -DNDEBUG -O3 -DENA
+BLE_BF16 -DENABLE_FP8 -DENABLE_FP4 -c /workspace/venv/lib/python3.12/site-packages/flashinfer/data/csrc/nv_internal/cpp/common/logger.cpp -o /root/.cache/flashinfer/0.6.13/103a/cached_ops/fp4_quantization_103/common_log
+ger.o
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901] [5/8]  c++ -MMD -MF /root/.cache/flashinfer/0.6.13/103a/cached_ops/fp4_quantization_103/common_envUtils.o.d -DPy_LIMITED_API=0x03090000 -D_GLIBCXX_
+USE_CXX11_ABI=1 -I/workspace/venv/lib/python3.12/site-packages/flashinfer/data/csrc/nv_internal -I/workspace/venv/lib/python3.12/site-packages/flashinfer/data/csrc/nv_internal/include -I/workspace/venv/lib/python3.12/si
+te-packages/flashinfer/data/cccl/cub -I/workspace/venv/lib/python3.12/site-packages/flashinfer/data/cccl/libcudacxx/include -I/workspace/venv/lib/python3.12/site-packages/flashinfer/data/cccl/thrust -isystem /usr/includ
+e/python3.12 -isystem /usr/local/cuda/include -isystem /workspace/venv/lib/python3.12/site-packages/tvm_ffi/include -isystem /workspace/venv/lib/python3.12/site-packages/tvm_ffi/include -isystem /workspace/venv/lib/pyth
+on3.12/site-packages/flashinfer/data/include -isystem /workspace/venv/lib/python3.12/site-packages/flashinfer/data/csrc -isystem /workspace/venv/lib/python3.12/site-packages/flashinfer/data/cutlass/include -isystem /wor
+kspace/venv/lib/python3.12/site-packages/flashinfer/data/cutlass/tools/util/include -isystem /workspace/venv/lib/python3.12/site-packages/flashinfer/data/spdlog/include -fPIC -std=c++17 -Wno-switch-bool -DNDEBUG -O3 -DE
+NABLE_BF16 -DENABLE_FP8 -DENABLE_FP4 -c /workspace/venv/lib/python3.12/site-packages/flashinfer/data/csrc/nv_internal/cpp/common/envUtils.cpp -o /root/.cache/flashinfer/0.6.13/103a/cached_ops/fp4_quantization_103/common
+_envUtils.o
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901] [6/8]  c++ -MMD -MF /root/.cache/flashinfer/0.6.13/103a/cached_ops/fp4_quantization_103/thop_fp4Op.o.d -DPy_LIMITED_API=0x03090000 -D_GLIBCXX_USE_C
+XX11_ABI=1 -I/workspace/venv/lib/python3.12/site-packages/flashinfer/data/csrc/nv_internal -I/workspace/venv/lib/python3.12/site-packages/flashinfer/data/csrc/nv_internal/include -I/workspace/venv/lib/python3.12/site-pa
+ckages/flashinfer/data/cccl/cub -I/workspace/venv/lib/python3.12/site-packages/flashinfer/data/cccl/libcudacxx/include -I/workspace/venv/lib/python3.12/site-packages/flashinfer/data/cccl/thrust -isystem /usr/include/pyt
+hon3.12 -isystem /usr/local/cuda/include -isystem /workspace/venv/lib/python3.12/site-packages/tvm_ffi/include -isystem /workspace/venv/lib/python3.12/site-packages/tvm_ffi/include -isystem /workspace/venv/lib/python3.1
+2/site-packages/flashinfer/data/include -isystem /workspace/venv/lib/python3.12/site-packages/flashinfer/data/csrc -isystem /workspace/venv/lib/python3.12/site-packages/flashinfer/data/cutlass/include -isystem /workspac
+e/venv/lib/python3.12/site-packages/flashinfer/data/cutlass/tools/util/include -isystem /workspace/venv/lib/python3.12/site-packages/flashinfer/data/spdlog/include -fPIC -std=c++17 -Wno-switch-bool -DNDEBUG -O3 -DENABLE
+_BF16 -DENABLE_FP8 -DENABLE_FP4 -c /workspace/venv/lib/python3.12/site-packages/flashinfer/data/csrc/nv_internal/tensorrt_llm/thop/fp4Op.cpp -o /root/.cache/flashinfer/0.6.13/103a/cached_ops/fp4_quantization_103/thop_fp
+4Op.o
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901] [7/8]  c++ -MMD -MF /root/.cache/flashinfer/0.6.13/103a/cached_ops/fp4_quantization_103/thop_fp4Quantize.o.d -DPy_LIMITED_API=0x03090000 -D_GLIBCXX
+_USE_CXX11_ABI=1 -I/workspace/venv/lib/python3.12/site-packages/flashinfer/data/csrc/nv_internal -I/workspace/venv/lib/python3.12/site-packages/flashinfer/data/csrc/nv_internal/include -I/workspace/venv/lib/python3.12/s
+ite-packages/flashinfer/data/cccl/cub -I/workspace/venv/lib/python3.12/site-packages/flashinfer/data/cccl/libcudacxx/include -I/workspace/venv/lib/python3.12/site-packages/flashinfer/data/cccl/thrust -isystem /usr/inclu
+de/python3.12 -isystem /usr/local/cuda/include -isystem /workspace/venv/lib/python3.12/site-packages/tvm_ffi/include -isystem /workspace/venv/lib/python3.12/site-packages/tvm_ffi/include -isystem /workspace/venv/lib/pyt
+hon3.12/site-packages/flashinfer/data/include -isystem /workspace/venv/lib/python3.12/site-packages/flashinfer/data/csrc -isystem /workspace/venv/lib/python3.12/site-packages/flashinfer/data/cutlass/include -isystem /wo
+rkspace/venv/lib/python3.12/site-packages/flashinfer/data/cutlass/tools/util/include -isystem /workspace/venv/lib/python3.12/site-packages/flashinfer/data/spdlog/include -fPIC -std=c++17 -Wno-switch-bool -DNDEBUG -O3 -D
+ENABLE_BF16 -DENABLE_FP8 -DENABLE_FP4 -c /workspace/venv/lib/python3.12/site-packages/flashinfer/data/csrc/nv_internal/tensorrt_llm/thop/fp4Quantize.cpp -o /root/.cache/flashinfer/0.6.13/103a/cached_ops/fp4_quantization
+_103/thop_fp4Quantize.o
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901] ninja: build stopped: subcommand failed.
+(Worker_TP0 pid=27292) ERROR 07-19 02:17:27 [multiproc_executor.py:901]
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901] WorkerProc failed to start.
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901] Traceback (most recent call last):
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/flashinfer/jit/cpp_ext.py", line 368, in run_ninja
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     subprocess.run(
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/usr/lib/python3.12/subprocess.py", line 571, in run
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     raise CalledProcessError(retcode, process.args,
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901] subprocess.CalledProcessError: Command '['ninja', '-v', '-C', '/root/.cache/flashinfer/0.6.13/103a/cached_ops/fp4_quantization_103', '-f', '/root/.
+cache/flashinfer/0.6.13/103a/cached_ops/fp4_quantization_103/build.ninja']' returned non-zero exit status 1.
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901]
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901] The above exception was the direct cause of the following exception:
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901]
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901] Traceback (most recent call last):
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/vllm/v1/executor/multiproc_executor.py", line 868, in worker_main
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     worker = WorkerProc(*args, **kwargs)
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901]              ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/vllm/tracing/otel.py", line 178, in sync_wrapper
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     return func(*args, **kwargs)
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901]            ^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/vllm/v1/executor/multiproc_executor.py", line 637, in __init__
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     self.worker.load_model()
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/vllm/v1/worker/gpu_worker.py", line 431, in load_model
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/vllm/v1/worker/gpu/model_runner.py", line 283, in load_model
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     self.model = model_loader.load_model(
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901]                  ^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/vllm/tracing/otel.py", line 178, in sync_wrapper
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     return func(*args, **kwargs)
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901]            ^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/vllm/model_executor/model_loader/base_loader.py", line 80, in load_model
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     process_weights_after_loading(model, model_config, target_device)
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/vllm/model_executor/model_loader/utils.py", line 113, in process_weights_after_loading
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     quant_method.process_weights_after_loading(module)
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/vllm/model_executor/layers/quantization/modelopt.py", line 1581, in process_weights_after_load
+ing
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     ) = convert_to_nvfp4_moe_kernel_format(
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901]         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/vllm/model_executor/layers/fused_moe/oracle/nvfp4.py", line 351, in convert_to_nvfp4_moe_kerne
+l_format
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     ) = prepare_nvfp4_moe_layer_for_fi_or_cutlass(
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901]         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/vllm/model_executor/layers/quantization/utils/flashinfer_fp4_moe.py", line 370, in prepare_nvf
+p4_moe_layer_for_fi_or_cutlass
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     w13, w13_scale, w2, w2_scale = prepare_static_weights_for_trtllm_fp4_moe(
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901]                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/vllm/model_executor/layers/quantization/utils/flashinfer_fp4_moe.py", line 230, in prepare_sta
+tic_weights_for_trtllm_fp4_moe
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     nvfp4_block_scale_interleave(
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/flashinfer/quantization/fp4_quantization.py", line 1094, in block_scale_interleave
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     return get_fp4_quantization_module(device_arch).block_scale_interleave_sm100(
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/flashinfer/quantization/fp4_quantization.py", line 247, in get_fp4_quantization_module
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     module = backend_modules[backend]().build_and_load()
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901]              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/flashinfer/jit/core.py", line 316, in build_and_load
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     self.build(verbose, need_lock=False)
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/flashinfer/jit/core.py", line 302, in build
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     run_ninja(self.build_dir, self.ninja_path, verbose)
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901]   File "/workspace/venv/lib/python3.12/site-packages/flashinfer/jit/cpp_ext.py", line 380, in run_ninja
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901]     raise RuntimeError(msg) from e
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901] RuntimeError: Ninja build failed. Ninja output:
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901] ninja: Entering directory `/root/.cache/flashinfer/0.6.13/103a/cached_ops/fp4_quantization_103'
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901] [1/2]  /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile -MF /root/.cache/flashinfer/0.6.13/103a/cached_ops/fp4_quantization_103/kernel
+s_quantization.cuda.o.d -DPy_LIMITED_API=0x03090000 -D_GLIBCXX_USE_CXX11_ABI=1 -I/workspace/venv/lib/python3.12/site-packages/flashinfer/data/csrc/nv_internal -I/workspace/venv/lib/python3.12/site-packages/flashinfer/da
+ta/csrc/nv_internal/include -I/workspace/venv/lib/python3.12/site-packages/flashinfer/data/cccl/cub -I/workspace/venv/lib/python3.12/site-packages/flashinfer/data/cccl/libcudacxx/include -I/workspace/venv/lib/python3.12
+/site-packages/flashinfer/data/cccl/thrust -isystem /usr/include/python3.12 -isystem /usr/local/cuda/include -isystem /workspace/venv/lib/python3.12/site-packages/tvm_ffi/include -isystem /workspace/venv/lib/python3.12/
+site-packages/tvm_ffi/include -isystem /workspace/venv/lib/python3.12/site-packages/flashinfer/data/include -isystem /workspace/venv/lib/python3.12/site-packages/flashinfer/data/csrc -isystem /workspace/venv/lib/python3
+.12/site-packages/flashinfer/data/cutlass/include -isystem /workspace/venv/lib/python3.12/site-packages/flashinfer/data/cutlass/tools/util/include -isystem /workspace/venv/lib/python3.12/site-packages/flashinfer/data/sp
+dlog/include --compiler-options=-fPIC --expt-relaxed-constexpr -static-global-template-stub=false -DFLASHINFER_ENABLE_FP8_E8M0 -DFLASHINFER_ENABLE_FP4_E2M1 -std=c++17 --threads=1 -use_fast_math -Xfatbin=-compress-all -D
+FLASHINFER_ENABLE_F16 -DFLASHINFER_ENABLE_BF16 -DFLASHINFER_ENABLE_FP8_E4M3 -DFLASHINFER_ENABLE_FP8_E5M2 -DNDEBUG -O3 -gencode=arch=compute_103a,code=sm_103a -DFLASHINFER_ENABLE_FP8_E8M0 -DFLASHINFER_ENABLE_FP4_E2M1 -DE
+NABLE_BF16 -DENABLE_FP8 -DENABLE_FP4 -c /workspace/venv/lib/python3.12/site-packages/flashinfer/data/csrc/nv_internal/cpp/kernels/quantization.cu -o /root/.cache/flashinfer/0.6.13/103a/cached_ops/fp4_quantization_103/ke
+rnels_quantization.cuda.o
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901] FAILED: [code=1] /root/.cache/flashinfer/0.6.13/103a/cached_ops/fp4_quantization_103/kernels_quantization.cuda.o
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901]  /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile -MF /root/.cache/flashinfer/0.6.13/103a/cached_ops/fp4_quantization_103/kernels_quan
+tization.cuda.o.d -DPy_LIMITED_API=0x03090000 -D_GLIBCXX_USE_CXX11_ABI=1 -I/workspace/venv/lib/python3.12/site-packages/flashinfer/data/csrc/nv_internal -I/workspace/venv/lib/python3.12/site-packages/flashinfer/data/csr
+c/nv_internal/include -I/workspace/venv/lib/python3.12/site-packages/flashinfer/data/cccl/cub -I/workspace/venv/lib/python3.12/site-packages/flashinfer/data/cccl/libcudacxx/include -I/workspace/venv/lib/python3.12/site-
+packages/flashinfer/data/cccl/thrust -isystem /usr/include/python3.12 -isystem /usr/local/cuda/include -isystem /workspace/venv/lib/python3.12/site-packages/tvm_ffi/include -isystem /workspace/venv/lib/python3.12/site-p
+ackages/tvm_ffi/include -isystem /workspace/venv/lib/python3.12/site-packages/flashinfer/data/include -isystem /workspace/venv/lib/python3.12/site-packages/flashinfer/data/csrc -isystem /workspace/venv/lib/python3.12/si
+te-packages/flashinfer/data/cutlass/include -isystem /workspace/venv/lib/python3.12/site-packages/flashinfer/data/cutlass/tools/util/include -isystem /workspace/venv/lib/python3.12/site-packages/flashinfer/data/spdlog/i
+nclude --compiler-options=-fPIC --expt-relaxed-constexpr -static-global-template-stub=false -DFLASHINFER_ENABLE_FP8_E8M0 -DFLASHINFER_ENABLE_FP4_E2M1 -std=c++17 --threads=1 -use_fast_math -Xfatbin=-compress-all -DFLASHI
+NFER_ENABLE_F16 -DFLASHINFER_ENABLE_BF16 -DFLASHINFER_ENABLE_FP8_E4M3 -DFLASHINFER_ENABLE_FP8_E5M2 -DNDEBUG -O3 -gencode=arch=compute_103a,code=sm_103a -DFLASHINFER_ENABLE_FP8_E8M0 -DFLASHINFER_ENABLE_FP4_E2M1 -DENABLE_
+BF16 -DENABLE_FP8 -DENABLE_FP4 -c /workspace/venv/lib/python3.12/site-packages/flashinfer/data/csrc/nv_internal/cpp/kernels/quantization.cu -o /root/.cache/flashinfer/0.6.13/103a/cached_ops/fp4_quantization_103/kernels_
+quantization.cuda.o
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901] nvcc fatal   : Unsupported gpu architecture 'compute_103a'
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901] ninja: build stopped: subcommand failed.
+(Worker_TP1 pid=27293) ERROR 07-19 02:17:27 [multiproc_executor.py:901]
+[rank0]:[W719 02:17:27.017339604 ProcessGroupNCCL.cpp:1575] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stab
+le/distributed.html#shutdown (function operator())
+(EngineCore pid=27010) INFO 07-19 02:17:29 [multiproc_executor.py:436] [shutdown] Executor: all workers exited gracefully
+(EngineCore pid=27010) ERROR 07-19 02:17:29 [core.py:1330] EngineCore failed to start.
+(EngineCore pid=27010) ERROR 07-19 02:17:29 [core.py:1330] Traceback (most recent call last):
+(EngineCore pid=27010) ERROR 07-19 02:17:29 [core.py:1330]   File "/workspace/venv/lib/python3.12/site-packages/vllm/v1/engine/core.py", line 1299, in run_engine_core
+(EngineCore pid=27010) ERROR 07-19 02:17:29 [core.py:1330]     engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
+(EngineCore pid=27010) ERROR 07-19 02:17:29 [core.py:1330]                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=27010) ERROR 07-19 02:17:29 [core.py:1330]   File "/workspace/venv/lib/python3.12/site-packages/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore pid=27010) ERROR 07-19 02:17:29 [core.py:1330]     return func(*args, **kwargs)
+(EngineCore pid=27010) ERROR 07-19 02:17:29 [core.py:1330]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=27010) ERROR 07-19 02:17:29 [core.py:1330]   File "/workspace/venv/lib/python3.12/site-packages/vllm/v1/engine/core.py", line 1065, in __init__
+(EngineCore pid=27010) ERROR 07-19 02:17:29 [core.py:1330]     super().__init__(
+(EngineCore pid=27010) ERROR 07-19 02:17:29 [core.py:1330]   File "/workspace/venv/lib/python3.12/site-packages/vllm/v1/engine/core.py", line 125, in __init__
+(EngineCore pid=27010) ERROR 07-19 02:17:29 [core.py:1330]     self.model_executor = executor_class(vllm_config)
+(EngineCore pid=27010) ERROR 07-19 02:17:29 [core.py:1330]                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=27010) ERROR 07-19 02:17:29 [core.py:1330]   File "/workspace/venv/lib/python3.12/site-packages/vllm/v1/executor/multiproc_executor.py", line 108, in __init__
+(EngineCore pid=27010) ERROR 07-19 02:17:29 [core.py:1330]     super().__init__(vllm_config)
+(EngineCore pid=27010) ERROR 07-19 02:17:29 [core.py:1330]   File "/workspace/venv/lib/python3.12/site-packages/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore pid=27010) ERROR 07-19 02:17:29 [core.py:1330]     return func(*args, **kwargs)
+(EngineCore pid=27010) ERROR 07-19 02:17:29 [core.py:1330]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=27010) ERROR 07-19 02:17:29 [core.py:1330]   File "/workspace/venv/lib/python3.12/site-packages/vllm/v1/executor/abstract.py", line 109, in __init__
+(EngineCore pid=27010) ERROR 07-19 02:17:29 [core.py:1330]     self._init_executor()
+(EngineCore pid=27010) ERROR 07-19 02:17:29 [core.py:1330]   File "/workspace/venv/lib/python3.12/site-packages/vllm/v1/executor/multiproc_executor.py", line 201, in _init_executor
+(EngineCore pid=27010) ERROR 07-19 02:17:29 [core.py:1330]     self.workers = WorkerProc.wait_for_ready(unready_workers)
+(EngineCore pid=27010) ERROR 07-19 02:17:29 [core.py:1330]                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=27010) ERROR 07-19 02:17:29 [core.py:1330]   File "/workspace/venv/lib/python3.12/site-packages/vllm/v1/executor/multiproc_executor.py", line 765, in wait_for_ready
+(EngineCore pid=27010) ERROR 07-19 02:17:29 [core.py:1330]     raise e from None
+(EngineCore pid=27010) ERROR 07-19 02:17:29 [core.py:1330] Exception: WorkerProc initialization failed due to an exception in a background process. See stack trace for root cause.
+(EngineCore pid=27010) Process EngineCore:
+(EngineCore pid=27010) Traceback (most recent call last):
+(EngineCore pid=27010)   File "/usr/lib/python3.12/multiprocessing/process.py", line 314, in _bootstrap
+(EngineCore pid=27010)     self.run()
+(EngineCore pid=27010)   File "/usr/lib/python3.12/multiprocessing/process.py", line 108, in run
+(EngineCore pid=27010)     self._target(*self._args, **self._kwargs)
+(EngineCore pid=27010)   File "/workspace/venv/lib/python3.12/site-packages/vllm/v1/engine/core.py", line 1334, in run_engine_core
+(EngineCore pid=27010)     raise e
+(EngineCore pid=27010)   File "/workspace/venv/lib/python3.12/site-packages/vllm/v1/engine/core.py", line 1299, in run_engine_core
+(EngineCore pid=27010)     engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
+(EngineCore pid=27010)                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=27010)   File "/workspace/venv/lib/python3.12/site-packages/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore pid=27010)     return func(*args, **kwargs)
+(EngineCore pid=27010)            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=27010)   File "/workspace/venv/lib/python3.12/site-packages/vllm/v1/engine/core.py", line 1065, in __init__
+(EngineCore pid=27010)     super().__init__(
+(EngineCore pid=27010)   File "/workspace/venv/lib/python3.12/site-packages/vllm/v1/engine/core.py", line 125, in __init__
+(EngineCore pid=27010)     self.model_executor = executor_class(vllm_config)
+(EngineCore pid=27010)                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=27010)   File "/workspace/venv/lib/python3.12/site-packages/vllm/v1/executor/multiproc_executor.py", line 108, in __init__
+(EngineCore pid=27010)     super().__init__(vllm_config)
+(EngineCore pid=27010)   File "/workspace/venv/lib/python3.12/site-packages/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore pid=27010)     return func(*args, **kwargs)
+(EngineCore pid=27010)            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=27010)   File "/workspace/venv/lib/python3.12/site-packages/vllm/v1/executor/abstract.py", line 109, in __init__
+(EngineCore pid=27010)     self._init_executor()
+(EngineCore pid=27010)   File "/workspace/venv/lib/python3.12/site-packages/vllm/v1/executor/multiproc_executor.py", line 201, in _init_executor
+(EngineCore pid=27010)     self.workers = WorkerProc.wait_for_ready(unready_workers)
+(EngineCore pid=27010)                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=27010)   File "/workspace/venv/lib/python3.12/site-packages/vllm/v1/executor/multiproc_executor.py", line 765, in wait_for_ready
+(EngineCore pid=27010)     raise e from None
+(EngineCore pid=27010) Exception: WorkerProc initialization failed due to an exception in a background process. See stack trace for root cause.
+(APIServer pid=26253) Traceback (most recent call last):
+(APIServer pid=26253)   File "/workspace/venv/bin/vllm", line 6, in <module>
+(APIServer pid=26253)     sys.exit(main())
+(APIServer pid=26253)              ^^^^^^
+(APIServer pid=26253)   File "/workspace/venv/lib/python3.12/site-packages/vllm/entrypoints/cli/main.py", line 95, in main
+(APIServer pid=26253)     args.dispatch_function(args)
+(APIServer pid=26253)   File "/workspace/venv/lib/python3.12/site-packages/vllm/entrypoints/cli/serve.py", line 148, in cmd
+(APIServer pid=26253)     uvloop.run(run_server(args))
+(APIServer pid=26253)   File "/workspace/venv/lib/python3.12/site-packages/uvloop/__init__.py", line 96, in run
+(APIServer pid=26253)     return __asyncio.run(
+(APIServer pid=26253)            ^^^^^^^^^^^^^^
+(APIServer pid=26253)   File "/usr/lib/python3.12/asyncio/runners.py", line 194, in run
+(APIServer pid=26253)     return runner.run(main)
+(APIServer pid=26253)            ^^^^^^^^^^^^^^^^
+(APIServer pid=26253)   File "/usr/lib/python3.12/asyncio/runners.py", line 118, in run
+(APIServer pid=26253)     return self._loop.run_until_complete(task)
+(APIServer pid=26253)            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(APIServer pid=26253)   File "uvloop/loop.pyx", line 1518, in uvloop.loop.Loop.run_until_complete
+(APIServer pid=26253)   File "/workspace/venv/lib/python3.12/site-packages/uvloop/__init__.py", line 48, in wrapper
+(APIServer pid=26253)     return await main
+(APIServer pid=26253)            ^^^^^^^^^^
+(APIServer pid=26253)   File "/workspace/venv/lib/python3.12/site-packages/vllm/entrypoints/openai/api_server.py", line 759, in run_server
+(APIServer pid=26253)     await run_server_worker(listen_address, sock, args, **uvicorn_kwargs)
+(APIServer pid=26253)   File "/workspace/venv/lib/python3.12/site-packages/vllm/entrypoints/openai/api_server.py", line 773, in run_server_worker
+(APIServer pid=26253)     async with build_async_engine_client(
+(APIServer pid=26253)   File "/usr/lib/python3.12/contextlib.py", line 210, in __aenter__
+(APIServer pid=26253)     return await anext(self.gen)
+(APIServer pid=26253)            ^^^^^^^^^^^^^^^^^^^^^
+(APIServer pid=26253)   File "/workspace/venv/lib/python3.12/site-packages/vllm/entrypoints/openai/api_server.py", line 139, in build_async_engine_client
+(APIServer pid=26253)     async with build_async_engine_client_from_engine_args(
+(APIServer pid=26253)   File "/usr/lib/python3.12/contextlib.py", line 210, in __aenter__
+(APIServer pid=26253)     return await anext(self.gen)
+(APIServer pid=26253)            ^^^^^^^^^^^^^^^^^^^^^
+(APIServer pid=26253)   File "/workspace/venv/lib/python3.12/site-packages/vllm/entrypoints/openai/api_server.py", line 175, in build_async_engine_client_from_engine_args
+(APIServer pid=26253)     async_llm = AsyncLLM.from_vllm_config(
+(APIServer pid=26253)                 ^^^^^^^^^^^^^^^^^^^^^^^^^^
+(APIServer pid=26253)   File "/workspace/venv/lib/python3.12/site-packages/vllm/v1/engine/async_llm.py", line 217, in from_vllm_config
+(APIServer pid=26253)     return cls(
+(APIServer pid=26253)            ^^^^
+(APIServer pid=26253)   File "/workspace/venv/lib/python3.12/site-packages/vllm/v1/engine/async_llm.py", line 146, in __init__
+(APIServer pid=26253)     self.engine_core = EngineCoreClient.make_async_mp_client(
+(APIServer pid=26253)                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(APIServer pid=26253)   File "/workspace/venv/lib/python3.12/site-packages/vllm/tracing/otel.py", line 178, in sync_wrapper
+(APIServer pid=26253)     return func(*args, **kwargs)
+(APIServer pid=26253)            ^^^^^^^^^^^^^^^^^^^^^
+(APIServer pid=26253)   File "/workspace/venv/lib/python3.12/site-packages/vllm/v1/engine/core_client.py", line 132, in make_async_mp_client
+(APIServer pid=26253)     return AsyncMPClient(*client_args)
+(APIServer pid=26253)            ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(APIServer pid=26253)   File "/workspace/venv/lib/python3.12/site-packages/vllm/tracing/otel.py", line 178, in sync_wrapper
+(APIServer pid=26253)     return func(*args, **kwargs)
+(APIServer pid=26253)            ^^^^^^^^^^^^^^^^^^^^^
+(APIServer pid=26253)   File "/workspace/venv/lib/python3.12/site-packages/vllm/v1/engine/core_client.py", line 963, in __init__
+(APIServer pid=26253)     super().__init__(
+(APIServer pid=26253)   File "/workspace/venv/lib/python3.12/site-packages/vllm/v1/engine/core_client.py", line 573, in __init__
+(APIServer pid=26253)     with launch_core_engines(
+(APIServer pid=26253)   File "/usr/lib/python3.12/contextlib.py", line 144, in __exit__
+(APIServer pid=26253)     next(self.gen)
+(APIServer pid=26253)   File "/workspace/venv/lib/python3.12/site-packages/vllm/v1/engine/utils.py", line 1213, in launch_core_engines
+(APIServer pid=26253)     wait_for_engine_startup(
+(APIServer pid=26253)   File "/workspace/venv/lib/python3.12/site-packages/vllm/v1/engine/utils.py", line 1272, in wait_for_engine_startup
+(APIServer pid=26253)     raise RuntimeError(
+(APIServer pid=26253) RuntimeError: Engine core initialization failed. See root cause above. Failed core proc(s): {}
+/usr/lib/python3.12/multiprocessing/resource_tracker.py:254: UserWarning: resource_tracker: There appear to be 1 leaked shared_memory objects to clean up at shutdown
+  warnings.warn('resource_tracker: There appear to be %d '
+(venv) root@70e466497cb1:/# bash /workspace/tm-opt/scripts/serve_vllm_baseline.sh
+(APIServer pid=48092) INFO 07-19 04:10:51 [api_utils.py:345]
+(APIServer pid=48092) INFO 07-19 04:10:51 [api_utils.py:345]        █     █     █▄   ▄█
+(APIServer pid=48092) INFO 07-19 04:10:51 [api_utils.py:345]  ▄▄ ▄█ █     █     █ ▀▄▀ █  version 0.23.1rc1.dev1270+g9243e0124
+(APIServer pid=48092) INFO 07-19 04:10:51 [api_utils.py:345]   █▄█▀ █     █     █     █  model   /workspace/models/inkling-nvfp4
+(APIServer pid=48092) INFO 07-19 04:10:51 [api_utils.py:345]    ▀▀  ▀▀▀▀▀ ▀▀▀▀▀ ▀     ▀
+(APIServer pid=48092) INFO 07-19 04:10:51 [api_utils.py:345]
+(APIServer pid=48092) INFO 07-19 04:10:51 [api_utils.py:273] non-default args: {'model_tag': '/workspace/models/inkling-nvfp4', 'port': 8106, 'model': '/workspace/models/inkling-nvfp4', 'tokenizer_mode': 'inkling', 'tru
+st_remote_code': True, 'max_model_len': 16384, 'reasoning_parser': 'inkling', 'tensor_parallel_size': 4}
+(APIServer pid=48092) INFO 07-19 04:10:51 [model.py:623] Resolved architecture: InklingForConditionalGeneration
+(APIServer pid=48092) INFO 07-19 04:10:51 [model.py:1788] Using max model len 16384
+(APIServer pid=48092) WARNING 07-19 04:10:52 [torch_utils.py:355] WARNING: Unknown kv_cache_quant_algo 'none' in model config. Supported values: ['fp8', 'nvfp4']. Falling back to 'auto'.
+(APIServer pid=48092) INFO 07-19 04:10:52 [scheduler.py:252] Chunked prefill is enabled with max_num_batched_tokens=8192.
+(APIServer pid=48092) WARNING 07-19 04:10:52 [modelopt.py:1034] Detected ModelOpt NVFP4 checkpoint (quant_algo=NVFP4). Please note that the format is experimental and could change in future.
+(APIServer pid=48092) INFO 07-19 04:10:52 [vllm.py:1109] Asynchronous scheduling is enabled.
+(APIServer pid=48092) INFO 07-19 04:10:52 [vllm.py:1197] Auto-enabling VLLM_USE_BREAKABLE_CUDAGRAPH=1. Set VLLM_USE_BREAKABLE_CUDAGRAPH=0 to opt out.
+(APIServer pid=48092) WARNING 07-19 04:10:52 [vllm.py:1203] VLLM_USE_BREAKABLE_CUDAGRAPH is set, disabling vLLM's torch.compile pipeline. Equivalent to -cc.mode=none.
+(APIServer pid=48092) WARNING 07-19 04:10:52 [vllm.py:1213] Inductor compilation was disabled by user settings, optimizations settings that are only active during inductor compilation will be ignored.
+(APIServer pid=48092) INFO 07-19 04:10:52 [kernel.py:295] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native'])
+(APIServer pid=48092) WARNING 07-19 04:10:52 [vllm.py:2227] Model Runner V2 does not yet support the thinking_token_budget request parameter. Set VLLM_USE_V2_MODEL_RUNNER=0 if this is required.
+(APIServer pid=48092) INFO 07-19 04:11:00 [compilation.py:329] Enabled custom fusions: norm_quant, act_quant, allreduce_rms
+(EngineCore pid=48834) INFO 07-19 04:11:08 [core.py:116] Initializing a V1 LLM engine (v0.23.1rc1.dev1270+g9243e0124) with config: model='/workspace/models/inkling-nvfp4', speculative_config=None, tokenizer='/workspace/
+models/inkling-nvfp4', skip_tokenizer_init=False, tokenizer_mode=inkling, revision=None, tokenizer_revision=None, trust_remote_code=True, dtype=torch.bfloat16, max_seq_len=16384, download_dir=None, load_format=auto, ten
+sor_parallel_size=4, pipeline_parallel_size=1, data_parallel_size=1, decode_context_parallel_size=1, dcp_comm_backend=ag_rs, disable_custom_all_reduce=False, quantization=modelopt_fp4, quantization_config=None, enforce_
+eager=False, enable_return_routed_experts=False, kv_cache_dtype=auto, device_config=cuda, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_any_whitespace=False, disable_additional_properties=Fal
+se, reasoning_parser='inkling', reasoning_parser_plugin='', enable_in_reasoning=False), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=N
+one, kv_cache_metrics=False, kv_cache_metrics_sample=0.01, cudagraph_metrics=False, enable_layerwise_nvtx_tracing=False, enable_mfu_metrics=False, enable_mm_processor_stats=False, enable_logging_iteration_details=False,
+ jit_monitor_mode='warn', jit_monitor_verbose=False), seed=0, served_model_name=/workspace/models/inkling-nvfp4, enable_prefix_caching=True, enable_chunked_prefill=True, pooler_config=None, compilation_config={'mode': <
+CompilationMode.NONE: 0>, 'debug_dump_path': None, 'cache_dir': '', 'compile_cache_save_format': 'binary', 'backend': 'inductor', 'custom_ops': ['all'], 'ir_enable_torch_wrap': False, 'splitting_ops': [], 'compile_mm_en
+coder': False, 'cudagraph_mm_encoder': False, 'encoder_cudagraph_token_budgets': [], 'encoder_cudagraph_max_vision_items_per_batch': 0, 'encoder_cudagraph_max_frames_per_batch': None, 'compile_sizes': [], 'compile_range
+s_endpoints': [5461, 8192], 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'size_asserts': False, 'alignment_asserts': False, 'scalar_asserts': False, 'combo_kernels': True, 'benchmark_combo_kernel'
+: True}, 'inductor_passes': {}, 'cudagraph_mode': <CUDAGraphMode.FULL_AND_PIECEWISE: (2, 1)>, 'cudagraph_num_of_warmups': 1, 'cudagraph_capture_sizes': [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112,
+120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256, 272, 288, 304, 320, 336, 352, 368, 384, 400, 416, 432, 448, 464, 480, 496, 512], 'cudagraph_copy_inputs': False, 'cudagraph_speci
+alize_lora': True, 'use_inductor_graph_partition': False, 'pass_config': {'fuse_norm_quant': True, 'fuse_act_quant': True, 'fuse_attn_quant': False, 'enable_sp': False, 'fuse_gemm_comms': False, 'fuse_allreduce_rms': Tr
+ue, 'enable_qk_norm_rope_fusion': False, 'fuse_rope_kvcache_cat_mla': False, 'fuse_act_padding': False, 'fuse_qk_norm_rope_kvcache': False}, 'max_cudagraph_capture_size': 512, 'dynamic_shapes_config': {'type': <DynamicS
+hapesType.BACKED: 'backed'>, 'evaluate_guards': False, 'assume_32_bit_indexing': False}, 'local_cache_dir': None, 'fast_moe_cold_start': False, 'static_all_moe_layers': []}, kernel_config=KernelConfig(ir_op_priority=IrO
+pPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native']), enable_flashinfer_autotune=True, enable_cutedsl_warmup=True, enable_bf16x3_router_gemm=False, moe_backend='auto', linear_backend='
+auto')
+(EngineCore pid=48834) WARNING 07-19 04:11:08 [multiproc_executor.py:1070] Reducing Torch parallelism from 172 threads to 1 to avoid unnecessary CPU contention. Set OMP_NUM_THREADS in the external environment to tune th
+is value as needed.
+(EngineCore pid=48834) INFO 07-19 04:11:08 [multiproc_executor.py:140] DP group leader: node_rank=0, node_rank_within_dp=0, master_addr=127.0.0.1, mq_connect_ip=172.19.0.2 (local), world_size=4, local_world_size=4
+(Worker pid=49131) INFO 07-19 04:11:19 [parallel_state.py:1615] world_size=4 rank=0 local_rank=0 distributed_init_method=tcp://127.0.0.1:39293 backend=nccl
+(Worker pid=49133) INFO 07-19 04:11:21 [parallel_state.py:1615] world_size=4 rank=2 local_rank=2 distributed_init_method=tcp://127.0.0.1:39293 backend=nccl
+(Worker pid=49132) INFO 07-19 04:11:21 [parallel_state.py:1615] world_size=4 rank=1 local_rank=1 distributed_init_method=tcp://127.0.0.1:39293 backend=nccl
+(Worker pid=49134) INFO 07-19 04:11:21 [parallel_state.py:1615] world_size=4 rank=3 local_rank=3 distributed_init_method=tcp://127.0.0.1:39293 backend=nccl
+(Worker pid=49131) INFO 07-19 04:11:22 [pynccl.py:113] vLLM is using nccl==2.28.9
+(Worker pid=49131) INFO 07-19 04:11:25 [cuda_communicator.py:264] Using ['CUSTOM', 'SYMM_MEM', 'PYNCCL'] all-reduce backends (in dispatch order) for group 'tp:0' out of potential backends: ['NCCL_SYMM_MEM', 'QUICK_REDUC
+E', 'FLASHINFER', 'AITER_CUSTOM', 'CUSTOM', 'SYMM_MEM', 'PYNCCL'].
+(Worker pid=49131) INFO 07-19 04:11:26 [cuda_communicator.py:264] Using ['PYNCCL'] all-reduce backends (in dispatch order) for group 'ep:0' out of potential backends: ['NCCL_SYMM_MEM', 'QUICK_REDUCE', 'FLASHINFER', 'AIT
+ER_CUSTOM', 'CUSTOM', 'SYMM_MEM', 'PYNCCL'].
+(Worker pid=49131) INFO 07-19 04:11:26 [parallel_state.py:1950] rank 0 in world size 4 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, EP rank 0, EPLB rank N/A
+(Worker pid=49131) INFO 07-19 04:11:26 [gpu_worker.py:378] Using V2 Model Runner
+(Worker_TP0 pid=49131) INFO 07-19 04:11:26 [model_runner.py:281] Loading model from scratch...
+(Worker_TP0 pid=49131) INFO 07-19 04:11:26 [unquantized.py:302] Using FlashInfer CUTLASS Unquantized MoE backend out of potential backends: ['FlashInfer TRTLLM', 'FlashInfer CUTLASS', 'TRITON', 'BATCHED_TRITON'].
+(Worker_TP0 pid=49131) INFO 07-19 04:11:26 [nvfp4.py:285] Using 'FLASHINFER_TRTLLM' NvFp4 MoE backend out of potential backends: ['FLASHINFER_TRTLLM', 'FLASHINFER_CUTEDSL', 'FLASHINFER_CUTEDSL_BATCHED', 'FLASHINFER_CUTL
+ASS', 'VLLM_CUTLASS', 'MARLIN', 'HUMMING', 'EMULATION'].
+(Worker_TP3 pid=49134) INFO 07-19 04:11:26 [model_runner.py:281] Loading model from scratch...
+(Worker_TP1 pid=49132) INFO 07-19 04:11:26 [model_runner.py:281] Loading model from scratch...
+(Worker_TP2 pid=49133) INFO 07-19 04:11:26 [model_runner.py:281] Loading model from scratch...
+(Worker_TP0 pid=49131) INFO 07-19 04:11:27 [weight_utils.py:869] Filesystem type for checkpoints: XFS. Checkpoint size: 551.35 GiB. Available RAM: 3947.36 GiB.
+(Worker_TP0 pid=49131) INFO 07-19 04:11:27 [weight_utils.py:892] Auto-prefetch is disabled because the filesystem (XFS) is not a recognized network FS (NFS/Lustre). If you want to force prefetching, start vLLM with --sa
+fetensors-load-strategy=prefetch.
+Loading safetensors checkpoint shards:   0% Completed | 0/34 [00:00<?, ?it/s]
+Loading safetensors checkpoint shards:   3% Completed | 1/34 [00:00<00:30,  1.07it/s]
+Loading safetensors checkpoint shards:   6% Completed | 2/34 [00:02<00:37,  1.16s/it]
+Loading safetensors checkpoint shards:   9% Completed | 3/34 [00:03<00:37,  1.21s/it]
+Loading safetensors checkpoint shards:  12% Completed | 4/34 [00:04<00:33,  1.12s/it]
+Loading safetensors checkpoint shards:  15% Completed | 5/34 [00:05<00:31,  1.09s/it]
+Loading safetensors checkpoint shards:  18% Completed | 6/34 [00:06<00:28,  1.02s/it]
+Loading safetensors checkpoint shards:  21% Completed | 7/34 [00:07<00:29,  1.09s/it]
+Loading safetensors checkpoint shards:  24% Completed | 8/34 [00:09<00:31,  1.22s/it]
+Loading safetensors checkpoint shards:  26% Completed | 9/34 [00:09<00:26,  1.08s/it]
+Loading safetensors checkpoint shards:  29% Completed | 10/34 [00:11<00:29,  1.25s/it]
+Loading safetensors checkpoint shards:  32% Completed | 11/34 [00:12<00:25,  1.11s/it]
+Loading safetensors checkpoint shards:  35% Completed | 12/34 [00:12<00:21,  1.04it/s]
+Loading safetensors checkpoint shards:  38% Completed | 13/34 [00:14<00:21,  1.02s/it]
+Loading safetensors checkpoint shards:  41% Completed | 14/34 [00:15<00:20,  1.01s/it]
+Loading safetensors checkpoint shards:  44% Completed | 15/34 [00:15<00:18,  1.04it/s]
+Loading safetensors checkpoint shards:  47% Completed | 16/34 [00:16<00:16,  1.09it/s]
+Loading safetensors checkpoint shards:  50% Completed | 17/34 [00:17<00:17,  1.00s/it]
+Loading safetensors checkpoint shards:  53% Completed | 18/34 [00:19<00:17,  1.12s/it]
+Loading safetensors checkpoint shards:  56% Completed | 19/34 [00:20<00:15,  1.03s/it]
+Loading safetensors checkpoint shards:  59% Completed | 20/34 [00:21<00:15,  1.11s/it]
+Loading safetensors checkpoint shards:  62% Completed | 21/34 [00:22<00:14,  1.11s/it]
+Loading safetensors checkpoint shards:  65% Completed | 22/34 [00:23<00:12,  1.08s/it]
+Loading safetensors checkpoint shards:  68% Completed | 23/34 [00:24<00:10,  1.03it/s]
+Loading safetensors checkpoint shards:  71% Completed | 24/34 [00:25<00:09,  1.10it/s]
+Loading safetensors checkpoint shards:  74% Completed | 25/34 [00:26<00:08,  1.01it/s]
+Loading safetensors checkpoint shards:  76% Completed | 26/34 [00:27<00:08,  1.08s/it]
+Loading safetensors checkpoint shards:  79% Completed | 27/34 [00:28<00:07,  1.12s/it]
+Loading safetensors checkpoint shards:  82% Completed | 28/34 [00:29<00:06,  1.11s/it]
+Loading safetensors checkpoint shards:  85% Completed | 29/34 [00:31<00:06,  1.23s/it]
+Loading safetensors checkpoint shards:  88% Completed | 30/34 [00:31<00:03,  1.09it/s]
+Loading safetensors checkpoint shards:  91% Completed | 31/34 [00:32<00:02,  1.25it/s]
+Loading safetensors checkpoint shards:  94% Completed | 32/34 [00:32<00:01,  1.27it/s]
+Loading safetensors checkpoint shards:  97% Completed | 33/34 [00:32<00:00,  1.68it/s]
+Loading safetensors checkpoint shards: 100% Completed | 34/34 [00:32<00:00,  1.03it/s]
+(Worker_TP0 pid=49131)
+(Worker_TP0 pid=49131) INFO 07-19 04:12:00 [default_loader.py:430] Loading weights took 33.00 seconds
+(Worker_TP0 pid=49131) INFO 07-19 04:12:00 [unquantized.py:374] Using MoEPrepareAndFinalizeNoDPEPModular
+(Worker_TP0 pid=49131) INFO 07-19 04:12:00 [unquantized.py:375] Using FlashInferExperts MoE backend
+(Worker_TP0 pid=49131) INFO 07-19 04:12:01 [nvfp4.py:544] Using MoEPrepareAndFinalizeNoDPEPModular
+(Worker_TP1 pid=49132) INFO 07-19 04:12:08 [model_runner.py:302] Model loading took 137.46 GiB and 41.810125 seconds
+(Worker_TP2 pid=49133) INFO 07-19 04:12:08 [model_runner.py:302] Model loading took 137.46 GiB and 42.028542 seconds
+(Worker_TP0 pid=49131) INFO 07-19 04:12:08 [model_runner.py:302] Model loading took 137.46 GiB and 42.352518 seconds
+(Worker_TP0 pid=49131) INFO 07-19 04:12:08 [topk_topp_sampler.py:55] Using FlashInfer for top-p & top-k sampling.
+(Worker_TP3 pid=49134) INFO 07-19 04:12:10 [model_runner.py:302] Model loading took 137.46 GiB and 44.321665 seconds
+(Worker_TP0 pid=49131) INFO 07-19 04:12:13 [gpu_worker.py:560] Available KV cache memory: 106.27 GiB
+(EngineCore pid=48834) INFO 07-19 04:12:13 [kv_cache_utils.py:2178] GPU KV cache size: 171,639 tokens
+(EngineCore pid=48834) INFO 07-19 04:12:13 [kv_cache_utils.py:2179] Maximum concurrency for 16,384 tokens per request: 10.48x
+(Worker_TP1 pid=49132) 2026-07-19 04:12:13,780 - INFO - autotuner.py:651 - flashinfer.jit: [Autotuner]: Autotuning process starts ...
+(Worker_TP0 pid=49131) 2026-07-19 04:12:13,780 - INFO - autotuner.py:651 - flashinfer.jit: [Autotuner]: Autotuning process starts ...
+(Worker_TP2 pid=49133) 2026-07-19 04:12:13,781 - INFO - autotuner.py:651 - flashinfer.jit: [Autotuner]: Autotuning process starts ...
+(Worker_TP3 pid=49134) 2026-07-19 04:12:13,782 - INFO - autotuner.py:651 - flashinfer.jit: [Autotuner]: Autotuning process starts ...
+[AutoTuner]: Tuning trtllm::fused_moe::gemm1:   0%|                                                                                                                                           | 0/21 [00:00<?, ?profile/s](
+[AutoTuner]: Tuning trtllm::fused_moe::gemm1:   0%|                                                                                                                                           | 0/21 [00:00<?, ?profile/s](
+[AutoTuner]: Tuning trtllm::fused_moe::gemm1:   0%|                                                                                                                                           | 0/21 [00:00<?, ?profile/s](
+[AutoTuner]: Tuning trtllm::fused_moe::gemm1:  95%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████▊      | 20/21 [00:59<00:04,  4.28s/profile](
+EngineCore pid=48834) INFO 07-19 04:13:14 [shm_broadcast.py:705] No available shared memory broadcast block found in 60 seconds. This typically happens when some processes are hanging or doing some time-consuming work (
+e.g. compilation, weight/kv cache quantization).
+[AutoTuner]: Tuning trtllm::fused_moe::gemm1: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 21/21 [01:05<00:00,  3.10s/profile]
+[AutoTuner]: Tuning trtllm::fused_moe::gemm1: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 21/21 [01:05<00:00,  3.10s/profile]
+[AutoTuner]: Tuning trtllm::fused_moe::gemm1: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 21/21 [01:05<00:00,  3.12s/profile]
+[AutoTuner]: Tuning trtllm::fused_moe::gemm1: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 21/21 [01:05<00:00,  3.12s/profile]
+[AutoTuner]: Tuning trtllm::fused_moe::gemm2:  90%|█████████████████████████████████████████████████████████████████████████████████████████████████████████████████████▌            | 19/21 [00:53<00:07,  3.96s/profile](
+EngineCore pid=48834) INFO 07-19 04:14:14 [shm_broadcast.py:705] No available shared memory broadcast block found in 60 seconds. This typically happens when some processes are hanging or doing some time-consuming work (
+e.g. compilation, weight/kv cache quantization).
+[AutoTuner]: Tuning trtllm::fused_moe::gemm2: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 21/21 [01:03<00:00,  3.04s/profile]
+[AutoTuner]: Tuning trtllm::fused_moe::gemm2: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 21/21 [01:03<00:00,  3.04s/profile]
+[AutoTuner]: Tuning trtllm::fused_moe::gemm2: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 21/21 [01:03<00:00,  3.04s/profile]
+[AutoTuner]: Tuning trtllm::fused_moe::gemm2: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 21/21 [01:03<00:00,  3.05s/profile]
+[AutoTuner]: Tuning flashinfer::trtllm_fp4_block_scale_moe:   0%|                                                                                                                             | 0/21 [00:00<?, ?profile/s](
+[AutoTuner]: Tuning flashinfer::trtllm_fp4_block_scale_moe:   0%|                                                                                                                             | 0/21 [00:00<?, ?profile/s](
+[AutoTuner]: Tuning flashinfer::trtllm_fp4_block_scale_moe:   0%|                                                                                                                             | 0/21 [00:00<?, ?profile/s](
+[AutoTuner]: Tuning flashinfer::trtllm_fp4_block_scale_moe:  29%|█████████████████████████████████▍                                                                                   | 6/21 [00:50<02:22,  9.53s/profile](
+EngineCore pid=48834) INFO 07-19 04:15:14 [shm_broadcast.py:705] No available shared memory broadcast block found in 60 seconds. This typically happens when some processes are hanging or doing some time-consuming work (
+e.g. compilation, weight/kv cache quantization).
+[AutoTuner]: Tuning flashinfer::trtllm_fp4_block_scale_moe:  52%|████████████████████████████████████████████████████████████▊                                                       | 11/21 [01:45<01:47, 10.76s/profile](
+EngineCore pid=48834) INFO 07-19 04:16:14 [shm_broadcast.py:705] No available shared memory broadcast block found in 60 seconds. This typically happens when some processes are hanging or doing some time-consuming work (
+e.g. compilation, weight/kv cache quantization).
+[AutoTuner]: Tuning flashinfer::trtllm_fp4_block_scale_moe: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 21/21 [02:32<00:00,  7.26s/profile]
+[AutoTuner]: Tuning flashinfer::trtllm_fp4_block_scale_moe: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 21/21 [02:32<00:00,  7.27s/profile]
+[AutoTuner]: Tuning flashinfer::trtllm_fp4_block_scale_moe: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 21/21 [02:32<00:00,  7.28s/profile]
+[AutoTuner]: Tuning flashinfer::trtllm_fp4_block_scale_moe: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 21/21 [02:36<00:00,  7.45s/profile]
+(Worker_TP1 pid=49132) 2026-07-19 04:17:00,384 - INFO - autotuner.py:674 - flashinfer.jit: [Autotuner]: Autotuning process ends
+(Worker_TP0 pid=49131) 2026-07-19 04:17:00,385 - INFO - autotuner.py:674 - flashinfer.jit: [Autotuner]: Autotuning process ends
+(Worker_TP2 pid=49133) 2026-07-19 04:17:00,386 - INFO - autotuner.py:674 - flashinfer.jit: [Autotuner]: Autotuning process ends
+(Worker_TP3 pid=49134) 2026-07-19 04:17:00,391 - INFO - autotuner.py:674 - flashinfer.jit: [Autotuner]: Autotuning process ends
+(Worker_TP1 pid=49132) (Worker_TP2 pid=49133) INFO 07-19 04:17:00 [kernel_warmup.py:65] Warming up ll_bf16 router GEMM kernels.
+INFO 07-19 04:17:00 [kernel_warmup.py:65] Warming up ll_bf16 router GEMM kernels.
+(Worker_TP3 pid=49134) INFO 07-19 04:17:00 [kernel_warmup.py:65] Warming up ll_bf16 router GEMM kernels.
+(Worker_TP0 pid=49131) INFO 07-19 04:17:00 [kernel_warmup.py:65] Warming up ll_bf16 router GEMM kernels.
+(Worker_TP1 pid=49132) INFO 07-19 04:17:12 [cutedsl_warmup.py:105] Warming up CuTeDSL compile_units=130 names=['inkling_fa4'].
+(Worker_TP2 pid=49133) INFO 07-19 04:17:12 [cutedsl_warmup.py:105] Warming up CuTeDSL compile_units=130 names=['inkling_fa4'].
+(Worker_TP3 pid=49134) INFO 07-19 04:17:12 [cutedsl_warmup.py:105] Warming up CuTeDSL compile_units=130 names=['inkling_fa4'].
+(Worker_TP0 pid=49131) INFO 07-19 04:17:12 [cutedsl_warmup.py:105] Warming up CuTeDSL compile_units=130 names=['inkling_fa4'].
+Compiling CuTeDSL kernels:  58%|███████████████████████████████████████████████████████████████████████████████████████▋                                                                | 75/130 [00:00<00:00, 383.56it/s](
+Worker_TP1 pid=49132) INFO 07-19 04:17:12 [cutedsl_warmup.py:113] CuTeDSL warmup compiled 130 units in 0.34 s.
+(Worker_TP2 pid=49133) INFO 07-19 04:17:12 [cutedsl_warmup.py:113] CuTeDSL warmup compiled 130 units in 0.34 s.
+(Worker_TP3 pid=49134) INFO 07-19 04:17:12 [cutedsl_warmup.py:113] CuTeDSL warmup compiled 130 units in 0.34 s.
+Compiling CuTeDSL kernels: 100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 130/130 [00:00<00:00, 379.28it/s]
+(Worker_TP0 pid=49131) INFO 07-19 04:17:12 [cutedsl_warmup.py:113] CuTeDSL warmup compiled 130 units in 0.34 s.
+(Worker_TP0 pid=49131) INFO 07-19 04:17:13 [breakable_cudagraph.py:288] Breakable CUDA graph enabled
+Capturing CUDA graphs (PIECEWISE):   6%|████████▋                                                                                                                                          | 3/51 [00:01<00:27,  1.73it/s](
+EngineCore pid=48834) INFO 07-19 04:17:15 [shm_broadcast.py:705] No available shared memory broadcast block found in 60 seconds. This typically happens when some processes are hanging or doing some time-consuming work (
+e.g. compilation, weight/kv cache quantization).
+Capturing CUDA graphs (PIECEWISE): 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 51/51 [00:30<00:00,  1.66it/s]
+Capturing CUDA graphs (FULL):  98%|████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████   | 50/51 [00:15<00:00,  3.52it/s](
+Worker_TP3 pid=49134) INFO 07-19 04:17:59 [custom_all_reduce.py:213] Registering 0 cuda graph addresses
+(Worker_TP1 pid=49132) INFO 07-19 04:17:59 [custom_all_reduce.py:213] Registering 0 cuda graph addresses
+(Worker_TP2 pid=49133) INFO 07-19 04:17:59 [custom_all_reduce.py:213] Registering 0 cuda graph addresses
+Capturing CUDA graphs (FULL): 100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 51/51 [00:15<00:00,  3.32it/s]
+(Worker_TP0 pid=49131) INFO 07-19 04:17:59 [custom_all_reduce.py:213] Registering 0 cuda graph addresses
+(Worker_TP3 pid=49134) INFO 07-19 04:17:59 [model_runner.py:737] Graph capturing finished in 46 secs, took 2.53 GiB
+(Worker_TP1 pid=49132) INFO 07-19 04:17:59 [model_runner.py:737] Graph capturing finished in 46 secs, took 2.53 GiB
+(Worker_TP2 pid=49133) (Worker_TP0 pid=49131) INFO 07-19 04:17:59 [model_runner.py:737] Graph capturing finished in 46 secs, took 2.53 GiB
+INFO 07-19 04:17:59 [model_runner.py:737] Graph capturing finished in 46 secs, took 2.53 GiB
+(Worker_TP3 pid=49134) INFO 07-19 04:17:59 [gpu_worker.py:857] Free memory on device (265.28/267.69 GiB) on startup. Desired GPU memory utilization is (0.92, 246.27 GiB). Actual usage is 137.46 GiB for weight, 1.91 GiB
+for peak activation, 0.63 GiB for non-torch memory, and 2.53 GiB for CUDAGraph memory. Replace gpu_memory_utilization config with `--kv-cache-memory=111232008643` (103.59 GiB) to fit into requested memory, or `--kv-cach
+e-memory=131644967936` (122.6 GiB) to fully utilize gpu memory. Current kv cache memory in use is 106.27 GiB.
+(Worker_TP1 pid=49132) INFO 07-19 04:17:59 [gpu_worker.py:857] Free memory on device (265.28/267.69 GiB) on startup. Desired GPU memory utilization is (0.92, 246.27 GiB). Actual usage is 137.46 GiB for weight, 1.91 GiB
+for peak activation, 0.63 GiB for non-torch memory, and 2.53 GiB for CUDAGraph memory. Replace gpu_memory_utilization config with `--kv-cache-memory=111232008643` (103.59 GiB) to fit into requested memory, or `--kv-cach
+e-memory=131644967936` (122.6 GiB) to fully utilize gpu memory. Current kv cache memory in use is 106.27 GiB.
+(Worker_TP2 pid=49133) INFO 07-19 04:17:59 [gpu_worker.py:857] Free memory on device (265.28/267.69 GiB) on startup. Desired GPU memory utilization is (0.92, 246.27 GiB). Actual usage is 137.46 GiB for weight, 1.91 GiB
+for peak activation, 0.63 GiB for non-torch memory, and 2.53 GiB for CUDAGraph memory. Replace gpu_memory_utilization config with `--kv-cache-memory=111232008643` (103.59 GiB) to fit into requested memory, or `--kv-cach
+e-memory=131644967936` (122.6 GiB) to fully utilize gpu memory. Current kv cache memory in use is 106.27 GiB.
+(Worker_TP0 pid=49131) INFO 07-19 04:17:59 [gpu_worker.py:857] Free memory on device (265.28/267.69 GiB) on startup. Desired GPU memory utilization is (0.92, 246.27 GiB). Actual usage is 137.46 GiB for weight, 1.91 GiB
+for peak activation, 0.63 GiB for non-torch memory, and 2.53 GiB for CUDAGraph memory. Replace gpu_memory_utilization config with `--kv-cache-memory=111232008643` (103.59 GiB) to fit into requested memory, or `--kv-cach
+e-memory=131644967936` (122.6 GiB) to fully utilize gpu memory. Current kv cache memory in use is 106.27 GiB.
+(Worker_TP3 pid=49134) INFO 07-19 04:18:00 [jit_monitor.py:79] Kernel JIT monitor activated; monitored JIT compilations during inference will use mode=warn.
+(Worker_TP0 pid=49131) INFO 07-19 04:18:00 [jit_monitor.py:79] Kernel JIT monitor activated; monitored JIT compilations during inference will use mode=warn.
+(Worker_TP1 pid=49132) INFO 07-19 04:18:00 [jit_monitor.py:79] Kernel JIT monitor activated; monitored JIT compilations during inference will use mode=warn.
+(Worker_TP2 pid=49133) INFO 07-19 04:18:00 [jit_monitor.py:79] Kernel JIT monitor activated; monitored JIT compilations during inference will use mode=warn.
+(EngineCore pid=48834) INFO 07-19 04:18:00 [core.py:347] init engine (profile, create kv cache, warmup model) took 349.79 s
+(EngineCore pid=48834) INFO 07-19 04:18:03 [vllm.py:1109] Asynchronous scheduling is enabled.
+(EngineCore pid=48834) WARNING 07-19 04:18:03 [vllm.py:1203] VLLM_USE_BREAKABLE_CUDAGRAPH is set, disabling vLLM's torch.compile pipeline. Equivalent to -cc.mode=none.
+(EngineCore pid=48834) WARNING 07-19 04:18:03 [vllm.py:1213] Inductor compilation was disabled by user settings, optimizations settings that are only active during inductor compilation will be ignored.
+(EngineCore pid=48834) INFO 07-19 04:18:03 [kernel.py:295] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native'])
+(EngineCore pid=48834) WARNING 07-19 04:18:03 [vllm.py:2227] Model Runner V2 does not yet support the thinking_token_budget request parameter. Set VLLM_USE_V2_MODEL_RUNNER=0 if this is required.
+(EngineCore pid=48834) INFO 07-19 04:18:04 [compilation.py:329] Enabled custom fusions: norm_quant, act_quant, allreduce_rms
+(APIServer pid=48092) INFO 07-19 04:18:04 [api_server.py:673] Supported tasks: ['generate']
+(APIServer pid=48092) INFO 07-19 04:18:04 [base.py:236] Multi-modal warmup completed in 0.133s
+(APIServer pid=48092) INFO 07-19 04:18:05 [base.py:236] Readonly multi-modal warmup completed in 0.118s
+(APIServer pid=48092) INFO 07-19 04:18:05 [api_server.py:677] Starting vLLM server on http://0.0.0.0:8106
+(APIServer pid=48092) INFO 07-19 04:18:05 [launcher.py:37] Available routes are:
+(APIServer pid=48092) INFO 07-19 04:18:05 [launcher.py:46] Route: /openapi.json, Methods: HEAD, GET
+(APIServer pid=48092) INFO 07-19 04:18:05 [launcher.py:46] Route: /docs, Methods: HEAD, GET
+(APIServer pid=48092) INFO 07-19 04:18:05 [launcher.py:46] Route: /docs/oauth2-redirect, Methods: HEAD, GET
+(APIServer pid=48092) INFO 07-19 04:18:05 [launcher.py:46] Route: /redoc, Methods: HEAD, GET
+(APIServer pid=48092) INFO 07-19 04:18:05 [launcher.py:46] Route: /load, Methods: GET
+(APIServer pid=48092) INFO 07-19 04:18:05 [launcher.py:46] Route: /version, Methods: GET
+(APIServer pid=48092) INFO 07-19 04:18:05 [launcher.py:46] Route: /health, Methods: GET
+(APIServer pid=48092) INFO 07-19 04:18:05 [launcher.py:46] Route: /metrics, Methods: GET
+(APIServer pid=48092) INFO 07-19 04:18:05 [launcher.py:46] Route: /tokenize, Methods: POST
+(APIServer pid=48092) INFO 07-19 04:18:05 [launcher.py:46] Route: /detokenize, Methods: POST
+(APIServer pid=48092) INFO 07-19 04:18:05 [launcher.py:46] Route: /v1/models, Methods: GET
+(APIServer pid=48092) INFO 07-19 04:18:05 [launcher.py:46] Route: /ping, Methods: GET
+(APIServer pid=48092) INFO 07-19 04:18:05 [launcher.py:46] Route: /ping, Methods: POST
+(APIServer pid=48092) INFO 07-19 04:18:05 [launcher.py:46] Route: /invocations, Methods: POST
+(APIServer pid=48092) INFO 07-19 04:18:05 [launcher.py:46] Route: /v1/chat/completions, Methods: POST
+(APIServer pid=48092) INFO 07-19 04:18:05 [launcher.py:46] Route: /v1/chat/completions/batch, Methods: POST
+(APIServer pid=48092) INFO 07-19 04:18:05 [launcher.py:46] Route: /v1/responses, Methods: POST
+(APIServer pid=48092) INFO 07-19 04:18:05 [launcher.py:46] Route: /v1/responses/{response_id}, Methods: GET
+(APIServer pid=48092) INFO 07-19 04:18:05 [launcher.py:46] Route: /v1/responses/{response_id}/cancel, Methods: POST
+(APIServer pid=48092) INFO 07-19 04:18:05 [launcher.py:46] Route: /v1/completions, Methods: POST
+(APIServer pid=48092) INFO 07-19 04:18:05 [launcher.py:46] Route: /v1/messages, Methods: POST
+(APIServer pid=48092) INFO 07-19 04:18:05 [launcher.py:46] Route: /v1/messages/count_tokens, Methods: POST
+(APIServer pid=48092) INFO 07-19 04:18:05 [launcher.py:46] Route: /generative_scoring, Methods: POST
+(APIServer pid=48092) INFO 07-19 04:18:05 [launcher.py:46] Route: /scale_elastic_ep, Methods: POST
+(APIServer pid=48092) INFO 07-19 04:18:05 [launcher.py:46] Route: /is_scaling_elastic_ep, Methods: POST
+(APIServer pid=48092) INFO 07-19 04:18:05 [launcher.py:46] Route: /v1/chat/completions/render, Methods: POST
+(APIServer pid=48092) INFO 07-19 04:18:05 [launcher.py:46] Route: /v1/completions/render, Methods: POST
+(APIServer pid=48092) INFO 07-19 04:18:05 [launcher.py:46] Route: /v1/chat/completions/derender, Methods: POST
+(APIServer pid=48092) INFO 07-19 04:18:05 [launcher.py:46] Route: /v1/completions/derender, Methods: POST
+(APIServer pid=48092) INFO 07-19 04:18:05 [launcher.py:46] Route: /inference/v1/generate, Methods: POST
+(APIServer pid=48092) INFO:     Started server process [48092]
+(APIServer pid=48092) INFO:     Waiting for application startup.
+(APIServer pid=48092) INFO:     Application startup complete.
+(APIServer pid=48092) INFO:     127.0.0.1:37222 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=48092) INFO 07-19 04:18:55 [loggers.py:310] Engine 000: Avg prompt throughput: 0.5 tokens/s, Avg generation throughput: 0.8 tokens/s, Running: 0 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.0%, Prefix cac
+he hit rate: 0.0%
+(APIServer pid=48092) INFO 07-19 04:19:05 [loggers.py:310] Engine 000: Avg prompt throughput: 0.0 tokens/s, Avg generation throughput: 0.0 tokens/s, Running: 0 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.0%, Prefix cac
+he hit rate: 0.0%
+(APIServer pid=48092) INFO:     127.0.0.1:53336 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=48092) INFO 07-19 04:20:35 [loggers.py:310] Engine 000: Avg prompt throughput: 0.5 tokens/s, Avg generation throughput: 0.4 tokens/s, Running: 0 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.0%, Prefix cac
+he hit rate: 0.0%
+(APIServer pid=48092) INFO 07-19 04:20:45 [loggers.py:310] Engine 000: Avg prompt throughput: 0.0 tokens/s, Avg generation throughput: 0.0 tokens/s, Running: 0 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.0%, Prefix cac
+he hit rate: 0.0%
+(APIServer pid=48092) INFO:     127.0.0.1:44542 - "POST /v1/completions HTTP/1.1" 200 OK
+(APIServer pid=48092) INFO 07-19 04:26:55 [loggers.py:310] Engine 000: Avg prompt throughput: 0.5 tokens/s, Avg generation throughput: 0.4 tokens/s, Running: 0 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.0%, Prefix cac
+he hit rate: 0.0%
+(APIServer pid=48092) INFO 07-19 04:27:05 [loggers.py:310] Engine 000: Avg prompt throughput: 0.0 tokens/s, Avg generation throughput: 0.0 tokens/s, Running: 0 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.0%, Prefix cac
+he hit rate: 0.0%
+
