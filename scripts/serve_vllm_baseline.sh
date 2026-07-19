@@ -18,4 +18,4 @@ exec vllm serve /workspace/models/inkling-nvfp4 \
   --tensor-parallel-size 4 \
   --max-model-len 16384 \
   --trust-remote-code \
-  --port 8106
+  --port 8106 2>&1 | tee "$LOG"
