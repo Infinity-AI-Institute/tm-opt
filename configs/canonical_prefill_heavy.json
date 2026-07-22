@@ -1,0 +1,19 @@
+{
+  "model": "/workspace/models/inkling-nvfp4",
+  "max_model_len": 16384,
+  "temperature": 0.0,
+  "ignore_eos": true,
+  "prefix_caching": false,
+  "kv_cache_memory": 111231943107,
+  "tensor_parallel": 4,
+  "mtp": false,
+  "gpu_arch": "B300 SXM6 (sm_103a)",
+  "isl": 8192,
+  "osl": 1024,
+  "range_ratio": 0.5,
+  "seed": 1002,
+  "concurrency": 128,
+  "num_warmup_requests": 256,
+  "num_bench_requests": 640,
+  "cache_key": "9beae2c4f63224f8"
+}
