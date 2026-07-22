@@ -17,8 +17,20 @@ mkdir -p /workspace/logs
 LOG="/workspace/logs/vllm_bench_$(date +%Y%m%d_%H%M%S).log"
 echo "[serve-bench] logging to $LOG"
 
-#1. NUMA pin: GPUs 0-3 live on node 0 (cores 0-85) — keep host-side work local
-exec numactl --cpunodebind=0 --membind=0 \
+# NUMA pin: GPUs 0-3 live on node 0 (cores 0-85) — keep host-side work local.
+# Runpod blocks set_mempolicy (--membind) in this container; sched_setaffinity
+# (--cpunodebind) is permitted, so CPU-pin and rely on first-touch locality.
+NUMA_PREFIX=""
+if numactl --cpunodebind=0 --membind=0 true 2>/dev/null; then
+  NUMA_PREFIX="numactl --cpunodebind=0 --membind=0"
+elif numactl --cpunodebind=0 true 2>/dev/null; then
+  NUMA_PREFIX="numactl --cpunodebind=0"
+  echo "[serve-bench] membind not permitted — CPU-pinning to node 0 only"
+else
+  echo "[serve-bench] numactl not permitted in this container — proceeding unpinned"
+fi
+
+exec $NUMA_PREFIX \
   vllm serve /workspace/models/inkling-nvfp4 \
   --tokenizer-mode inkling \
   --reasoning-parser inkling \
