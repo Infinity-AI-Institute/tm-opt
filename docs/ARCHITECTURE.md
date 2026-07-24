@@ -1,10 +1,17 @@
-# tmopt engine architecture — Inkling on 8×B300 (rev 3)
+# tmopt engine architecture — Inkling on 8×B300 (rev 4)
 
 Rev 3 (2026-07-19): KV "concurrency edge" claim retracted after baseline
 investigation (docs/BASELINE_NOTES.md) — vLLM's Inkling integration is
 window-aware in allocation (SlidingWindowSpec per local layer). Hybrid KV is
 now classified as parity work; the win burden moves to kernels, scheduling,
 launch-overhead deletion, MTP, and comm/compute overlap.
+
+Rev 4 (2026-07-23): canonical contract frozen at concurrency 512 (both
+workloads; cache_key 8451a604a8849296). Sweep found a true PEAK, not a
+plateau: decode-heavy 13,374 tok/s at 512 collapsing to 4,959 at 768 —
+per-sequence KV arithmetic puts 512×~0.64 GiB inside the 4×106 GiB pool and
+768 outside it, i.e. THE CANONICAL OPERATING POINT SITS AT THE KV-CAPACITY
+EDGE. Consequences below in "Scheduler & KV at canonical scale".
 
 Single-model engine for `thinkingmachines/Inkling-NVFP4`, specialized for B300,
 deployed as **two 4-GPU replicas** (leading design; 8-GPU×1 is the standing A/B).
@@ -46,6 +53,24 @@ declared in README.
 | fused_rmsnorm | rms_norm_eps 1e-6, embed_norm variant; (RoPE kernel from rev 1 deleted — model has no RoPE) |
 | dense_mlp | layer 2 only, FFN 24576, standard fused GEMM path |
 | mtp | 8 chained draft layers with own local/global ids; verify pass batched with main model |
+
+## Scheduler & KV at canonical scale (rev 4 — binding requirements)
+
+The frozen contract makes these engine requirements, not aspirations:
+- The scheduler must SUSTAIN 512 concurrent sequences: admission control,
+  chunked prefill interleaving, and per-step batch assembly at that scale.
+  Python-loop-per-sequence designs die here; batch state must be tensorized.
+- KV efficiency is a CLIFF, not a gradient: at conc 512 the pool is ~full.
+  Matching vLLM's window-aware allocation is required to even reach the
+  canonical point; beating its allocator overhead (page granularity, sconv
+  padding-to-page — see BASELINE_NOTES) is a small but real lever, since any
+  bytes saved convert to headroom exactly where vLLM starts to preempt.
+- Preemption behavior at the edge matters: vLLM's collapse past 512 is
+  recompute-preemption thrash. Our engine only needs grace AT 512, but the
+  A/B protocol will also record behavior at 512±10% for the write-up.
+- Decode dominates the headline workload: ~26 tok/s per stream × 512 —
+  per-step launch overhead is multiplied 512-fold; the CUDA-graph /
+  launch-deletion lever is therefore ranked first (D4).
 
 ## Where the wins must come from (rev 3, post-KV-verdict)
 

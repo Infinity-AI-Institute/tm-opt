@@ -85,6 +85,7 @@ is compute/scheduler-bound, set empirically. Evidence: BASELINE_NOTES.md.
 | D7 | Canonical configs run **MTP OFF both engines**; MTP-ON tracked as separate config pair | Their footnote: "no speculative decoding"; vLLM gets ~2.7× from MTP — excluding it from headline while reporting both is the defensible move |
 | D8 | Engines never run simultaneously during measurement; experiments serialize | Fairness constitution §4.3 |
 | D9 | Multi-node out of scope (one pod); multi-GPU TP=4 NCCL is our version of the "multi-node challenge" | README scope note |
+| D10 | Canonical concurrency = 512, both workloads (peak, not plateau: decode 13,374 tok/s @512 → 4,959 @768; prefill 5,109 @512). Canonical point sits at the KV-capacity edge → scheduler must sustain 512 seqs; KV efficiency is a cliff (ARCHITECTURE rev 4) | Three-stage sweep, docs/logs/; noise: decode 0.68%, prefill 2.2% run-to-run at 512 |
 
 ## 3. Repo state (Infinity-AI-Institute/tm-opt, working copy /workspace/tm-opt)
 
@@ -100,7 +101,10 @@ Ralph kit, trajectory plot script.
 
 ## 4. Execution plan from here (strict order; each step has an acceptance test)
 
-### P1. Freeze the measurement contract  → `configs/canonical.json`
+### P1. Freeze the measurement contract ✅ 2026-07-23
+(evidence: configs/canonical_*.json + canonical.lock.json, cache_key
+8451a604a8849296; docs/logs/2026-07-2{2,3}_sweep_*.log — three-stage sweep,
+peak at conc 512 both workloads, collapse past 512 = KV-capacity edge)
 - Benchmark serve variant: add `--no-enable-prefix-caching`; pin KV via
   `--kv-cache-memory` (log-suggested 111231943107) rather than util fraction.
 - Two workloads (D6), fixed seeds, `ignore_eos:true`, range_ratio 0.5.
