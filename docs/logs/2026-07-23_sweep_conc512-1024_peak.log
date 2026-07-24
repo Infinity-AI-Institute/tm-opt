@@ -1,0 +1,13 @@
+[freeze] sweeping decode_heavy ISL=1024 OSL=8192 concs=[512, 768, 1024]
+[freeze]   conc=512     13374.1 tok/s (1536 reqs, 940.84s)
+[freeze]   conc=768      4958.9 tok/s (2304 reqs, 3806.18s)
+[freeze]   conc=1024     6036.3 tok/s (3072 reqs, 4169.06s)
+[freeze] decode_heavy: knee -> concurrency 512
+[freeze] sweeping prefill_heavy ISL=8192 OSL=1024 concs=[512, 768, 1024]
+[freeze]   conc=512      5108.8 tok/s (1536 reqs, 307.87s)
+[freeze]   conc=768      3999.4 tok/s (2304 reqs, 589.92s)
+[freeze]   conc=1024     3769.9 tok/s (3072 reqs, 834.43s)
+[freeze] prefill_heavy: knee -> concurrency 512
+[freeze] WROTE configs/canonical_*.json + canonical.lock.json
+[freeze] cache_key = 8451a604a8849296
+[freeze] review, then commit to FREEZE. Changing any parameter afterwards changes the key and invalidates comparisons.
