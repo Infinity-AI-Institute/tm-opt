@@ -12,8 +12,8 @@
   "osl": 8192,
   "range_ratio": 0.5,
   "seed": 1001,
-  "concurrency": 128,
-  "num_warmup_requests": 256,
-  "num_bench_requests": 640,
-  "cache_key": "9beae2c4f63224f8"
+  "concurrency": 512,
+  "num_warmup_requests": 1024,
+  "num_bench_requests": 2560,
+  "cache_key": "8451a604a8849296"
 }

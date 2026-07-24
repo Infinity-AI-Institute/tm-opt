@@ -1,6 +1,6 @@
 {
-  "cache_key": "9beae2c4f63224f8",
-  "frozen_at": "2026-07-22 07:11:51",
+  "cache_key": "8451a604a8849296",
+  "frozen_at": "2026-07-23 09:30:41",
   "workloads": {
     "decode_heavy": {
       "model": "/workspace/models/inkling-nvfp4",
@@ -16,10 +16,10 @@
       "osl": 8192,
       "range_ratio": 0.5,
       "seed": 1001,
-      "concurrency": 128,
-      "num_warmup_requests": 256,
-      "num_bench_requests": 640,
-      "cache_key": "9beae2c4f63224f8"
+      "concurrency": 512,
+      "num_warmup_requests": 1024,
+      "num_bench_requests": 2560,
+      "cache_key": "8451a604a8849296"
     },
     "prefill_heavy": {
       "model": "/workspace/models/inkling-nvfp4",
@@ -35,85 +35,57 @@
       "osl": 1024,
       "range_ratio": 0.5,
       "seed": 1002,
-      "concurrency": 128,
-      "num_warmup_requests": 256,
-      "num_bench_requests": 640,
-      "cache_key": "9beae2c4f63224f8"
+      "concurrency": 512,
+      "num_warmup_requests": 1024,
+      "num_bench_requests": 2560,
+      "cache_key": "8451a604a8849296"
     }
   },
   "sweep_evidence": {
     "decode_heavy": [
       {
-        "concurrency": 8,
-        "requests": 24,
-        "gen_tokens": 196608,
-        "wall_s": 222.68,
-        "tok_per_s": 882.9
+        "concurrency": 512,
+        "requests": 1536,
+        "gen_tokens": 12582912,
+        "wall_s": 940.84,
+        "tok_per_s": 13374.1
       },
       {
-        "concurrency": 16,
-        "requests": 48,
-        "gen_tokens": 393216,
-        "wall_s": 239.69,
-        "tok_per_s": 1640.5
+        "concurrency": 768,
+        "requests": 2304,
+        "gen_tokens": 18874368,
+        "wall_s": 3806.18,
+        "tok_per_s": 4958.9
       },
       {
-        "concurrency": 32,
-        "requests": 96,
-        "gen_tokens": 786432,
-        "wall_s": 270.25,
-        "tok_per_s": 2910.0
-      },
-      {
-        "concurrency": 64,
-        "requests": 192,
-        "gen_tokens": 1572864,
-        "wall_s": 339.21,
-        "tok_per_s": 4636.9
-      },
-      {
-        "concurrency": 128,
-        "requests": 384,
-        "gen_tokens": 3145728,
-        "wall_s": 440.91,
-        "tok_per_s": 7134.6
+        "concurrency": 1024,
+        "requests": 3072,
+        "gen_tokens": 25165824,
+        "wall_s": 4169.06,
+        "tok_per_s": 6036.3
       }
     ],
     "prefill_heavy": [
       {
-        "concurrency": 8,
-        "requests": 24,
-        "gen_tokens": 24576,
-        "wall_s": 30.22,
-        "tok_per_s": 813.3
+        "concurrency": 512,
+        "requests": 1536,
+        "gen_tokens": 1572864,
+        "wall_s": 307.87,
+        "tok_per_s": 5108.8
       },
       {
-        "concurrency": 16,
-        "requests": 48,
-        "gen_tokens": 49152,
-        "wall_s": 34.32,
-        "tok_per_s": 1432.3
+        "concurrency": 768,
+        "requests": 2304,
+        "gen_tokens": 2359296,
+        "wall_s": 589.92,
+        "tok_per_s": 3999.4
       },
       {
-        "concurrency": 32,
-        "requests": 96,
-        "gen_tokens": 98304,
-        "wall_s": 45.46,
-        "tok_per_s": 2162.4
-      },
-      {
-        "concurrency": 64,
-        "requests": 192,
-        "gen_tokens": 196608,
-        "wall_s": 65.18,
-        "tok_per_s": 3016.4
-      },
-      {
-        "concurrency": 128,
-        "requests": 384,
-        "gen_tokens": 393216,
-        "wall_s": 101.74,
-        "tok_per_s": 3865.0
+        "concurrency": 1024,
+        "requests": 3072,
+        "gen_tokens": 3145728,
+        "wall_s": 834.43,
+        "tok_per_s": 3769.9
       }
     ]
   },
@@ -129,6 +101,6 @@
         "label": "vLLM + MTP (tracked pair)"
       }
     ],
-    "footnote": "Inkling-NVFP4, 4xB300 TP=4, decode-heavy ISL~1k/OSL=8k & prefill-heavy ISL~8k/OSL=1k, range_ratio 0.5, ignore_eos, prefix cache off, KV pinned, no speculative decoding (canonical); build g9243e0124; cache_key 9beae2c4f63224f8"
+    "footnote": "Inkling-NVFP4, 4xB300 TP=4, decode-heavy ISL~1k/OSL=8k & prefill-heavy ISL~8k/OSL=1k, range_ratio 0.5, ignore_eos, prefix cache off, KV pinned, no speculative decoding (canonical); build g9243e0124; cache_key 8451a604a8849296"
   }
 }
