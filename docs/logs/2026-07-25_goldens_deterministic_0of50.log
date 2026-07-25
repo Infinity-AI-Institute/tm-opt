@@ -1,0 +1,8 @@
+[goldens] 50 parity prompts, 64 tokens each
+[goldens] 10/50 (21s)
+[goldens] 20/50 (43s)
+[goldens] 30/50 (65s)
+[goldens] 40/50 (86s)
+[goldens] 50/50 (108s)
+[goldens] wrote goldens/goldens_parity.json (sha 74d977632c936736) in 108s
+[goldens] next: point harness/correctness.py reference loader at this file, run the gate against the live server (must be green), commit goldens/ + the gate run log.
