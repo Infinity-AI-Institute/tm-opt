@@ -33,6 +33,6 @@ grep -q "ClientAliveInterval 15" /etc/ssh/sshd_config || {
 
 #5. python env sanity (venv persists; system pip does not)
 source /workspace/venv/bin/activate
-python -c "import vllm, scipy" 2>/dev/null || pip install scipy
+python -c "import vllm, scipy, accelerate" 2>/dev/null || pip install scipy accelerate
 
 echo "[pod_init] done. Serve: tmux new -s serve; bash scripts/serve_vllm_bench.sh"

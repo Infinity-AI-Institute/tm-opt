@@ -1,0 +1,2 @@
+[gate] reference: goldens sha=74d977632c936736 fingerprint=vllm-0.23.1rc1.dev1270+g9243e0124-tp4-0df3af17 cache_key=8451a604a8849296
+{"parity_pass": true, "max_logprob_delta": 0.0, "prompt_mismatches": 0, "n_prompts": 50, "first_divergences": []}
