@@ -60,8 +60,12 @@ Env for all items: `cd /workspace/tm-opt && source /workspace/venv/bin/activate
 Reference: generate per-layer reference activations ONCE with
 transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
 {0,1,2,5,6}, saved to engine/pyengine/tests/ref/ (script t_b2 ref).
-- [ ] B2.1 reference activations generated + committed (small tensors only).
+- [x] B2.1 reference activations generated + committed (small tensors only).
       test: `python -m engine.pyengine.tests.t_b2 ref`
+      — green: 94 tensors 10.8 MiB committed (layers {0,1,2,5,6}, 13-tok
+      prompt); native transformers 5.14.1 eager on a 7-layer slice; layers
+      3-6 experts repaired via B1.4 dequant, proven bit-exact vs HF's own
+      Interleave on layer-2 bf16 experts (commit ef157f6)
 - [ ] B2.2 embed + embed_norm matches ref (rel err < 1e-2 bf16).
       test: `python -m engine.pyengine.tests.t_b2 embed`
 - [ ] B2.3 rmsnorm Triton kernel matches torch reference on random tensors.
@@ -283,3 +287,46 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
   full nvfp4 pack u8/scale/scale2), dim-1 (wo), dim-2 (shared_w2), replicated
   pack metadata (input_amax). B1 loader track complete; next is B2.1
   (transformers reference activations).
+- 2026-07-26 B2.1: implemented tests/t_b2.py (`ref` + fail-loud stubs for
+  embed..logits). Design forced by P2 probe-run-3 evidence (cited in
+  scripts/generate_goldens.py): naive transformers from_pretrained REINITS
+  the packed NVFP4 experts of layers 3-65 ("Reinit due to size mismatch"),
+  and full-model bf16 experts (~1.8 TB) fit nowhere — so `ref` builds a
+  7-layer TRUNCATED config (causal decoder: layers {0,1,2,5,6} activations
+  depend only on layers below; slice is exact), loads via transformers'
+  native Inkling code + conversion pipeline (conversion_mapping.py
+  "inkling_mm_model": w13 → Interleave(dim=1) de-interleave → gate_up_proj),
+  then repairs the 8 mismatched expert tensors (layers 3-6 × w13/w2) with
+  loader.dequant_nvfp4 (B1.4, bit-exact vs vLLM) + the same de-interleave.
+  Honesty gates: loading-info reconciled exactly (mismatch set == the 8
+  packs, nothing text-tower missing, no kept-layer key dropped); our
+  de-interleave proven torch.equal vs HF's OWN Interleave output on layer-2
+  bf16 experts; dense w13_dn chunk, embed rows, layer-5 wq, fp32-upcast
+  k_sconv all bit-exact; ModelOpt max|deq|=6*448*scale2 invariant ratio
+  1.000000 on all 8 packs; every capture finite. Captured 94 module-boundary
+  tensors (layer in/out, norms, attn in/out, all 4 sconvs, MoE gate
+  routed_logits/topk_weights/topk_indices/shared_gammas, experts + shared
+  out, attn internals k/v_sconv+r_proj+q/k_norm+rel_logits_proj for layers
+  0+5, embed/embed_norm/final_norm, input_ids), 10.8 MiB — committable.
+  Reruns verify sha256+manifest instead of regenerating (frozen like
+  goldens). Ran test verbatim from /workspace/tm-opt (venv active,
+  CUDA_VISIBLE_DEVICES=4,5,6,7), foreground. Real output (first run, after
+  transformers' load report table):
+  ```
+  ref ok: generated 94 tensors (10.8 MiB) for layers [0, 1, 2, 5, 6], prompt 13 toks; native transformers 5.14.1 eager, 7-layer slice on cuda:0; fixup layers 3-6 experts dequant (invariant ratios [1.0]); spot checks bit-exact (interleave/dense-chunk/embed/wq/fp32-sconv); all finite; wall 63.6 s (load 20.4)
+  ```
+  Verify path exercised by a second verbatim run:
+  ```
+  ref ok: existing refs verified — 94 tensors, sha256 eae8f3a95804, layers [0, 1, 2, 5, 6], prompt 13 toks (generated with transformers 5.14.1, 63.5 s)
+  ```
+  .gitignore: added `!engine/pyengine/tests/ref/*.safetensors` negation under
+  the existing `*.safetensors` rule — the item REQUIRES committing the refs
+  (.gitignore is not on the protected list). Sanity stats: activations
+  bounded (absmax ≤ 8.2e3 bf16, finite), router picks 41-50 distinct experts
+  over 78 slots, topk_weights f32. NOTE for B2.4/B2.6: eager path applies
+  log-scaling tau only on global layers and tau==1.0 at 13 tokens (clamp
+  min 1 below floor 128000) — rel_logits_proj.out captures are PRE-tau.
+  NOTE for B2.2+: refs are bf16 module-boundary captures; self_attn.in is
+  post-input_layernorm, mlp.in is post-post_attention_layernorm,
+  attn_sconv/mlp_sconv outs are PRE-residual-add (sconv module includes its
+  own +residual of its input, in fp32, per modeling_inkling.py:512-542).
