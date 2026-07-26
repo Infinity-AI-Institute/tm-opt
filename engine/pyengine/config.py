@@ -39,6 +39,8 @@ def load_verified(model_dir: str) -> ModelConfig:
         "n_routed_experts": mc.n_experts, "num_experts_per_tok": mc.topk,
         "intermediate_size": mc.expert_ffn, "dense_mlp_idx": mc.dense_idx,
         "rms_norm_eps": mc.rms_eps,
+        "d_rel": mc.d_rel, "rel_extent": mc.rel_extent,
+        "log_scaling_alpha": mc.log_alpha, "log_scaling_n_floor": mc.log_floor,
     }
     bad = {k: (txt.get(k), v) for k, v in checks.items() if txt.get(k) != v}
     if bad:

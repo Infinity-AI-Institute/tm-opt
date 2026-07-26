@@ -502,6 +502,163 @@ def t_rmsnorm():
           f"rel err {rel_a:.1e} < 1e-2 (max {ulp_a:.0f} ulp)")
 
 
+def t_relbias():
+    """B2.4: relative-attention bias table + log scaling (model.py, pure
+    torch) vs ref math. Gates:
+      (a) frozen anchors — replay the captured r_proj.out of layers 0 (SWA,
+          extent 512) and 5 (global, extent 1024) through our rel_bias with
+          the real checkpoint proj banks, vs the captured rel_logits_proj.out
+          (PRE-tau per the B2.1 note; tau==1.0 at 13 toks anyway): rel err
+          < 1e-2 (B2 header budget), bit-exactness reported as evidence;
+      (b) native-module cross-check — the ACTUAL transformers
+          InklingRelativeLogits (the class that generated the refs) run
+          in-process on real + random proj banks at synthetic long positions
+          (offsets past the 128000 floor; distances spanning negative,
+          in-band, and >= extent for both extents): torch.equal REQUIRED —
+          identical math must give identical bits; out-of-band exactly zero;
+      (c) log scaling — no non-trivial frozen anchor exists (13-tok prompt
+          => tau==1.0, and every B2 prompt is tiny), so tau is gated against
+          an independent float64 evaluation over the full context range plus
+          exactness facts: tau==1.0 exactly through pos floor-1 (clamp arm,
+          => inert across the whole 16K serving window), >1 and monotonic
+          from pos==floor, and the fp32-multiply-then-downcast application
+          op order (modeling_inkling.py:259-261) bit-checked on random
+          bf16 Q/bias at positions past the floor."""
+    import math
+    from transformers.models.inkling.modeling_inkling import (
+        InklingRelativeLogits)
+    torch.manual_seed(0)
+    tens, meta, _ = _load_refs()
+    mc = pcfg.load_verified(MODEL_DIR)
+    idx = loader.build_shard_index(MODEL_DIR)
+
+    #1. frozen anchors: layers 0 + 5, real weights, real activations
+    Q = tens["input_ids"].shape[1]
+    pos = torch.arange(Q, device=DEV)
+    projs, anchor_re, anchor_bit = {}, {}, {}
+    for L in (0, 5):
+        is_global = L in mc.global_layers
+        extent = mc.rel_extent if is_global else mc.window
+        proj = _disk(idx, f"model.llm.layers.{L}.attn.rel_logits_proj.proj"
+                     ).to(DEV)
+        assert proj.shape == (mc.d_rel, extent), proj.shape
+        assert proj.dtype == torch.bfloat16, proj.dtype
+        projs[extent] = proj
+        heads = mc.g_q_heads if is_global else mc.s_q_heads
+        rs = tens[f"layers.{L}.self_attn.r_proj.out"].to(DEV).view(
+            1, Q, heads, mc.d_rel)
+        got = pmodel.rel_bias(rs, proj, pos, pos)
+        want = tens[f"layers.{L}.self_attn.rel_logits_proj.out"].to(DEV)
+        assert got.shape == want.shape == (1, heads, Q, Q), got.shape
+        #1a. future keys (distance < 0) must be EXACT zeros
+        fut = (pos[:, None] - pos[None, :] < 0).view(1, 1, Q, Q)
+        if not (got.masked_select(fut) == 0).all():
+            raise SystemExit(f"[t_b2 relbias] layer {L}: nonzero future bias")
+        re = _rel_err(got, want)
+        if re >= 1e-2:
+            raise SystemExit(f"[t_b2 relbias] layer {L} anchor rel err "
+                             f"{re:.3e} >= 1e-2")
+        anchor_re[L], anchor_bit[L] = re, torch.equal(got, want)
+
+    #2. native-module cross-check at synthetic long positions. Cases give
+    #   distances: ref-shaped -12..12 (negative + in-band), prefill@200k
+    #   -15..1515 (all three zones for both extents), decode@300k 0..599
+    #   (crosses extent 512 in decode shape, Q=1).
+    cases = ((13, 0, 13, 0, "ref-shaped"),
+             (16, 200000, 1516, 198500, "prefill-200k"),
+             (1, 300000, 600, 299401, "decode-300k"))
+    n_cross = el_cross = 0
+    for extent, real_proj in sorted(projs.items()):
+        for bank, pj in (("real", real_proj),
+                         ("random", torch.randn(
+                             mc.d_rel, extent, device=DEV,
+                             dtype=torch.float32).to(torch.bfloat16))):
+            #2a. the reference module itself, bf16 on the same GPU
+            mod = InklingRelativeLogits(mc.d_rel, extent).to(
+                device=DEV, dtype=torch.bfloat16)
+            with torch.no_grad():
+                mod.proj.copy_(pj)
+            for qlen, qoff, klen, koff, tag in cases:
+                qp = torch.arange(qlen, device=DEV) + qoff
+                kp = torch.arange(klen, device=DEV) + koff
+                rs = torch.randn(1, qlen, mc.g_q_heads, mc.d_rel,
+                                 device=DEV,
+                                 dtype=torch.float32).to(torch.bfloat16)
+                with torch.no_grad():
+                    want = mod(rs, qp, kp)
+                got = pmodel.rel_bias(rs, pj, qp, kp)
+                if not torch.equal(got, want):
+                    raise SystemExit(f"[t_b2 relbias] not bit-exact vs "
+                                     f"native module: extent {extent}, "
+                                     f"{bank}, {tag}")
+                #2b. band semantics: out-of-band exact zeros, in-band alive
+                d = qp[:, None] - kp[None, :]
+                oob = ((d < 0) | (d >= extent)).view(1, 1, qlen, klen)
+                if oob.any() and not (got.masked_select(oob) == 0).all():
+                    raise SystemExit(f"[t_b2 relbias] nonzero out-of-band: "
+                                     f"extent {extent}, {bank}, {tag}")
+                if not got.masked_select(~oob).any():
+                    raise SystemExit(f"[t_b2 relbias] in-band all zero: "
+                                     f"extent {extent}, {bank}, {tag}")
+                n_cross += 1
+                el_cross += got.numel()
+
+    #3. log scaling. (a) exactness: tau == 1.0 for every position below the
+    #   floor — covers the 13-tok ref prompt AND the whole 16K serve window
+    ones = lambda t: torch.ones_like(t)                      # noqa: E731
+    t13 = pmodel.log_scale_tau(pos, mc.log_alpha, mc.log_floor)
+    serve = torch.arange(16384, device=DEV)
+    t_serve = pmodel.log_scale_tau(serve, mc.log_alpha, mc.log_floor)
+    if not (torch.equal(t13, ones(t13)) and
+            torch.equal(t_serve, ones(t_serve))):
+        raise SystemExit("[t_b2 relbias] tau != 1.0 below the floor")
+    #3b. boundary + monotonicity around pos = floor-1 (eff == floor -> 1.0)
+    bpos = torch.arange(mc.log_floor - 3, mc.log_floor + 3, device=DEV)
+    tb = pmodel.log_scale_tau(bpos, mc.log_alpha, mc.log_floor)
+    if not (torch.equal(tb[:3], ones(tb[:3])) and (tb[3:] > 1.0).all()
+            and (tb.diff() >= 0).all()):
+        raise SystemExit(f"[t_b2 relbias] tau boundary broken: {tb.tolist()}")
+    #3c. independent float64 evaluation, log-spaced to the 1M context edge
+    lpos = torch.unique(torch.cat([
+        torch.logspace(0, math.log10(1048575), 4096,
+                       device=DEV).to(torch.int64),
+        bpos, torch.tensor([1048575], device=DEV)]))
+    t32 = pmodel.log_scale_tau(lpos, mc.log_alpha, mc.log_floor)
+    t64 = 1.0 + mc.log_alpha * torch.log(
+        ((lpos + 1).double() / mc.log_floor).clamp(min=1.0))
+    tau_rel = ((t32.double() - t64).abs() / t64).max().item()
+    if tau_rel >= 1e-6:
+        raise SystemExit(f"[t_b2 relbias] tau vs fp64: rel {tau_rel:.3e}")
+    #3d. application op order on random bf16 Q/bias past the floor, checked
+    #    against a literal transcription of modeling_inkling.py:259-261
+    apos = torch.arange(5, device=DEV) + 250000
+    qs = torch.randn(1, mc.g_q_heads, 5, mc.head_dim, device=DEV,
+                     dtype=torch.float32).to(torch.bfloat16)
+    bias = torch.randn(1, mc.g_q_heads, 5, 700, device=DEV,
+                       dtype=torch.float32).to(torch.bfloat16)
+    gq, gb = pmodel.apply_log_scaling(qs, bias, apos, mc.log_alpha,
+                                      mc.log_floor)
+    tau_t = (1.0 + mc.log_alpha * torch.log(
+        ((apos + 1).float() / mc.log_floor).clamp(min=1.0))).view(1, 1, -1, 1)
+    if not (torch.equal(gq, (qs.float() * tau_t).to(qs.dtype)) and
+            torch.equal(gb, (bias.float() * tau_t).to(bias.dtype))):
+        raise SystemExit("[t_b2 relbias] apply_log_scaling op order differs")
+    if torch.equal(gq, qs):
+        raise SystemExit("[t_b2 relbias] tau>1 case was a no-op on Q")
+
+    #4. summary line = the test's green evidence
+    print(f"relbias ok: frozen anchors L0(swa,ext512)/L5(global,ext1024) "
+          f"rel err {anchor_re[0]:.1e}/{anchor_re[5]:.1e} < 1e-2 (bit-exact "
+          f"{anchor_bit[0]}/{anchor_bit[5]}), future-dist zeros exact; "
+          f"native-module cross-check bit-exact {n_cross}/{n_cross} cases "
+          f"({el_cross} els; extents {{512,1024}} x real/random proj x "
+          f"{{13tok, prefill@200k dist-15..1515, decode@300k}}), out-of-band "
+          f"exact zeros; tau: ==1.0 exactly below floor 128000 (16K serve "
+          f"window inert), floor boundary+monotonic ok, fp64 agreement "
+          f"{tau_rel:.1e} < 1e-6 over {lpos.numel()} pts to ctx 1048575, "
+          f"apply op-order bit-exact (modeling_inkling.py:259-261)")
+
+
 def _todo(item):
     def f():
         raise SystemExit(f"[t_b2] not implemented — that is item {item}'s job")
@@ -512,7 +669,7 @@ def main():
     #1. dispatch on subcommand; unimplemented ones fail loud with their item
     cmds = {"ref": t_ref,
             "embed": t_embed, "rmsnorm": t_rmsnorm,
-            "relbias": _todo("B2.4"), "sconv": _todo("B2.5"),
+            "relbias": t_relbias, "sconv": _todo("B2.5"),
             "attn_global": _todo("B2.6"), "attn_swa": _todo("B2.7"),
             "gate": _todo("B2.8"), "moe": _todo("B2.9"),
             "dense": _todo("B2.10"), "logits": _todo("B2.11")}
