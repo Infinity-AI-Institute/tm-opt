@@ -447,17 +447,94 @@ def t_plan():
           f"GiB; checkpoint total {total / GiB:.2f} GiB")
 
 
+def t_load():
+    #1. inputs: index/headers/config/dtype map/plan — every prior B1 builder,
+    #   their own fail-loud checks run inside
+    import time
+    import torch
+    idx = loader.build_shard_index(MODEL_DIR)
+    meta = loader.read_headers(idx)
+    mc = pcfg.load_verified(MODEL_DIR)
+    dm = loader.build_dtype_map(idx, meta)
+    plan = loader.build_shard_plan(meta, dm, mc, tp=4)
+
+    #2. the item's target hardware: exactly the 4 visible devices = physical
+    #   GPUs 4-7 (CUDA_VISIBLE_DEVICES=4,5,6,7 per PROGRESS env; vLLM owns
+    #   0-3); load_replica itself verifies each has free memory for its share
+    assert torch.cuda.device_count() == 4, torch.cuda.device_count()
+
+    #3. timed full load; per-shard progress goes to stderr so the minutes-long
+    #   run is observable without polluting the one-line stdout evidence
+    t0 = time.monotonic()
+
+    def prog(i, n, fname, src_bytes):
+        print(f"[t_b1 load] {i:2d}/{n} {fname}: {src_bytes / 2**30:.1f} GiB "
+              f"read, {time.monotonic() - t0:.0f}s", file=sys.stderr)
+
+    rep = loader.load_replica(idx, meta, plan, progress=prog)
+    wall = time.monotonic() - t0
+
+    #4. budget (the item's bar): exact resident bytes per rank == the B1.5
+    #   plan prediction; allocator's view within block-rounding slack of
+    #   that (2046 allocations x <=512 B rounding each << 64 MiB); <=150 GiB
+    GiB = 2 ** 30
+    rb = plan.rank_bytes(meta)
+    allocs = []
+    for r in range(4):
+        exact = rep.rank_nbytes(r)
+        assert exact == rb["per_rank"], (r, exact, rb["per_rank"])
+        alloc = torch.cuda.memory_allocated(r)
+        assert 0 <= alloc - exact < 64 * 2**20, (r, alloc, exact)
+        assert alloc <= 150 * GiB, f"budget blown on rank {r}: {alloc / GiB:.2f}"
+        allocs.append(alloc)
+
+    #5. spot checks, one per placement flavor: read the checkpoint tensor
+    #   again and compare rank pieces BITWISE (uint8 view — works for every
+    #   dtype incl. f8e4m3, which lacks eq) on first + last rank. Covers
+    #   replicate (embed), dim-0 shard (wq bf16; packed U8 + .scale f8 +
+    #   .scale2 f32), dim-1 shard (wo), dim-2 shard (shared_w2), and the
+    #   replicated tiny pack metadata (.input_amax).
+    def disk(name):
+        with safe_open(str(idx.shard_path(name)), framework="pt") as f:
+            return f.get_tensor(name)
+
+    b3 = f"model.llm.layers.{mc.dense_idx + 1}.mlp.experts.w13_weight"
+    spots = ["model.llm.embed.weight",
+             "model.llm.layers.0.attn.wq_du.weight",
+             f"model.llm.layers.{mc.global_layers[0]}.attn.wo_ud.weight",
+             "model.llm.layers.9.mlp.shared_experts.shared_w2_weight",
+             b3, b3 + ".scale", b3 + ".scale2", b3 + ".input_amax"]
+    for name in spots:
+        full = disk(name)
+        kind, dim = plan.placement[name]
+        for r in (0, 3):
+            got = rep.ranks[r][name]
+            assert got.device.index == r and got.dtype == full.dtype, name
+            if kind == loader.REPLICATE:
+                want = full
+            else:
+                step = full.shape[dim] // plan.tp
+                want = full.narrow(dim, r * step, step)
+            assert torch.equal(got.cpu().contiguous().view(torch.uint8),
+                               want.contiguous().view(torch.uint8)), (name, r)
+
+    #6. summary line = the test's green evidence (wall time printed, per item)
+    src_gib = (rb[loader.SHARD] + rb[loader.REPLICATE]) / GiB
+    print(f"load ok: tp=4 replica on GPUs 4-7 (visible cuda:0-3), "
+          f"{len(rep.ranks[0])} tensors/rank; per-GPU {rb['per_rank'] / GiB:.2f} "
+          f"GiB resident (allocator max {max(allocs) / GiB:.2f}) <= 150 GiB "
+          f"budget; wall {wall:.1f} s ({src_gib:.2f} source GiB, "
+          f"{src_gib / wall:.2f} GiB/s); spot checks bitwise-exact: replicate + "
+          f"dim0/1/2 shards + nvfp4 pack (u8/f8-scale/f32-scale2/amax)")
+
+
 def main():
-    #1. dispatch on subcommand; unimplemented ones fail loud with their item id
+    #1. dispatch on subcommand; all B1 items implemented
     done = {"index": t_index, "census": t_census, "dtypes": t_dtypes,
-            "dequant": t_dequant, "plan": t_plan}
-    todo = {"load": "B1.6"}
-    usage = f"usage: python -m engine.pyengine.tests.t_b1 {{{'|'.join([*done, *todo])}}}"
-    if len(sys.argv) != 2 or sys.argv[1] not in {*done, *todo}:
+            "dequant": t_dequant, "plan": t_plan, "load": t_load}
+    usage = f"usage: python -m engine.pyengine.tests.t_b1 {{{'|'.join(done)}}}"
+    if len(sys.argv) != 2 or sys.argv[1] not in done:
         raise SystemExit(usage)
-    if sys.argv[1] in todo:
-        raise SystemExit(
-            f"[t_b1] '{sys.argv[1]}' not implemented yet — PROGRESS item {todo[sys.argv[1]]}")
     done[sys.argv[1]]()
 
 

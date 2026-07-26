@@ -1,7 +1,6 @@
 """B1: checkpoint -> GPU tensors. NVFP4 block-scale layout per vLLM modelopt
 (see dequant_nvfp4 for the cited layout facts). TP=4 plan: attention
 head-parallel, MoE expert-parallel (64 experts/GPU), embeddings replicated."""
-#TODO(B1.6): implemented item-by-item by the build loop.
 import json
 import pathlib
 import re
@@ -9,6 +8,7 @@ import struct
 from dataclasses import dataclass
 
 import torch
+from safetensors import safe_open
 
 N_MODEL_SHARDS = 33            # model-XXXXX-of-00033.safetensors (CLAUDE.md model facts)
 MTP_SHARD = "mtp.safetensors"  # MTP draft layers, separate file, listed in the index
@@ -406,3 +406,95 @@ def build_shard_plan(meta: dict, dm: DtypeMap, mc, tp: int = 4) -> ShardPlan:
             raise SystemExit(f"[loader] plan: pack {b} split incoherently:\n"
                              f"  want {want}\n  got {got}")
     return ShardPlan(tp=tp, placement=placement)
+
+
+#B1.6: safetensors header dtype -> torch dtype, loading preserves the stored
+#precision exactly (dequant is a compute-time concern, not a load-time one).
+#B1.3 proved this dtype set exhaustive for the checkpoint.
+DTYPE_TORCH = {"BF16": torch.bfloat16, "F32": torch.float32,
+               "U8": torch.uint8, "F8_E4M3": torch.float8_e4m3fn,
+               "I64": torch.int64}
+
+
+@dataclass(frozen=True)
+class LoadedReplica:
+    """B1.6: one tp-wide replica resident on GPUs. ranks[r] maps every
+    non-skipped tensor name -> rank r's piece (full tensor if replicated,
+    the r-th of tp equal slices along the plan's dim if sharded)."""
+    plan: ShardPlan
+    devices: tuple   # device string per rank, e.g. ("cuda:0", ..., "cuda:3")
+    ranks: tuple     # dict per rank: tensor name -> tensor on devices[r]
+
+    def rank_nbytes(self, r: int) -> int:
+        #1. exact bytes resident for rank r's tensors (allocator rounding excluded)
+        return sum(t.numel() * t.element_size() for t in self.ranks[r].values())
+
+
+def load_replica(idx: ShardIndex, meta: dict, plan: ShardPlan,
+                 devices=None, progress=None) -> LoadedReplica:
+    """B1.6: materialize the full checkpoint on plan.tp GPUs per the plan.
+    Streams each shard once; every non-skipped tensor is read from disk
+    exactly once, sliced on CPU, and copied to its rank(s). `progress`, if
+    given, is called after each shard with (files_done, files_total,
+    shard_filename, source_bytes_read_so_far)."""
+    #1. resolve devices and fail loud BEFORE reading 551 GiB: need plan.tp
+    #   CUDA devices, each with free memory for its predicted share (the
+    #   B1.5 budget) plus 1 GiB headroom — catches busy GPUs immediately
+    tp = plan.tp
+    if devices is None:
+        devices = tuple(f"cuda:{r}" for r in range(tp))
+    if len(devices) != tp:
+        raise SystemExit(f"[loader] load: {len(devices)} devices for tp={tp}")
+    if torch.cuda.device_count() < tp:
+        raise SystemExit(f"[loader] load: only {torch.cuda.device_count()} "
+                         f"CUDA devices visible, need {tp}")
+    need = plan.rank_bytes(meta)["per_rank"]
+    for d in devices:
+        free, _ = torch.cuda.mem_get_info(torch.device(d))
+        if free < need + (1 << 30):
+            raise SystemExit(f"[loader] load: {d} has {free / 2**30:.1f} GiB "
+                             f"free < {need / 2**30:.1f} needed + 1 headroom "
+                             f"— GPU not idle?")
+
+    #2. stream shards; deterministic tensor order via the B1.1 index (header
+    #   keys == index keys is a proven invariant). REPLICATE -> full copy on
+    #   every rank; SHARD dim k -> rank r takes the r-th of tp equal slices
+    #   (builder enforced divisibility); SKIP -> never read. contiguous()
+    #   compacts non-dim-0 slices on CPU so the device copy is dense.
+    ranks = tuple({} for _ in range(tp))
+    src_read = 0
+    for i, fname in enumerate(idx.shard_files):
+        with safe_open(str(idx.model_dir / fname), framework="pt") as f:
+            for name in sorted(idx.tensors_in_shard(fname)):
+                kind, dim = plan.placement[name]
+                if kind == SKIP:
+                    continue
+                t = f.get_tensor(name)
+                if t.dtype is not DTYPE_TORCH[meta[name][0]]:
+                    raise SystemExit(f"[loader] load: {name} read as {t.dtype}"
+                                     f", header says {meta[name][0]}")
+                if kind == REPLICATE:
+                    for r, d in enumerate(devices):
+                        ranks[r][name] = t.to(d)
+                else:
+                    step = t.shape[dim] // tp
+                    for r, d in enumerate(devices):
+                        ranks[r][name] = t.narrow(dim, r * step,
+                                                  step).contiguous().to(d)
+                src_read += nbytes(*meta[name])
+        if progress is not None:
+            progress(i + 1, len(idx.shard_files), fname, src_read)
+
+    #3. verify against the plan's prediction: every rank holds exactly the
+    #   non-skipped name set, and exactly replicated + sharded/tp bytes
+    rep = LoadedReplica(plan=plan, devices=tuple(devices), ranks=ranks)
+    want_names = {n for n, (k, _) in plan.placement.items() if k != SKIP}
+    for r in range(tp):
+        if set(ranks[r]) != want_names:
+            raise SystemExit(f"[loader] load: rank {r} name set mismatch "
+                             f"({len(ranks[r])} vs {len(want_names)})")
+        got = rep.rank_nbytes(r)
+        if got != need:
+            raise SystemExit(f"[loader] load: rank {r} holds {got} bytes, "
+                             f"plan predicts {need}")
+    return rep

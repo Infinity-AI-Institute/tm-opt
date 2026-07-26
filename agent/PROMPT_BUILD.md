@@ -37,3 +37,11 @@ iterations; the repo is your memory. Work inside /workspace/tm-opt.
   fine; hangs >30 min are not (kill, mark BLOCKED).
 - vLLM source in the venv may be READ for reference (it is public code);
   never copied wholesale — cite file:line in a comment when a design follows it.
+- Your session ends when you stop responding — there is NO "later". Never
+  start background tasks you plan to "wait for" or "pick up": run long
+  commands in the FOREGROUND and wait for them within this session (the
+  loop allots you a full hour). If a single test cannot finish inside one
+  session, mark the item BLOCKED with a proposed split instead.
+- If you end an iteration without committing, you MUST leave a BLOCKED or
+  IN-PROGRESS note in PROGRESS.md explaining why — a silent no-commit
+  iteration is a rule violation.

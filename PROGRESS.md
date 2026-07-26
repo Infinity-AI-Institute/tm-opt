@@ -48,6 +48,10 @@ Env for all items: `cd /workspace/tm-opt && source /workspace/venv/bin/activate
       choice) (commit 5c3a636)
 - [ ] B1.6 full load onto GPUs 4-7 under budget, wall time printed.
       test: `python -m engine.pyengine.tests.t_b1 load`
+      HINT: a substantially-complete load_replica() sits UNCOMMITTED in
+      loader.py + t_b1.py from a prior session (killed by its own
+      backgrounding — see rules). Review it, finish it, run the test in the
+      FOREGROUND (expect ~5-15 min; page cache is warm), commit.
 
 ## B2 — model graph (single token correctness, vs transformers reference slices)
 Reference: generate per-layer reference activations ONCE with
