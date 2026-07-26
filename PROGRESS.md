@@ -75,9 +75,13 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
       — green: 17.9M random elements (widths 6144+128, 8 cases), all within
       2 bf16 ulp of torch ref (35 off-by-ulp, worst rel err 1.1e-05); frozen
       embed_norm anchor bit-exact (commit 0162160)
-- [ ] B2.4 relative-attention bias table + log scaling matches ref math
+- [x] B2.4 relative-attention bias table + log scaling matches ref math
       (pure torch first; d_rel 16, extent 1024, α 0.1, floor 128000).
       test: `python -m engine.pyengine.tests.t_b2 relbias`
+      — green: frozen anchors L0(ext512)/L5(ext1024) bit-exact vs ref
+      captures; 12/12 bit-exact vs native InklingRelativeLogits at long
+      positions; tau fp64 agreement 6.1e-08, ==1.0 below floor (16K serve
+      window inert) (commit 7545848)
 - [ ] B2.5 sconv (window-4, prefill form) matches ref on layer 0.
       test: `python -m engine.pyengine.tests.t_b2 sconv`
 - [ ] B2.6 global-attention layer (idx 5) forward matches ref slice.
@@ -379,3 +383,34 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
   bit-exact, 0 ulp. Regressions green: t_b2 ref (verify path, sha
   eae8f3a95804 unchanged) + t_b2 embed. Code committed first (0162160) per
   convention; this tick is its own commit.
+- 2026-07-26 B2.4: implemented model.py rel_bias + log_scale_tau +
+  apply_log_scaling (pure torch, op-for-op InklingRelativeLogits semantics
+  per modeling_inkling.py:131-142 — bf16 matmul vs the (d_rel, extent) bank,
+  gather at backward distance, zero outside 0<=d<extent; extent = 1024
+  global / window 512 SWA per :196; tau fp32 clamp((pos+1)/floor,min=1) log
+  form + fp32-mul-downcast application per :254-261, global layers only) +
+  t_b2 relbias; config.py load_verified now also checks d_rel/rel_extent/
+  log_scaling_alpha/log_scaling_n_floor vs checkpoint (were declared but
+  unverified). Test design: tau has NO non-trivial frozen anchor (13-tok
+  prompt => tau==1.0 exactly, B2.1 note; captures are PRE-tau), so the tau
+  gate is an independent float64 evaluation + exactness facts (==1.0 through
+  pos floor-1 incl. whole 16K serve window — log scaling provably inert at
+  canonical lengths; >1 monotonic from pos==floor); the bias table IS
+  decisively anchored: frozen captures on real weights AND the native
+  transformers module run in-process at synthetic long positions (offsets
+  200k/300k, distances -15..1515 spanning negative/in-band/>=extent for both
+  extents, real + random banks), torch.equal required. kernels/relbias.py
+  untouched — item says "pure torch first"; the fused kernel is D4 Stage-3
+  work. Ran test verbatim from /workspace/tm-opt (venv active,
+  CUDA_VISIBLE_DEVICES=4,5,6,7). Real output:
+  ```
+  relbias ok: frozen anchors L0(swa,ext512)/L5(global,ext1024) rel err 0.0e+00/0.0e+00 < 1e-2 (bit-exact True/True), future-dist zeros exact; native-module cross-check bit-exact 12/12 cases (6406400 els; extents {512,1024} x real/random proj x {13tok, prefill@200k dist-15..1515, decode@300k}), out-of-band exact zeros; tau: ==1.0 exactly below floor 128000 (16K serve window inert), floor boundary+monotonic ok, fp64 agreement 6.1e-08 < 1e-6 over 2717 pts to ctx 1048575, apply op-order bit-exact (modeling_inkling.py:259-261)
+  ```
+  Regressions green after the config.py check additions: t_b2 ref (verify
+  path, sha eae8f3a95804 unchanged) + embed + rmsnorm; t_b1 index + census +
+  dtypes + plan. NOTE for B2.6/B2.7: rel_bias consumes r_proj output viewed
+  [B,Q,heads,d_rel]; attention must apply tau to BOTH q and bias (global
+  only) BEFORE softmax; at every B2/B3 test length tau==1.0 so a tau bug
+  would only surface >128K — the bit-check vs :259-261 transcription is the
+  guard. Code committed first (7545848) per convention; this tick is its
+  own commit.
