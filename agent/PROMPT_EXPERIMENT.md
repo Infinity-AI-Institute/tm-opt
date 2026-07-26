@@ -25,8 +25,12 @@ Precondition (verify, else stop): parity gate green on main, and
    docs/LEDGER_SCHEMA.md: `label` (2-4 words, chart hover title) and
    `mechanism` (one line, chart hover subtitle), plus hypothesis, predicted
    delta, worktree ref, commit.
-7. Commit the worktree + spec. Stop. The dispatcher/worker run the canonical
-   gates; you never run canonical benchmarks yourself and never merge to main.
+7. Commit the worktree + spec:
+   `git add <files> && git commit -m "[ralph] exp(<id>): <hypothesis in 5-8 words>"`
+   — the [ralph] prefix is MANDATORY on every commit you make, and <id>
+   must match the spec filename. Stop. The dispatcher/worker run the
+   canonical gates; you never run canonical benchmarks yourself and never
+   merge to main.
 
 ## Hard rules
 - One variable per experiment. If your diff does two things, split it.
@@ -37,3 +41,5 @@ Precondition (verify, else stop): parity gate green on main, and
   `experiments/DEADENDS.md` before proposing anything new.
 - Numbers that look too good are bugs until proven otherwise: check output
   lengths, check the gate actually ran, check the cache_key matches.
+- Every commit message you write starts with the literal prefix `[ralph] ` —
+  no exceptions, including post-mortems and progress notes.

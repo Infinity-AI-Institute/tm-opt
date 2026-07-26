@@ -32,6 +32,10 @@ for i in $(seq 1 "$MAX"); do
   else
     NOPROG=0
     echo "[ralph-build] iter $i landed:"; git log --oneline "$BEFORE..$AFTER" | sed "s/^/    /"
+    #4. provenance check: every loop commit must carry the [ralph] prefix
+    if git log --format=%s "$BEFORE..$AFTER" | grep -qv '^\[ralph\]'; then
+      echo "[ralph-build] WARNING: commit(s) missing [ralph] prefix — review"
+    fi
   fi
   grep -E "^- \[.\]" PROGRESS.md | tail -3
 done

@@ -15,7 +15,8 @@ iterations; the repo is your memory. Work inside /workspace/tm-opt.
    into your PROGRESS.md note — never summarize a test you did not run.
 5. If the test passes: tick the box `[x]`, append
    `— green <one-line evidence> (commit <hash>)`, then
-   `git add -A && git commit -m "build(<item-id>): <what>"`.
+   `git add -A && git commit -m "[ralph] build(<item-id>): <what>"` — the
+   [ralph] prefix is MANDATORY on every commit you make.
    If it fails after honest effort: DO NOT tick. Change the item's marker to
    `[ ] BLOCKED:` with the exact error and your best hypothesis, commit that
    PROGRESS.md edit alone, and stop.
