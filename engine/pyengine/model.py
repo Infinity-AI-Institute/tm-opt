@@ -257,6 +257,32 @@ def moe(x, w_gate, bias, global_scale, w_gate_up, w_down, w_sh_gate,
                                shared_gammas)
 
 
+def dense_mlp(x, w_gate, w_up, w_down, global_scale):
+    """Dense-layer MLP (layers 0-1; dense_mlp_idx=2 is a COUNT of leading
+    dense layers, census B1.2) — exact InklingMLP semantics (transformers
+    models/inkling/modeling_inkling.py:285-299):
+    down_proj(silu(gate_proj(x)) * up_proj(x)) * global_scale. The native
+    module holds three SEPARATE bias-free linears (:291-293) — kept
+    separate here, not one fused GEMM, so cuBLAS sees the module's exact
+    shapes; global_scale is a LIVE bf16 scalar parameter (:295, :299;
+    checkpoint values ~0.008 / 0.026 on layers 0 / 1, not 1.0) and is the
+    module's LAST op. The whole module runs in the model dtype, bf16 (NOT
+    in _keep_in_fp32_modules_strict :610 — only the sconvs are fp32).
+    ffn = 24576: the raw config's dense_intermediate_size lands on
+    config.intermediate_size (configuration_inkling.py:125-126; the raw
+    intermediate_size 3072 is the EXPERT ffn). The checkpoint stores
+    gate/up fused as w13_dn [2*ffn, hidden] with interleaved
+    [g0,u0,g1,u1,..] rows; transformers converts via Interleave(dim=0) +
+    Chunk(dim=0) -> gate_proj, up_proj (conversion_mapping.py
+    "inkling_mm_model") — callers pass the two de-interleaved halves.
+    Fused Triton form is Stage-3 work (D4)."""
+    F = torch.nn.functional
+    #1. gate/up/down chain with silu, no biases anywhere (:298)
+    h = F.linear(F.silu(F.linear(x, w_gate)) * F.linear(x, w_up), w_down)
+    #2. trailing live global_scale multiply, the module's last op (:299)
+    return h * global_scale
+
+
 def attn_prefill(x, wq, wk, wv, wr, wo, w_k_sconv, w_v_sconv, w_q_norm,
                  w_k_norm, rel_proj, attn_mask, q_positions, kv_positions,
                  head_dim, is_global, alpha=None, n_floor=None, eps=1e-6):

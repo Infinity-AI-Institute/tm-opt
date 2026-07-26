@@ -1807,6 +1807,204 @@ def t_moe():
           f"{re_r64:.1e}/{re_s64:.1e}/{re_m64:.1e} < 1e-2")
 
 
+def t_dense():
+    """B2.10: the dense-layer MLP (model.dense_mlp) matches the ref mlp
+    outputs. FACT (census B1.2, flagged in PROGRESS for the item's wording):
+    the DENSE layers are 0-1 — dense_mlp_idx=2 is a COUNT of leading dense
+    layers, layer 2 is MoE (covered by B2.8/B2.9) — so this item gates the
+    dense MLP on BOTH dense layers' frozen captures. Gates:
+      (a) frozen anchors — layers {0,1}: disk w13_dn [2*24576, 6144]
+          (interleaved [g0,u0,g1,u1,..] rows) -> de-interleave -> chunk
+          halves [gate; up] (conversion_mapping.py:196-201: Interleave(0)
+          + Chunk(0) -> gate_proj, up_proj), w2_md -> down_proj, LIVE bf16
+          mlp.global_scale; replay the captured mlp.in through
+          model.dense_mlp vs mlp.out: rel err < 1e-2 (B2 header budget),
+          bit-exactness reported (expected True: InklingMLP is three plain
+          nn.Linears with no dispatch decorator, unlike InklingExperts);
+      (b) weight-conversion pin — our _deinterleave_rows + chunk halves
+          torch.equal vs transformers' OWN Interleave(dim=0) / Chunk(dim=0)
+          conversion ops (core_model_loading.py:184-208 / :117-146) run
+          in-process on the same disk tensor, both layers;
+      (c) native-module cross-check — the ACTUAL transformers InklingMLP
+          (modeling_inkling.py:285-299; bf16 — NOT in
+          _keep_in_fp32_modules_strict :610; intermediate 24576 = raw
+          config dense_intermediate_size, configuration_inkling.py:125-126)
+          fed our converted weights, torch.equal REQUIRED: real layer-0
+          weights on the frozen input + random T57 + batch-2 T5, real
+          layer-1 weights on its frozen input, and a small random config
+          (hidden 512, ffn 768) at T600 + batch-2 T13;
+      (d) structural — global_scale is LIVE (values != 1.0) and is the
+          module's LAST op (unit-scale output * global_scale == output,
+          bitwise); swapped gate/up halves break the anchor (silu is
+          asymmetric — orientation discriminates); zero input -> exact
+          zero output (no biases anywhere, :291-293); an independent fp64
+          replay agrees < 1e-2 on both layers."""
+    import copy
+    from transformers import AutoConfig
+    from transformers.core_model_loading import Chunk, Interleave
+    from transformers.models.inkling.modeling_inkling import InklingMLP
+    torch.manual_seed(0)
+    F = torch.nn.functional
+    tens, meta, _ = _load_refs()
+    mc = pcfg.load_verified(MODEL_DIR)
+    idx = loader.build_shard_index(MODEL_DIR)
+
+    #1. the ref run itself built layers 0-1 dense, layer 2 sparse (census
+    #   B1.2), and the native dense ffn is the verified 24576
+    assert meta["mlp_layer_types"][:3] == ["dense", "dense", "sparse"]
+    tc = AutoConfig.from_pretrained(MODEL_DIR,
+                                    trust_remote_code=True).text_config
+    assert tc.hidden_act == "silu"
+    assert tc.intermediate_size == mc.dense_ffn, tc.intermediate_size
+
+    def load_dense_weights(L):
+        #2. disk -> module layout, with the HF-op conversion pin (b)
+        base = f"model.llm.layers.{L}.mlp."
+        w13 = _disk(idx, base + "w13_dn.weight").to(DEV)
+        assert w13.shape == (2 * mc.dense_ffn, mc.hidden), w13.shape
+        wg, wu = _deinterleave_rows(w13).chunk(2, dim=0)
+        hf = Interleave(dim=0).convert({"w": w13}, ["w"], ["w"])
+        hf = Chunk(dim=0).convert(hf, ["w"], ["gate", "up"])
+        if not (torch.equal(wg, hf["gate"]) and torch.equal(wu, hf["up"])):
+            raise SystemExit(f"[t_b2 dense] layer {L}: our de-interleave+"
+                             f"chunk != HF's own Interleave/Chunk ops")
+        del hf
+        wd = _disk(idx, base + "w2_md.weight").to(DEV)
+        assert wd.shape == (mc.hidden, mc.dense_ffn), wd.shape
+        gs = _disk(idx, base + "global_scale").to(DEV)
+        assert gs.shape == (1,) and gs.dtype == torch.bfloat16
+        assert w13.dtype == wd.dtype == torch.bfloat16
+        return wg, wu, wd, gs
+
+    #3. gates (a) + (d): frozen anchors + structural pins, both dense layers
+    anchor_re, n_bit, gs_vals, re64s, W = {}, 0, {}, {}, {}
+    for L in (0, 1):
+        wg, wu, wd, gs = load_dense_weights(L)
+        x = tens[f"layers.{L}.mlp.in"].to(DEV)
+        want = tens[f"layers.{L}.mlp.out"].to(DEV)
+        #3a. anchor-point sanity: mlp.in IS the post_attention_layernorm
+        #    output (decoder forward :587-589; B2.1 capture convention)
+        assert torch.equal(
+            x, tens[f"layers.{L}.post_attention_layernorm.out"].to(DEV))
+        got = pmodel.dense_mlp(x, wg, wu, wd, gs)
+        assert got.dtype == torch.bfloat16 and got.shape == want.shape
+        re = _rel_err(got, want)
+        if re >= 1e-2:
+            raise SystemExit(f"[t_b2 dense] layer {L} mlp.out rel err "
+                             f"{re:.3e} >= 1e-2")
+        anchor_re[L] = re
+        n_bit += torch.equal(got, want)
+        #3b. global_scale is LIVE and the LAST op: a unit-scale run times
+        #    the real scale must reproduce the output bitwise (bf16 *1.0
+        #    is exact)
+        gs_vals[L] = gs.item()
+        assert gs_vals[L] != 1.0, gs_vals[L]
+        got_unit = pmodel.dense_mlp(x, wg, wu, wd, torch.ones_like(gs))
+        if not torch.equal(got_unit * gs, got):
+            raise SystemExit(f"[t_b2 dense] layer {L}: global_scale is "
+                             f"not a single trailing multiply")
+        #3c. swapped halves must NOT reproduce the anchor — proves the
+        #    anchor discriminates the gate/up orientation
+        if torch.equal(pmodel.dense_mlp(x, wu, wg, wd, gs), want):
+            raise SystemExit(f"[t_b2 dense] layer {L}: gate/up swap "
+                             f"reproduced the anchor — orientation pin "
+                             f"vacuous")
+        #3d. zero input -> exact zero out (three bias-free linears + silu)
+        if not (pmodel.dense_mlp(torch.zeros_like(x), wg, wu, wd, gs)
+                == 0).all():
+            raise SystemExit(f"[t_b2 dense] layer {L}: zero input gave "
+                             f"nonzero output")
+        #3e. independent fp64 replay of the whole chain
+        x64 = x.double()
+        r64 = ((F.silu(x64 @ wg.double().T) * (x64 @ wu.double().T))
+               @ wd.double().T) * gs.double()
+        re64s[L] = _rel_err(got, r64)
+        if re64s[L] >= 1e-2:
+            raise SystemExit(f"[t_b2 dense] layer {L}: fp64 replay "
+                             f"disagrees {re64s[L]:.3e}")
+        W[L] = (wg, wu, wd, gs, x)
+
+    #4. gate (c): the native InklingMLP in-process, bf16 like the ref run
+    def build_native(cfg, wg, wu, wd, gs):
+        #4a. construct under a bf16 default dtype, eval, copy all 4 params
+        old = torch.get_default_dtype()
+        torch.set_default_dtype(torch.bfloat16)
+        try:
+            with torch.device(DEV):
+                mod = InklingMLP(cfg)
+        finally:
+            torch.set_default_dtype(old)
+        mod.eval()
+        pn = {n for n, _ in mod.named_parameters()}
+        assert pn == {"gate_proj.weight", "up_proj.weight",
+                      "down_proj.weight", "global_scale"}, pn
+        with torch.no_grad():
+            mod.gate_proj.weight.copy_(wg)
+            mod.up_proj.weight.copy_(wu)
+            mod.down_proj.weight.copy_(wd)
+            mod.global_scale.copy_(gs)
+        for _, p in mod.named_parameters():
+            assert p.dtype == torch.bfloat16
+        return mod
+
+    def rnd(*shape):
+        return torch.randn(*shape, device=DEV).to(torch.bfloat16)
+
+    n_cross = 0
+    #4b. real layer-0 weights: frozen input + random shapes incl. batch 2
+    mod = build_native(tc, *W[0][:4])
+    for xx, tag in ((W[0][4], "L0/ref-x"), (rnd(1, 57, mc.hidden), "L0/T57"),
+                    (rnd(2, 5, mc.hidden), "L0/B2T5")):
+        with torch.no_grad():
+            nat = mod(xx)
+        if not torch.equal(pmodel.dense_mlp(xx, *W[0][:4]), nat):
+            raise SystemExit(f"[t_b2 dense] not bit-exact vs native "
+                             f"InklingMLP: {tag}")
+        n_cross += 1
+    del mod
+    #4c. real layer-1 weights on their frozen input
+    mod = build_native(tc, *W[1][:4])
+    with torch.no_grad():
+        nat = mod(W[1][4])
+    if not torch.equal(pmodel.dense_mlp(W[1][4], *W[1][:4]), nat):
+        raise SystemExit("[t_b2 dense] not bit-exact vs native "
+                         "InklingMLP: L1/ref-x")
+    n_cross += 1
+    del mod
+    torch.cuda.empty_cache()
+    #4d. small random config: different shapes exercise the same code
+    tcs = copy.deepcopy(tc)
+    tcs.hidden_size, tcs.intermediate_size = 512, 768
+    ws = ((torch.randn(768, 512, device=DEV) * 0.1).to(torch.bfloat16),
+          (torch.randn(768, 512, device=DEV) * 0.1).to(torch.bfloat16),
+          (torch.randn(512, 768, device=DEV) * 0.1).to(torch.bfloat16),
+          torch.tensor([1.625], device=DEV, dtype=torch.bfloat16))
+    mod = build_native(tcs, *ws)
+    for xx, tag in ((rnd(1, 600, 512), "small/T600"),
+                    (rnd(2, 13, 512), "small/B2T13")):
+        with torch.no_grad():
+            nat = mod(xx)
+        if not torch.equal(pmodel.dense_mlp(xx, *ws), nat):
+            raise SystemExit(f"[t_b2 dense] not bit-exact vs native "
+                             f"InklingMLP: {tag}")
+        n_cross += 1
+    del mod
+
+    #5. summary line = the test's green evidence
+    print(f"dense ok: frozen anchors layers {{0,1}} (the dense layers — "
+          f"dense_mlp_idx=2 is a COUNT, census B1.2; layer 2 is MoE, "
+          f"covered by B2.8/B2.9) — mlp.out rel err "
+          f"{anchor_re[0]:.1e}/{anchor_re[1]:.1e} < 1e-2 (bit-exact "
+          f"{n_bit}/2); weight conversion pinned vs HF's own "
+          f"Interleave(0)+Chunk(0) ops both layers; native InklingMLP "
+          f"cross-check bit-exact {n_cross}/6 (real L0 T{{13,57}} + "
+          f"batch 2, real L1 T13, random hidden512/ffn768 T{{600,13}}); "
+          f"global_scale LIVE ({gs_vals[0]:.4f}/{gs_vals[1]:.4f}) applied "
+          f"last (bitwise), gate/up swap breaks anchor, zero-in exact "
+          f"zero-out; fp64 replay agrees {re64s[0]:.1e}/{re64s[1]:.1e} "
+          f"< 1e-2")
+
+
 def _todo(item):
     def f():
         raise SystemExit(f"[t_b2] not implemented — that is item {item}'s job")
@@ -1820,7 +2018,7 @@ def main():
             "relbias": t_relbias, "sconv": t_sconv,
             "attn_global": t_attn_global, "attn_swa": t_attn_swa,
             "gate": t_gate, "moe": t_moe,
-            "dense": _todo("B2.10"), "logits": _todo("B2.11")}
+            "dense": t_dense, "logits": _todo("B2.11")}
     usage = f"usage: python -m engine.pyengine.tests.t_b2 {{{'|'.join(cmds)}}}"
     if len(sys.argv) != 2 or sys.argv[1] not in cmds:
         raise SystemExit(usage)

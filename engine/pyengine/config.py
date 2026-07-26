@@ -40,6 +40,7 @@ def load_verified(model_dir: str) -> ModelConfig:
         "n_routed_experts": mc.n_experts, "num_experts_per_tok": mc.topk,
         "n_shared_experts": mc.n_shared, "route_scale": mc.route_scale,
         "intermediate_size": mc.expert_ffn, "dense_mlp_idx": mc.dense_idx,
+        "dense_intermediate_size": mc.dense_ffn,
         "rms_norm_eps": mc.rms_eps,
         "d_rel": mc.d_rel, "rel_extent": mc.rel_extent,
         "log_scaling_alpha": mc.log_alpha, "log_scaling_n_floor": mc.log_floor,
