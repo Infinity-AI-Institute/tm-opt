@@ -1,117 +1,187 @@
 """
-@brief  Perf benchmark runner. Measures decode throughput, TTFT, and peak GPU
-        memory against ANY OpenAI-compatible endpoint — so the identical code
-        path measures the vLLM baseline and the candidate engine.
+@brief  Canonical perf benchmark. Measures total throughput against ANY
+        OpenAI-compatible endpoint under a FROZEN canonical config — the
+        identical code path measures the vLLM baseline and the candidate
+        engine (fairness rule: same workload generator, same counting, same
+        timing for both).
 
-        Hygiene built in: warmup rounds, median-of-N, fixed seed/prompt set,
-        concurrency sweep, and run-to-run stddev reported for the merge gate.
+        Methodology is IDENTICAL to the P1 freeze sweep (freeze_canonical.py):
+        seeded synthetic prompts (range_ratio applied), non-streamed
+        completions, tokens counted from usage.completion_tokens, wall-clock
+        over the measured block. The sweep's numbers and these are therefore
+        directly comparable.
+
+        Protocol per run (from the canonical config):
+          warmup:   num_warmup_requests (= 2 x concurrency), untimed
+          measure:  --repeats independent blocks of num_bench_requests
+                    (= 5 x concurrency); median = the number,
+                    stddev/median = the noise floor input
+        Ledger: with --ledger-iteration N --engine E --label/--mechanism,
+        appends a row to experiments/ledger.jsonl carrying every
+        docs/LEDGER_SCHEMA.md field.
 """
-import json
-import time
 import argparse
-import asyncio
+import hashlib
+import json
+import pathlib
+import random
 import statistics
 import subprocess
+import time
+from concurrent.futures import ThreadPoolExecutor
 
-import aiohttp
+import requests
 
-WORKLOAD_PATH = "configs/bench_prompts.json"   # fixed ShareGPT-style mix
-WARMUP_ROUNDS = 2
-MEASURE_ROUNDS = 5
+LEDGER = "experiments/ledger.jsonl"
 
 
-async def one_request(session, endpoint, model, prompt, max_tokens):
+def make_prompts(isl: int, range_ratio: float, seed: int, n: int) -> list[str]:
     """
-    @brief  Streamed completion; returns (ttft_s, n_tokens, total_s).
+    @brief  Seeded synthetic prompts — MUST stay byte-identical to
+            freeze_canonical.make_prompts (same generator = same contract).
     """
-    t0 = time.perf_counter()
-    ttft, n_tok = None, 0
-    async with session.post(
+    rng = random.Random(seed)
+    out = []
+    for i in range(n):
+        L = rng.randint(int(isl * range_ratio), isl)
+        out.append(f"[req {i}] " + "word " * max(L - 4, 1))
+    return out
+
+
+def one_request(endpoint: str, model: str, prompt: str, osl: int, ignore_eos: bool) -> int:
+    r = requests.post(
         f"{endpoint}/v1/completions",
-        json={
-            "model": model,
-            "prompt": prompt,
-            "max_tokens": max_tokens,
-            "temperature": 0,
-            "stream": True,
-            "seed": 0,
-        },
-    ) as resp:
-        resp.raise_for_status()
-        async for raw in resp.content:
-            line = raw.decode().strip()
-            if not line.startswith("data:") or line.endswith("[DONE]"):
-                continue
-            if ttft is None:
-                ttft = time.perf_counter() - t0
-            n_tok += 1
-    return ttft, n_tok, time.perf_counter() - t0
+        json={"model": model, "prompt": prompt, "max_tokens": osl,
+              "temperature": 0, "seed": 0, "ignore_eos": ignore_eos},
+        timeout=3600,
+    )
+    r.raise_for_status()
+    return r.json()["usage"]["completion_tokens"]
 
 
-async def one_round(endpoint, model, prompts, concurrency, max_tokens):
+def run_block(endpoint, model, prompts, conc, osl, ignore_eos):
     """
-    @brief  Fire `concurrency` simultaneous streams; aggregate throughput.
+    @brief  One timed block: len(prompts) requests at fixed concurrency.
+    @return (tok_per_s, gen_tokens, wall_s)
     """
-    conn = aiohttp.TCPConnector(limit=concurrency)
-    async with aiohttp.ClientSession(connector=conn) as session:
-        t0 = time.perf_counter()
-        results = await asyncio.gather(
-            *[
-                one_request(session, endpoint, model, prompts[i % len(prompts)], max_tokens)
-                for i in range(concurrency)
-            ]
-        )
-        wall = time.perf_counter() - t0
-    total_tokens = sum(r[1] for r in results)
-    ttfts = [r[0] for r in results if r[0] is not None]
-    return {
-        "decode_tok_s": total_tokens / wall,
-        "ttft_ms": 1000 * statistics.median(ttfts),
-    }
+    with ThreadPoolExecutor(max_workers=conc) as pool:
+        t0 = time.time()
+        toks = list(pool.map(
+            lambda p: one_request(endpoint, model, p, osl, ignore_eos), prompts))
+        dt = time.time() - t0
+    return sum(toks) / dt, sum(toks), dt
 
 
-def peak_gpu_mem_gb(gpu_index: int) -> float:
+def run_canonical(endpoint: str, model: str, cfg: dict, repeats: int) -> dict:
+    """
+    @brief  Frozen protocol for one workload config; returns the measurement
+            record (median tok/s, noise floor, evidence per block).
+    """
+    conc = cfg["concurrency"]
+    n_warm = cfg["num_warmup_requests"]
+    n_bench = cfg["num_bench_requests"]
+    total = n_warm + repeats * n_bench
+    prompts = make_prompts(cfg["isl"], cfg["range_ratio"], cfg["seed"], total)
+
+    #1. warmup: fills caches/JIT/clock stabilization; untimed, but counted
+    #   toward warm server state (fairness: identical for both engines)
+    print(f"[bench] warmup {n_warm} reqs @ conc {conc}", flush=True)
+    run_block(endpoint, model, prompts[:n_warm], conc, cfg["osl"], cfg["ignore_eos"])
+
+    #2. measured blocks
+    blocks, off = [], n_warm
+    for b in range(repeats):
+        tps, toks, wall = run_block(
+            endpoint, model, prompts[off:off + n_bench], conc,
+            cfg["osl"], cfg["ignore_eos"])
+        off += n_bench
+        blocks.append({"tok_per_s": round(tps, 1), "gen_tokens": toks,
+                       "wall_s": round(wall, 1)})
+        print(f"[bench] block {b+1}/{repeats}: {tps:,.1f} tok/s "
+              f"({toks} tok, {wall:.0f}s)", flush=True)
+
+    toks = [b["tok_per_s"] for b in blocks]
+    med = statistics.median(toks)
+    noise_pct = (100 * statistics.stdev(toks) / med) if len(toks) > 1 else 0.0
+    return {"tok_per_s": med, "noise_floor_pct": round(noise_pct, 2),
+            "blocks": blocks, "concurrency": conc}
+
+
+def gpu_mem_snapshot() -> str:
     out = subprocess.run(
-        ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits",
-         "-i", str(gpu_index)],
-        capture_output=True, text=True,
-    ).stdout.strip()
-    return float(out) / 1024 if out else -1.0
+        ["nvidia-smi", "--query-gpu=index,memory.used",
+         "--format=csv,noheader"], capture_output=True, text=True).stdout
+    return "; ".join(l.strip() for l in out.splitlines())
 
 
-def run(endpoint, model, gpu_index, concurrency, max_tokens):
-    prompts = json.load(open(WORKLOAD_PATH))
+def append_ledger_row(row: dict):
+    #1. append-only by convention AND by never opening with truncate
+    pathlib.Path("experiments").mkdir(exist_ok=True)
+    with open(LEDGER, "a") as f:
+        f.write(json.dumps(row, sort_keys=True) + "\n")
+    print(f"[bench] ledger row appended: iter={row['iteration']} "
+          f"engine={row['engine']} workload={row['workload']} "
+          f"tok_per_s={row['tok_per_s']:,}")
 
-    #1. warmup: fills caches, triggers JIT/autotune paths, stabilizes clocks
-    for _ in range(WARMUP_ROUNDS):
-        asyncio.run(one_round(endpoint, model, prompts, concurrency, max_tokens))
 
-    #2. measure: N independent rounds, medians + stddev reported
-    rounds = [
-        asyncio.run(one_round(endpoint, model, prompts, concurrency, max_tokens))
-        for _ in range(MEASURE_ROUNDS)
-    ]
-    toks = [r["decode_tok_s"] for r in rounds]
-    return {
-        "concurrency": concurrency,
-        "decode_tok_s": statistics.median(toks),
-        "run_stddev_tok_s": statistics.stdev(toks),
-        "ttft_ms": statistics.median(r["ttft_ms"] for r in rounds),
-        "peak_mem_gb": peak_gpu_mem_gb(gpu_index),
-        "rounds": rounds,
-    }
+def git_head() -> str:
+    return subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                          capture_output=True, text=True).stdout.strip()
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--endpoint", required=True)
+    ap.add_argument("--model", default="/workspace/models/inkling-nvfp4")
+    ap.add_argument("--config", required=True,
+                    help="configs/canonical_<workload>.json (frozen)")
+    ap.add_argument("--repeats", type=int, default=3,
+                    help="independent measured blocks (median reported)")
+    ap.add_argument("--ledger-iteration", type=int, default=None,
+                    help="if set, append a ledger row for this iteration")
+    ap.add_argument("--engine", default="vllm",
+                    help="ledger engine tag: vllm | pyengine")
+    ap.add_argument("--baseline-id", default="vllm_mtp_off")
+    ap.add_argument("--label", default="baseline")
+    ap.add_argument("--mechanism", default="vLLM pinned build, canonical config")
+    ap.add_argument("--log-path", default="")
+    args = ap.parse_args()
+
+    cfg = json.loads(pathlib.Path(args.config).read_text())
+    workload = pathlib.Path(args.config).stem.replace("canonical_", "")
+    print(f"[bench] {workload}: ISL~{cfg['isl']} OSL={cfg['osl']} "
+          f"conc={cfg['concurrency']} cache_key={cfg['cache_key']} "
+          f"repeats={args.repeats}")
+
+    rec = run_canonical(args.endpoint, args.model, cfg, args.repeats)
+    rec.update({"workload": workload, "cache_key": cfg["cache_key"],
+                "gpu_mem": gpu_mem_snapshot(),
+                "measured_at": time.strftime("%Y-%m-%d %H:%M:%S")})
+    print(json.dumps(rec, indent=1))
+
+    if args.ledger_iteration is not None:
+        #2. pct_vs_baseline: baseline rows are their own denominator (100.0);
+        #   candidate rows compute vs the committed baseline row
+        pct = 100.0
+        if args.engine != "vllm":
+            base = None
+            for line in pathlib.Path(LEDGER).read_text().splitlines():
+                r = json.loads(line)
+                if (r.get("engine") == "vllm" and r.get("workload") == workload
+                        and r.get("baseline_id") == args.baseline_id):
+                    base = r["tok_per_s"]
+            if base:
+                pct = round(100 * rec["tok_per_s"] / base, 1)
+        append_ledger_row({
+            "iteration": args.ledger_iteration, "engine": args.engine,
+            "workload": workload, "label": args.label,
+            "mechanism": args.mechanism, "tok_per_s": rec["tok_per_s"],
+            "pct_vs_baseline": pct, "baseline_id": args.baseline_id,
+            "cache_key": cfg["cache_key"], "commit": git_head(),
+            "accepted": True, "noise_floor_pct": rec["noise_floor_pct"],
+            "log_path": args.log_path, "blocks": rec["blocks"],
+        })
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--endpoint", required=True)
-    ap.add_argument("--model", required=True)
-    ap.add_argument("--gpu", type=int, required=True)
-    ap.add_argument("--concurrency", type=int, nargs="+", default=[1, 8, 32, 128])
-    ap.add_argument("--max-tokens", type=int, default=256)
-    args = ap.parse_args()
-
-    #1. sweep concurrency levels; the merge gate keys off the highest level
-    report = {str(c): run(args.endpoint, args.model, args.gpu, c, args.max_tokens)
-              for c in args.concurrency}
-    print(json.dumps(report, indent=2))
+    main()

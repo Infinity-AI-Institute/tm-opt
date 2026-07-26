@@ -1,0 +1,2 @@
+[bench] prefill_heavy: ISL~8192 OSL=1024 conc=512 cache_key=8451a604a8849296 repeats=3
+[bench] warmup 1024 reqs @ conc 512
