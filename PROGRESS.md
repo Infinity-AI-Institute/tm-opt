@@ -22,13 +22,14 @@ Env for all items: `cd /workspace/tm-opt && source /workspace/venv/bin/activate
       — green: 34 files (33 model + mtp), 2056 tensors mapped, per-shard
       safetensors headers match index exactly (commit 5400822)
 - [x] B1.2 tensor census vs config: counts per layer match config.h shapes
-      (66 layers; layer 2 dense; 11 global / 55 swa; MoE 256×ffn3072).
+      (66 layers; layer 0-1 dense; 11 global / 55 swa; MoE 256×ffn3072).
       test: `python -m engine.pyengine.tests.t_b1 census`
       — green: all 2056 tensors accounted, exact per-layer dtype+shape match
       vs config; FACT FIX: dense = layers 0–1 (dense_mlp_idx=2 is a count),
       layer 2 is MoE — see note below (commit fa0e025)
-- [x] B1.3 dtype map honors hf_quant exclude list (embeds/norms/unembed/
-      layer-0 attn stay bf16; rest NVFP4 + scales).
+- [x] B1.3 dtype map honors hf_quant exclude list (bf16: ALL attention,
+      norms/sconvs, gates+shared experts, layer-2 experts, dense MLPs 0–1,
+      embeds/unembed, mtp; NVFP4 = routed expert w13/w2 of layers 3–65 only).
       test: `python -m engine.pyengine.tests.t_b1 dtypes`
       — green: 479-entry exclude list reconciled exactly both directions;
       nvfp4 = 126 expert weights (layers 3–65 × w13/w2) ONLY, all attn bf16
