@@ -250,11 +250,97 @@ def t_dtypes():
           f"(outside exclude scope)")
 
 
+def t_dequant():
+    #1. inputs: index/headers/config/dtype map (their own checks run inside);
+    #   the item's ONE expert weight = w13 of the first quantized MoE layer
+    #   (layer 3; representative of all 126 packs, same layout by B1.3)
+    import torch
+    idx = loader.build_shard_index(MODEL_DIR)
+    meta = loader.read_headers(idx)
+    mc = pcfg.load_verified(MODEL_DIR)
+    dm = loader.build_dtype_map(idx, meta)
+    base = f"model.llm.layers.{mc.dense_idx + 1}.mlp.experts.w13_weight"
+    assert base in dm.packed, base
+
+    #2. read an expert slice (first/middle/last) of base + block scale, and
+    #   the full tiny companions; tensors resolve shards independently (the
+    #   base and its companions need not share a shard file)
+    experts = [0, 7, mc.n_experts - 1]
+
+    def read(name, sel=None):
+        with safe_open(str(idx.shard_path(name)), framework="pt") as f:
+            if sel is None:
+                return f.get_tensor(name)
+            sl = f.get_slice(name)
+            return torch.cat([sl[i:i + 1] for i in sel])
+
+    dev = "cuda:0"  # first visible device = physical GPU 4 (vLLM owns 0-3)
+    u8 = read(base, experts).to(dev)
+    sc = read(base + ".scale", experts).to(dev)
+    s2 = read(base + ".scale2")[experts].to(dev)
+    orig_shape = tuple(read(base + ".original_shape").tolist())
+
+    #3. checkpoint's own confirmation of the pack geometry: original_shape
+    #   gives the unpacked dims -> input dim really is 2 fp4 per byte
+    E, od, pk = meta[base][1]
+    assert orig_shape == (E, od, pk * 2), (orig_shape, meta[base][1])
+
+    #4. our dequant (loader.dequant_nvfp4, pure torch): 3D per-expert-scale2
+    #   arm and 2D scalar-scale2 arm
+    ours = loader.dequant_nvfp4(u8, sc, s2, dm.group_size, torch.bfloat16)
+    ours_2d = loader.dequant_nvfp4(u8[0], sc[0], s2[0], dm.group_size,
+                                   torch.bfloat16)
+
+    #5. vLLM's dequant of the SAME tensors — the reference the item names:
+    #   dequantize_to_dtype (vllm/model_executor/layers/quantization/utils/
+    #   nvfp4_emulation_utils.py:346) is vLLM's weight-dequant entry point
+    #   (run_nvfp4_emulations calls it at :484-491); swizzle=False because
+    #   checkpoint scales are linear (see loader.dequant_nvfp4 docstring)
+    from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils \
+        import dequantize_to_dtype
+    ref = dequantize_to_dtype(u8, sc, s2, torch.bfloat16, dm.group_size,
+                              swizzle=False)
+    ref_2d = dequantize_to_dtype(u8[0], sc[0], s2[0], torch.bfloat16,
+                                 dm.group_size, swizzle=False)
+
+    #6. match must be exact: same f32 ops in the same association, so the
+    #   bf16 results are bit-identical, not merely close
+    for name, a, b in (("3d", ours, ref), ("2d", ours_2d, ref_2d),
+                       ("2d-vs-3d[0]", ours_2d, ours[0])):
+        if not torch.equal(a, b):
+            d = (a.float() - b.float()).abs()
+            raise SystemExit(f"[t_b1 dequant] {name} mismatch: "
+                             f"{(a != b).sum().item()} elems differ, "
+                             f"max abs diff {d.max().item():.3e}")
+
+    #7. sanity anchored to the ModelOpt invariant scale2 = amax/(6*448):
+    #   per expert, max|deq| <= 6*448*scale2 (block scales are clamped to
+    #   fp8 max 448) and reaches ~amax (fp8 rounding slack); values finite,
+    #   not degenerate-zero
+    assert torch.isfinite(ours.float()).all()
+    ratios = []
+    for j, e in enumerate(experts):
+        cap = 6.0 * 448.0 * float(s2[j])
+        m = ours[j].float().abs().max().item()
+        assert 0.5 * cap < m <= cap * (1 + 1e-4), (e, m, cap)
+        ratios.append(m / cap)
+    nz = (ours != 0).float().mean().item()
+    assert nz > 0.5, f"degenerate dequant: only {nz:.1%} nonzero"
+
+    #8. summary line = the test's green evidence
+    print(f"dequant ok: {base} experts {experts} + 2D arm, shape "
+          f"{tuple(ours.shape)}: bit-exact vs vLLM dequantize_to_dtype("
+          f"swizzle=False) in bf16; e2m1 low-nibble-first, f8e4m3 block "
+          f"scale /{dm.group_size} * f32 scale2 (amax/2688, no reciprocal); "
+          f"max|deq|/(6*448*scale2) = {[f'{r:.3f}' for r in ratios]}, "
+          f"nonzero {nz:.1%}")
+
+
 def main():
     #1. dispatch on subcommand; unimplemented ones fail loud with their item id
-    done = {"index": t_index, "census": t_census, "dtypes": t_dtypes}
-    todo = {"dequant": "B1.4",
-            "plan": "B1.5", "load": "B1.6"}
+    done = {"index": t_index, "census": t_census, "dtypes": t_dtypes,
+            "dequant": t_dequant}
+    todo = {"plan": "B1.5", "load": "B1.6"}
     usage = f"usage: python -m engine.pyengine.tests.t_b1 {{{'|'.join([*done, *todo])}}}"
     if len(sys.argv) != 2 or sys.argv[1] not in {*done, *todo}:
         raise SystemExit(usage)

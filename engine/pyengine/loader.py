@@ -1,12 +1,14 @@
 """B1: checkpoint -> GPU tensors. NVFP4 block-scale layout per vLLM modelopt
-(cite file:line when implemented). TP=4 plan: attention head-parallel,
-MoE expert-parallel (64 experts/GPU), embeddings replicated."""
-#TODO(B1.2..B1.6): implemented item-by-item by the build loop.
+(see dequant_nvfp4 for the cited layout facts). TP=4 plan: attention
+head-parallel, MoE expert-parallel (64 experts/GPU), embeddings replicated."""
+#TODO(B1.5..B1.6): implemented item-by-item by the build loop.
 import json
 import pathlib
 import re
 import struct
 from dataclasses import dataclass
+
+import torch
 
 N_MODEL_SHARDS = 33            # model-XXXXX-of-00033.safetensors (CLAUDE.md model facts)
 MTP_SHARD = "mtp.safetensors"  # MTP draft layers, separate file, listed in the index
@@ -190,3 +192,63 @@ def build_dtype_map(idx: ShardIndex, meta: dict) -> DtypeMap:
         else:
             raise SystemExit(f"[loader] unclassified tensor family: {n}")
     return dm
+
+
+#B1.4: E2M1 decode table, index = 3-bit magnitude (sign is bit 0x08). Values
+#per vLLM kE2M1ToFloat (vllm/model_executor/layers/quantization/utils/
+#nvfp4_emulation_utils.py:20-22).
+E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
+
+def dequant_nvfp4(packed, scale, scale2, group_size, out_dtype=torch.bfloat16):
+    """B1.4: dequantize one NVFP4-packed weight (or an expert slice of one).
+
+    Layout facts, each cited to the vLLM code that defines them (all paths
+    under vllm/model_executor/layers/quantization/ unless noted):
+    - byte j of the packed input dim holds elements 2j (LOW nibble) and
+      2j+1 (HIGH nibble) — utils/nvfp4_emulation_utils.py:316-333
+      (break_fp4_bytes: low first) and :101-108 (triton kernel interleave).
+    - value = e2m1(nibble) * block_scale * scale2: one F8_E4M3 block scale
+      per `group_size`(=16) inputs, times the per-expert F32 scale2.
+      scale2 is ModelOpt's weight_scale_2 = amax/(6.0*448.0), applied
+      DIRECTLY, no reciprocation — modelopt.py:1253-1262 (docstring) and
+      utils/nvfp4_emulation_utils.py:391-397 (dequantize_to_dtype:
+      tensor_sf * global_scale). The inkling loader maps checkpoint names
+      .scale/.scale2 -> weight_scale/weight_scale_2 verbatim
+      (vllm/models/inkling/nvidia/model.py:381-386, moe.py:578-582).
+    - checkpoint block scales are LINEAR row-major (exact [*, rows, k/16]
+      shape, dtype-map-verified; swizzling is a load-time transform for the
+      cutlass kernels, modelopt.py:1873 expects "2D, not swizzled" on disk)
+      -> dequantize_to_dtype(swizzle=False) semantics.
+
+    Shapes: packed (*L, rows, k/2) u8; scale (*L, rows, k/group_size)
+    f8e4m3; scale2 (*L,) f32 (0-d for a single 2D weight slice).
+    """
+    #1. contract checks — dtypes/shapes exactly as stored (census B1.2/B1.3)
+    assert packed.dtype == torch.uint8, packed.dtype
+    assert scale.dtype == torch.float8_e4m3fn, scale.dtype
+    assert scale2.dtype == torch.float32, scale2.dtype
+    *lead, rows, pk = packed.shape
+    k = pk * 2
+    assert k % group_size == 0
+    assert tuple(scale.shape) == (*lead, rows, k // group_size), scale.shape
+    assert tuple(scale2.shape) == tuple(lead), scale2.shape
+
+    #2. unpack nibbles along the input dim, LOW nibble first (see citation)
+    nib = torch.stack((packed & 0x0F, packed >> 4), dim=-1)
+    nib = nib.reshape(*lead, rows, k)
+
+    #3. decode E2M1: 3-bit magnitude via LUT, sign bit 0x08
+    lut = torch.tensor(E2M1_VALUES, dtype=torch.float32, device=packed.device)
+    val = lut[(nib & 0x07).long()]
+    val = torch.where(nib & 0x08 != 0, -val, val)
+
+    #4. effective f32 scale per block = f8 block scale * scale2 — same
+    #   association as vLLM's kernel (e2m1 * (scale*global), utils/
+    #   nvfp4_emulation_utils.py:88-89,104-105) so bf16 results are bit-equal
+    s = scale.float() * scale2.reshape(*scale2.shape, 1, 1)
+
+    #5. broadcast the block scale over its group_size inputs; cast once
+    val = val.reshape(*lead, rows, k // group_size, group_size)
+    out = (val * s.unsqueeze(-1)).reshape(*lead, rows, k)
+    return out.to(out_dtype)
