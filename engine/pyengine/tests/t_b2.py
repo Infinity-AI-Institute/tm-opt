@@ -1248,6 +1248,205 @@ def t_attn_swa():
           f"{mc.sconv_k}-1 bit-identical, k/v sconv smear accounted)")
 
 
+def t_gate():
+    """B2.8: MoE gate/router (model.moe_gate) vs the frozen refs + the
+    native module. The router (InklingTopkRouter, modeling_inkling.py
+    :342-377) scores 258 slots (256 routed + 2 shared) in one linear;
+    CHOICE ranks sigmoid(routed)+bias, WEIGHTS are bias-free normalized
+    sigmoids over the 6 chosen + 2 shared logits, * route_scale *
+    global_scale. Gates:
+      (a) frozen anchors — all three sparse ref layers {2,5,6}: replay the
+          captured mlp.in (the gate's input, InklingMoE.forward :421) with
+          the real checkpoint gate weights (f32 bias/global_scale downcast
+          to bf16 exactly as the ref load did — router not in
+          _keep_in_fp32_modules_strict :610; captures are bf16): topk
+          INDICES torch.equal REQUIRED (item: exact); topk_weights,
+          routed_logits, shared_gammas rel err < 1e-2 REQUIRED,
+          bit-exactness reported;
+      (b) native-module cross-check — the ACTUAL transformers
+          InklingTopkRouter in-process, bf16, torch.equal REQUIRED on ALL
+          FOUR outputs: real weights (frozen input + random T {1,257}) and
+          random weights incl. bias and global_scale != 1 (batch 2, T 600);
+      (c) structural — per token the chosen 6 are distinct, in-range, and
+          really the 6 LARGEST sigmoid+bias scores (min chosen >= max
+          unchosen, no topk call); an independent fp64 normalized-sigmoid
+          evaluation (NO bias term) reproduces weights+gammas < 1e-2 —
+          proving the bias steers choice only; a +100 bias spike on an
+          unchosen expert forces it into every token's top-6; weights+gammas
+          sum to route_scale*global_scale (softmax sums to 1 pre-scale)."""
+    from transformers import AutoConfig
+    from transformers.models.inkling.modeling_inkling import InklingTopkRouter
+    torch.manual_seed(0)
+    F = torch.nn.functional
+    tens, meta, _ = _load_refs()
+    mc = pcfg.load_verified(MODEL_DIR)
+    idx = loader.build_shard_index(MODEL_DIR)
+    names4 = ("routed_logits", "topk_weights", "topk_indices",
+              "shared_gammas")
+
+    #1. real gate weights for the three sparse ref layers, shapes/dtypes
+    #   pinned; bias/global_scale downcast f32 -> bf16 like the ref load
+    layers = (2, 5, 6)
+    W, down_exact = {}, True
+    for L in layers:
+        base = f"model.llm.layers.{L}.mlp.gate."
+        wg = _disk(idx, base + "weight").to(DEV)
+        b32 = _disk(idx, base + "bias").to(DEV)
+        gs32 = _disk(idx, base + "global_scale").to(DEV)
+        assert wg.shape == (mc.n_experts + mc.n_shared, mc.hidden), wg.shape
+        assert wg.dtype == torch.bfloat16, wg.dtype
+        assert b32.shape == (mc.n_experts,) and b32.dtype == torch.float32
+        assert gs32.shape == (1,) and gs32.dtype == torch.float32
+        b, gs = b32.to(torch.bfloat16), gs32.to(torch.bfloat16)
+        down_exact &= (torch.equal(b.float(), b32)
+                       and torch.equal(gs.float(), gs32))
+        W[L] = (wg, b, gs)
+
+    def ours(xx, wd):
+        #2. our full router (model.moe_gate)
+        return pmodel.moe_gate(xx, *wd, mc.topk, mc.n_shared, mc.route_scale)
+
+    #3. gate (a) + (c): frozen anchors and structural pins per layer
+    anchor_re, n_bit = {}, 0
+    worst_re64 = worst_sum = 0.0
+    keep = {}
+    for L in layers:
+        wg, b, gs = W[L]
+        x = tens[f"layers.{L}.mlp.in"].to(DEV)
+        rl, tw, ti, sg = ours(x, W[L])
+        keep[L] = (x, rl, tw, ti, sg)
+        want = {n: tens[f"layers.{L}.mlp.gate.{n}"].to(DEV) for n in names4}
+        assert ti.dtype == torch.int64, ti.dtype
+        assert rl.dtype == tw.dtype == sg.dtype == torch.bfloat16
+        for n, g in zip(names4, (rl, tw, ti, sg)):
+            assert g.shape == want[n].shape, (L, n, g.shape)
+        #3a. indices EXACT (the item's gate)
+        if not torch.equal(ti, want["topk_indices"]):
+            bad = (ti != want["topk_indices"]).any(-1).sum().item()
+            raise SystemExit(f"[t_b2 gate] layer {L}: topk_indices differ "
+                             f"from ref on {bad}/{ti.shape[0]} tokens")
+        #3b. weights/logits/gammas < 1e-2, bit-exactness counted
+        res = {}
+        for n, g in (("routed_logits", rl), ("topk_weights", tw),
+                     ("shared_gammas", sg)):
+            res[n] = _rel_err(g, want[n])
+            if res[n] >= 1e-2:
+                raise SystemExit(f"[t_b2 gate] layer {L} {n} rel err "
+                                 f"{res[n]:.3e} >= 1e-2")
+            n_bit += torch.equal(g, want[n])
+        anchor_re[L] = res["topk_weights"]
+        #3c. structural: distinct, in-range, and truly the 6 largest
+        #    sigmoid+bias scores (direct comparison, no topk call)
+        assert ti.min() >= 0 and ti.max() < mc.n_experts
+        if not (torch.sort(ti, dim=-1)[0].diff(dim=-1) > 0).all():
+            raise SystemExit(f"[t_b2 gate] layer {L}: duplicate expert "
+                             f"in a token's top-{mc.topk}")
+        sfc = (F.linear(x.reshape(-1, mc.hidden), wg
+                        ).sigmoid()[..., :-mc.n_shared] + b)
+        chosen_min = sfc.gather(-1, ti).amin(-1)
+        unchosen_max = sfc.scatter(-1, ti, float("-inf")).amax(-1)
+        if not (chosen_min >= unchosen_max).all():
+            raise SystemExit(f"[t_b2 gate] layer {L}: chosen set is not "
+                             f"the {mc.topk} largest scores")
+        #3d. independent fp64 normalized-sigmoid weights, NO bias term —
+        #    different math path (no logsigmoid/logsumexp), proves the
+        #    correction bias never enters the weights
+        lg8 = torch.cat([rl.gather(-1, ti), F.linear(
+            x.reshape(-1, mc.hidden), wg)[..., -mc.n_shared:]], -1).double()
+        s8 = lg8.sigmoid()
+        w64 = (s8 / s8.sum(-1, keepdim=True)
+               * mc.route_scale * gs.double())
+        re64 = _rel_err(torch.cat([tw, sg], -1), w64)
+        if re64 >= 1e-2:
+            raise SystemExit(f"[t_b2 gate] layer {L}: fp64 "
+                             f"normalized-sigmoid weights differ {re64:.3e}")
+        worst_re64 = max(worst_re64, re64)
+        #3e. weights+gammas sum to route_scale*global_scale per token
+        tot = torch.cat([tw, sg], -1).float().sum(-1)
+        want_tot = mc.route_scale * gs.float()
+        dev = ((tot - want_tot).abs() / want_tot).max().item()
+        if dev >= 2e-2:
+            raise SystemExit(f"[t_b2 gate] layer {L}: slot sum off by "
+                             f"{dev:.3e} from route_scale*global_scale")
+        worst_sum = max(worst_sum, dev)
+
+    #4. gate (c) spike: +100 bias on an expert NO token chose must force it
+    #   into every token's top-6 (bias steers choice)
+    x2, _, _, ti0, _ = keep[2]
+    absent = next(j for j in range(mc.n_experts) if not (ti0 == j).any())
+    b_spike = W[2][1].clone()
+    b_spike[absent] += 100.0
+    _, _, ti_s, _ = ours(x2, (W[2][0], b_spike, W[2][2]))
+    if not (ti_s == absent).any(-1).all():
+        raise SystemExit(f"[t_b2 gate] +100 bias spike on expert {absent} "
+                         f"did not force it into every top-{mc.topk}")
+
+    #5. gate (b): the native module in-process, real config, bf16 like the
+    #   ref run; torch.equal on all four outputs
+    tc = AutoConfig.from_pretrained(MODEL_DIR,
+                                    trust_remote_code=True).text_config
+    assert tc.n_routed_experts == mc.n_experts
+    assert tc.n_shared_experts == mc.n_shared
+    assert tc.num_experts_per_tok == mc.topk
+    assert tc.route_scale == mc.route_scale
+
+    def build_native(wg, bb, gg):
+        with torch.device(DEV):
+            mod = InklingTopkRouter(tc)
+        mod.eval()
+        pn = {n for n, _ in mod.named_parameters()}
+        assert pn == {"weight", "global_scale",
+                      "e_score_correction_bias"}, pn
+        mod.to(torch.bfloat16)
+        with torch.no_grad():
+            mod.weight.copy_(wg)
+            mod.e_score_correction_bias.copy_(bb)
+            mod.global_scale.copy_(gg)
+        assert mod.top_k == mc.topk and mod.route_scale == mc.route_scale
+        assert mod.n_total_experts == mc.n_experts + mc.n_shared
+        return mod
+
+    def rnd(*shape):
+        return torch.randn(*shape, device=DEV).to(torch.bfloat16)
+
+    w_rand = ((torch.randn(mc.n_experts + mc.n_shared, mc.hidden,
+                           device=DEV) * 0.02).to(torch.bfloat16),
+              (torch.randn(mc.n_experts, device=DEV) * 0.5
+               ).to(torch.bfloat16),
+              torch.tensor([1.625], device=DEV, dtype=torch.bfloat16))
+    mods = {"real": build_native(*W[2]), "rand": build_native(*w_rand)}
+    wsets = {"real": W[2], "rand": w_rand}
+    cases = (("real", keep[2][0], "ref-x"), ("real", rnd(1, 1, mc.hidden),
+             "T1"), ("real", rnd(1, 257, mc.hidden), "T257"),
+             ("rand", rnd(2, 13, mc.hidden), "B2T13"),
+             ("rand", rnd(1, 600, mc.hidden), "T600"))
+    n_cross = 0
+    for wkey, xx, tag in cases:
+        got = ours(xx, wsets[wkey])
+        with torch.no_grad():
+            nat = mods[wkey](xx)
+        for n, g, na in zip(names4, got, nat):
+            if not torch.equal(g, na):
+                raise SystemExit(f"[t_b2 gate] not bit-exact vs native "
+                                 f"module: {wkey}/{tag}/{n}")
+        n_cross += 1
+
+    #6. summary line = the test's green evidence
+    print(f"gate ok: frozen anchors layers {{2,5,6}} — topk_indices EXACT "
+          f"3/3 layers ({3 * ti0.shape[0] * mc.topk} slots), "
+          f"weights rel err {anchor_re[2]:.1e}/{anchor_re[5]:.1e}/"
+          f"{anchor_re[6]:.1e} < 1e-2 (+ routed_logits/shared_gammas, "
+          f"bit-exact {n_bit}/9); native-module cross-check bit-exact "
+          f"{n_cross}/{len(cases)} cases x all 4 outputs (real+random "
+          f"weights incl. global_scale!=1, T {{1,13,257,600}}, batch 2); "
+          f"top-6 = 6 largest sigmoid+bias scores (distinct, in-range), "
+          f"fp64 bias-free normalized-sigmoid weights agree "
+          f"{worst_re64:.1e} (bias steers choice only; +100 spike forces "
+          f"expert into all top-6), slot sums = route_scale*global_scale "
+          f"(max dev {worst_sum:.1e}); router all-bf16 like ref (f32 "
+          f"bias/global_scale downcast exact={down_exact})")
+
+
 def _todo(item):
     def f():
         raise SystemExit(f"[t_b2] not implemented — that is item {item}'s job")
@@ -1260,7 +1459,7 @@ def main():
             "embed": t_embed, "rmsnorm": t_rmsnorm,
             "relbias": t_relbias, "sconv": t_sconv,
             "attn_global": t_attn_global, "attn_swa": t_attn_swa,
-            "gate": _todo("B2.8"), "moe": _todo("B2.9"),
+            "gate": t_gate, "moe": _todo("B2.9"),
             "dense": _todo("B2.10"), "logits": _todo("B2.11")}
     usage = f"usage: python -m engine.pyengine.tests.t_b2 {{{'|'.join(cmds)}}}"
     if len(sys.argv) != 2 or sys.argv[1] not in cmds:

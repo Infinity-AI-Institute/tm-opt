@@ -128,6 +128,52 @@ def additive_causal_mask(q_positions, kv_positions, dtype, window=None):
     return torch.where(allowed, zero, torch.finfo(dtype).min)[None, None]
 
 
+def moe_gate(x, w_gate, bias, global_scale, top_k, n_shared, route_scale):
+    """MoE router — exact InklingTopkRouter semantics (transformers
+    models/inkling/modeling_inkling.py:342-377). w_gate is
+    (n_routed + n_shared, hidden): the router scores the 2 shared experts
+    alongside the 256 routed ones in ONE linear (:357-358). Selection and
+    weighting are DIFFERENT functions of those logits: the top_k CHOICE
+    ranks sigmoid(routed logits) + e_score_correction_bias (:361-364 —
+    the bias steers which experts win, DeepSeek-V3 style), while the
+    WEIGHTS ignore the bias entirely — softmax over logsigmoid (= sigmoids
+    normalized to sum 1) of the chosen routed logits AND the shared logits
+    jointly (:366-370, the norm_after_topk form), then * route_scale *
+    global_scale (:372). Slot order [top_k routed | n_shared shared];
+    shared slots are returned separately as shared_gammas, consumed by
+    InklingSharedExperts (:374-375). Tokens are flattened (:357): returns
+    (routed_logits [T, n_routed], topk_weights [T, top_k], topk_indices
+    [T, top_k] int64, shared_gammas [T, n_shared]) in the input dtype —
+    the ref run holds the whole router in bf16 (checkpoint f32
+    bias/global_scale downcast at load; router NOT in
+    _keep_in_fp32_modules_strict :610). Fused Triton form is Stage-3 (D4)."""
+    F = torch.nn.functional
+    #1. flatten tokens, one linear over all routed+shared slots (:357-358)
+    flat = x.reshape(-1, x.shape[-1])
+    router_logits = F.linear(flat, w_gate)
+    #2. choice scores: sigmoid of the ROUTED logits + correction bias;
+    #   top-k indices only, unsorted (:361-364)
+    scores = router_logits.sigmoid()
+    scores_for_choice = scores[..., :-n_shared] + bias
+    topk_indices = torch.topk(scores_for_choice, top_k, dim=-1,
+                              sorted=False)[1]
+    #3. weights from the LOGITS (no bias): gather the chosen routed logits,
+    #   append the shared logits, normalize their sigmoids (:366-370)
+    routed_logits = router_logits[..., :-n_shared]
+    shared_logits = router_logits[..., -n_shared:]
+    topk_logits = torch.cat(
+        [routed_logits.gather(-1, topk_indices), shared_logits], dim=-1)
+    topk_log_probs = F.logsigmoid(topk_logits)
+    topk_weights = torch.exp(
+        topk_log_probs - torch.logsumexp(topk_log_probs, dim=-1,
+                                         keepdim=True))
+    #4. scale, then split the [top_k | n_shared] slots (:372-375)
+    topk_weights = topk_weights * route_scale * global_scale
+    shared_gammas = topk_weights[..., -n_shared:].contiguous()
+    topk_weights = topk_weights[..., :top_k].contiguous()
+    return routed_logits, topk_weights, topk_indices, shared_gammas
+
+
 def attn_prefill(x, wq, wk, wv, wr, wo, w_k_sconv, w_v_sconv, w_q_norm,
                  w_k_norm, rel_proj, attn_mask, q_positions, kv_positions,
                  head_dim, is_global, alpha=None, n_floor=None, eps=1e-6):

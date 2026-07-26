@@ -38,6 +38,7 @@ def load_verified(model_dir: str) -> ModelConfig:
         "swa_num_key_value_heads": mc.s_kv_heads, "head_dim": mc.head_dim,
         "swa_num_attention_heads": mc.s_q_heads, "swa_head_dim": mc.head_dim,
         "n_routed_experts": mc.n_experts, "num_experts_per_tok": mc.topk,
+        "n_shared_experts": mc.n_shared, "route_scale": mc.route_scale,
         "intermediate_size": mc.expert_ffn, "dense_mlp_idx": mc.dense_idx,
         "rms_norm_eps": mc.rms_eps,
         "d_rel": mc.d_rel, "rel_extent": mc.rel_extent,
