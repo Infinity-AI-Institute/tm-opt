@@ -7,8 +7,10 @@ Env for all items: `cd /workspace/tm-opt && source /workspace/venv/bin/activate
 && export CUDA_VISIBLE_DEVICES=4,5,6,7`. Model dir: /workspace/models/inkling-nvfp4.
 
 ## B0 — scaffolding sanity
-- [ ] B0.1 pyengine imports clean.
+- [x] B0.1 pyengine imports clean.
       test: `python -c "import engine.pyengine as pe; print(pe.__version__)"`
+      — green: output `0.0.1` (scaffolding pre-existing from commit 8d85a77;
+      no code change needed)
 - [ ] B0.2 triton availability + toy kernel compiles on GPU 4.
       test: `python engine/pyengine/tests/test_triton_smoke.py`
 
@@ -87,3 +89,12 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
       test: `python harness/benchmark.py --endpoint http://localhost:8200 --config configs/canonical_prefill_heavy.json --ledger-iteration 0`
 
 <!-- Loop notes append below this line -->
+- 2026-07-26 B0.1: ran test verbatim from /workspace/tm-opt (venv active,
+  CUDA_VISIBLE_DEVICES=4,5,6,7). Real output:
+  ```
+  0.0.1
+  ```
+  No code change required — engine/pyengine/ scaffolding (commit 8d85a77)
+  already imports clean via namespace package. Pre-existing uncommitted edits
+  to scripts/ralph_{build,experiment}.sh were left unstaged (loop scripts are
+  off-limits to this loop; staged PROGRESS.md only instead of `git add -A`).
