@@ -11,8 +11,10 @@ Env for all items: `cd /workspace/tm-opt && source /workspace/venv/bin/activate
       test: `python -c "import engine.pyengine as pe; print(pe.__version__)"`
       — green: output `0.0.1` (scaffolding pre-existing from commit 8d85a77;
       no code change needed)
-- [ ] B0.2 triton availability + toy kernel compiles on GPU 4.
+- [x] B0.2 triton availability + toy kernel compiles on GPU 4.
       test: `python engine/pyengine/tests/test_triton_smoke.py`
+      — green: `triton ok on NVIDIA B300 SXM6 AC; triton 3.6.0` (test file
+      pre-existing from scaffolding; no code change needed)
 
 ## B1 — loader (safetensors → GPU tensors, NVFP4-aware)
 - [ ] B1.1 shard index: enumerate 33 shards + mtp.safetensors, map tensor
@@ -98,3 +100,12 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
   already imports clean via namespace package. Pre-existing uncommitted edits
   to scripts/ralph_{build,experiment}.sh were left unstaged (loop scripts are
   off-limits to this loop; staged PROGRESS.md only instead of `git add -A`).
+- 2026-07-26 B0.2: ran test verbatim from /workspace/tm-opt (venv active,
+  CUDA_VISIBLE_DEVICES=4,5,6,7). Real output:
+  ```
+  triton ok on NVIDIA B300 SXM6 AC; triton 3.6.0
+  ```
+  test_triton_smoke.py pre-existing from scaffolding; kernel compiled and ran
+  on GPU 4 (first visible device), allclose check passed. No code change.
+  Same staging convention as B0.1: PROGRESS.md only (ralph_*.sh edits remain
+  unstaged, loop scripts off-limits).
