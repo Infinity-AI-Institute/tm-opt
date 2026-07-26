@@ -93,8 +93,12 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
       mask bit-equal native create_causal_mask; 6/6 native-module
       cross-checks bit-exact (real+random weights, T 1-600, batch 2);
       causality bit-checked (commit 3196ecd)
-- [ ] B2.7 SWA layer (idx 0, window 512, 16 KV heads) matches ref slice.
+- [x] B2.7 SWA layer (idx 0, window 512, 16 KV heads) matches ref slice.
       test: `python -m engine.pyengine.tests.t_b2 attn_swa`
+      — green: layer-0 frozen anchors bit-exact (full path + 8 internals);
+      window mask bit-equal native create_sliding_window_causal_mask; 6/6
+      native-module cross-checks bit-exact incl. T600 > window; window
+      cutoff pinned exactly both sides (commit a0c007b)
 - [ ] B2.8 MoE gate: sigmoid+bias → top-6 → norm_after_topk → route_scale 8
       matches ref router outputs exactly (indices) / 1e-2 (weights).
       test: `python -m engine.pyengine.tests.t_b2 gate`
@@ -492,3 +496,35 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
   embed + rmsnorm + relbias + sconv; t_b1 index + census + dtypes + plan.
   Code committed first (3196ecd) per convention; this tick is its own
   commit.
+- 2026-07-26 B2.7: NO new model code — B2.6's attn_prefill already carries
+  the SWA arm (is_global=False skips the tau round-trip exactly like the
+  native `if not self.is_sliding` gate, modeling_inkling.py:254; rel extent
+  falls out of the proj bank shape (16,512); window enters only through the
+  mask, matching eager_attention_forward which ignores its sliding_window
+  kwarg, :157-182). Added t_b2 attn_swa (mirror of attn_global at layer 0:
+  frozen anchors full-path + 8 internals, mask-vs-native, native-module
+  torch.equal cross-check, causality) plus the SWA-specific arms: our
+  additive_causal_mask(window=512) bit-equal transformers'
+  create_sliding_window_causal_mask on the exact ref-run call (predicate
+  kv > q - window per masking_utils sliding_window_overlay; layer 0 reads
+  the "sliding_attention" mask entry, InklingTextModel.forward :709);
+  cross-check T set {1,4,13,600} with T600 > window on BOTH real and random
+  weights; and a window-cutoff gate at T600 — perturbing token 37 must move
+  the direct window edge query 37+511 and be bit-invisible from query
+  37+512+3 on (k/v sconv smears the token into keys/values t..t+3, so the
+  cutoff is window+sconv_k-1, not window — a real trap for B3.1's ring
+  buffer sizing). config.py load_verified now also checks
+  swa_num_attention_heads=64 + swa_head_dim=128 vs checkpoint (SWA arm
+  relies on them; B2.4/B2.5 convention). Ran test verbatim from
+  /workspace/tm-opt (venv active, CUDA_VISIBLE_DEVICES=4,5,6,7). Real output:
+  ```
+  attn_swa ok: layer-0 frozen anchors — full path rel err 0.0e+00 < 1e-2 (bit-exact True), 8 internals (k/v_proj+sconv, r_proj, q/k_norm, rel_bias ext512) < 1e-2, bit-exact 8/8; window mask bit-equal native create_sliding_window_causal_mask (eager 0/finfo.min); native-module cross-check bit-exact 6/6 cases (7587840 els; real+random weights, T {1,4,13,600} incl. 600>window, batch 2); causality bit-checked; window cutoff exact at T600 (edge 37+511 moves, queries >= 37+512+4-1 bit-identical, k/v sconv smear accounted)
+  ```
+  Everything bit-exact, not just <1e-2. NOTE for B3.1: the KV ring for SWA
+  layers must retain window+sconv_k-1 = 515 tokens of history influence —
+  the sconv ring (3 raw pre-conv K/V inputs) is separate state from the 512
+  post-conv KV entries; the cutoff gate above is the ground truth for that
+  boundary. Regressions green after the config.py addition: t_b2 ref
+  (verify path, sha eae8f3a95804 unchanged) + embed + rmsnorm + relbias +
+  sconv + attn_global; t_b1 index + census + dtypes + plan. Code committed
+  first (a0c007b) per convention; this tick is its own commit.
