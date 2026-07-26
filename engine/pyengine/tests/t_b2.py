@@ -414,6 +414,94 @@ def t_embed():
           f"weights {tuple(w_e.shape)} bf16 from shards, eps {mc.rms_eps}")
 
 
+def _ulp_bf16(a, b):
+    """Exact bf16 ulp distance. Finite inputs only (callers gate finiteness).
+    Sign-magnitude bit patterns map to a monotonic 'lexicographic' integer
+    (i >= 0 -> i, else -32768 - i; both zeros -> 0), where adjacent
+    representable bf16 values differ by exactly 1."""
+    #1. reinterpret bits, widen so the subtraction cannot overflow
+    ai = a.view(torch.int16).to(torch.int32)
+    bi = b.view(torch.int16).to(torch.int32)
+    #2. monotonic mapping, then integer distance = ulp count
+    al = torch.where(ai >= 0, ai, -32768 - ai)
+    bl = torch.where(bi >= 0, bi, -32768 - bi)
+    return (al - bl).abs()
+
+
+def t_rmsnorm():
+    """B2.3: Triton rmsnorm kernel (kernels/rmsnorm.py) vs the torch
+    reference (model.rmsnorm — proven bit-exact vs transformers in B2.2)
+    on random bf16 tensors. Gate per case: elementwise <= 2 bf16 ulp AND
+    fp32 global L2 rel err < 1e-3 — far inside the B2 bf16 budget (1e-2).
+    Bit-exactness is NOT required: tl.sum's tree order differs from torch's
+    reduction order by a few fp32 ulps in the variance; after the bf16
+    downcast that is <= 1 ulp on xhat, <= 2 on the weight product (analysis
+    in kernels/rmsnorm.py). Extra anchor: kernel output on the frozen embed
+    lookup ref vs the frozen embed_norm.out (real checkpoint weights)."""
+    from engine.pyengine.kernels import rmsnorm as krms
+    torch.manual_seed(0)
+    mc = pcfg.load_verified(MODEL_DIR)
+
+    #1. random cases over the two real widths: hidden 6144 (BLOCK 8192,
+    #   masked lanes) incl. decode-shaped, ref-prompt-shaped, batchy and
+    #   odd row counts + scale extremes (1e-4 makes eps dominate the
+    #   variance); head_dim 128 3D = q/k-norm shape (BLOCK 128, unmasked)
+    cases = [((1, mc.hidden), 1.0), ((13, mc.hidden), 1.0),
+             ((512, mc.hidden), 1.0), ((2048, mc.hidden), 1.0),
+             ((257, mc.hidden), 1e-4), ((64, mc.hidden), 1e4),
+             ((13, mc.g_q_heads, mc.head_dim), 1.0),
+             ((5, mc.hidden), 0.0)]   # all-zero rows: var=0, eps path only
+    tot_el = tot_exact = 0
+    max_ulp = worst_rel = 0.0
+    for shape, scale in cases:
+        x = (torch.randn(shape, device=DEV, dtype=torch.float32)
+             * scale).to(torch.bfloat16)
+        w = torch.randn(shape[-1], device=DEV,
+                        dtype=torch.float32).to(torch.bfloat16)
+        want = pmodel.rmsnorm(x, w, eps=mc.rms_eps)
+        got = krms.rmsnorm(x, w, eps=mc.rms_eps)
+        #2. hard contract: same dtype/shape, finite everywhere
+        assert got.dtype == want.dtype == torch.bfloat16, got.dtype
+        assert got.shape == want.shape == x.shape, got.shape
+        if not torch.isfinite(got.float()).all():
+            raise SystemExit(f"[t_b2 rmsnorm] non-finite output {shape}")
+        #3. gates: <= 2 bf16 ulp elementwise, global rel err < 1e-3
+        ulp = _ulp_bf16(got, want)
+        mu = ulp.max().item()
+        rel = 0.0 if scale == 0.0 else _rel_err(got, want)
+        if mu > 2 or rel >= 1e-3:
+            raise SystemExit(f"[t_b2 rmsnorm] case {shape} scale {scale}: "
+                             f"max ulp {mu}, rel err {rel:.3e}")
+        if scale == 0.0 and not torch.equal(got, want):
+            raise SystemExit("[t_b2 rmsnorm] zero-input case not bit-exact")
+        tot_el += ulp.numel()
+        tot_exact += (ulp == 0).sum().item()
+        max_ulp = max(max_ulp, mu)
+        worst_rel = max(worst_rel, rel)
+
+    #4. real-weights anchor: frozen embed lookup -> kernel -> vs frozen
+    #   embed_norm.out, same 1e-2 gate the torch path passed in B2.2
+    tens, meta, _ = _load_refs()
+    idx = loader.build_shard_index(MODEL_DIR)
+    w_n = _disk(idx, "model.llm.embed_norm.weight").to(DEV)
+    got_a = krms.rmsnorm(tens["embed_tokens.out"].to(DEV), w_n,
+                         eps=mc.rms_eps)
+    want_a = tens["embed_norm.out"].to(DEV)
+    rel_a = _rel_err(got_a, want_a)
+    ulp_a = _ulp_bf16(got_a, want_a).max().item()
+    if rel_a >= 1e-2:
+        raise SystemExit(f"[t_b2 rmsnorm] ref anchor rel err {rel_a:.3e}")
+
+    #5. summary line = the test's green evidence
+    print(f"rmsnorm ok: triton kernel vs torch ref, {len(cases)} random "
+          f"cases (widths {{{mc.hidden},{mc.head_dim}}}, rows 1-2048, "
+          f"scales 0/1e-4/1/1e4): {tot_el} elements, bit-exact "
+          f"{tot_exact} ({tot_el - tot_exact} off), max {max_ulp:.0f} "
+          f"ulp <= 2, "
+          f"worst rel err {worst_rel:.1e} < 1e-3; frozen embed_norm anchor "
+          f"rel err {rel_a:.1e} < 1e-2 (max {ulp_a:.0f} ulp)")
+
+
 def _todo(item):
     def f():
         raise SystemExit(f"[t_b2] not implemented — that is item {item}'s job")
@@ -423,7 +511,7 @@ def _todo(item):
 def main():
     #1. dispatch on subcommand; unimplemented ones fail loud with their item
     cmds = {"ref": t_ref,
-            "embed": t_embed, "rmsnorm": _todo("B2.3"),
+            "embed": t_embed, "rmsnorm": t_rmsnorm,
             "relbias": _todo("B2.4"), "sconv": _todo("B2.5"),
             "attn_global": _todo("B2.6"), "attn_swa": _todo("B2.7"),
             "gate": _todo("B2.8"), "moe": _todo("B2.9"),
