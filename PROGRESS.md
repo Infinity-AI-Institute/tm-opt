@@ -21,9 +21,12 @@ Env for all items: `cd /workspace/tm-opt && source /workspace/venv/bin/activate
       name → shard file.  test: `python -m engine.pyengine.tests.t_b1 index`
       — green: 34 files (33 model + mtp), 2056 tensors mapped, per-shard
       safetensors headers match index exactly (commit 5400822)
-- [ ] B1.2 tensor census vs config: counts per layer match config.h shapes
+- [x] B1.2 tensor census vs config: counts per layer match config.h shapes
       (66 layers; layer 2 dense; 11 global / 55 swa; MoE 256×ffn3072).
       test: `python -m engine.pyengine.tests.t_b1 census`
+      — green: all 2056 tensors accounted, exact per-layer dtype+shape match
+      vs config; FACT FIX: dense = layers 0–1 (dense_mlp_idx=2 is a count),
+      layer 2 is MoE — see note below (commit fa0e025)
 - [ ] B1.3 dtype map honors hf_quant exclude list (embeds/norms/unembed/
       layer-0 attn stay bf16; rest NVFP4 + scales).
       test: `python -m engine.pyengine.tests.t_b1 dtypes`
@@ -127,3 +130,33 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
   CLAUDE.md and this file. Code committed first (5400822) so this tick can
   cite the real hash; PROGRESS tick is its own follow-up commit. ralph_*.sh
   edits remain unstaged per B0.1 convention (loop scripts off-limits).
+- 2026-07-26 B1.2: implemented loader.read_headers() (header-only dtype+shape
+  map) + t_b1 census: exact per-layer suffix→(dtype,shape) comparison for all
+  66 layers, global/SWA split cross-checked vs config.json local_layer_ids,
+  full partition reconciled. Ran test verbatim from /workspace/tm-opt (venv
+  active, CUDA_VISIBLE_DEVICES=4,5,6,7). Real output:
+  ```
+  census ok: 66 layers = 2 dense[0, 1] (ffn 24576) + 64 moe (256x ffn3072 +2 shared; 63 nvfp4-packed, 1 bf16 @[2]); attn 11 global + 55 swa (w512, 16kv); all shapes match config; totals 1882 layer + 4 llm + 10 multimodal(ignored) + 160 mtp (8x20) = 2056
+  ```
+  FACT CORRECTION (checkpoint + vLLM code, decisive): "layer 2 is dense" in
+  the docs was a misreading. dense_mlp_idx=2 is a COUNT of leading dense
+  layers — vllm/models/inkling/nvidia/model.py:164 (`layer_id <
+  config.dense_mlp_idx`). Checkpoint: layers 0,1 have mlp.w13_dn [49152,6144]
+  (=2×24576 dense fused gate+up); layers 2–65 have mlp.experts.* (256×,
+  per-expert w13 [6144,6144] = 2×3072 fused). Layer 2's experts are stored
+  bf16 WITHOUT quant scales (only MoE layer unquantized; B1.3 must reconcile
+  vs hf_quant exclude list). Also observed: ALL attention weights bf16 (not
+  only layer 0 — B1.3 evidence); rel_logits_proj.proj is (16,512) on SWA vs
+  (16,1024) on global layers. The item's test (census vs config.h shapes)
+  passes fully — its parenthetical gloss "layer 2 dense" was the wrong part;
+  glosses fixed same-commit in CLAUDE.md, CONTEXT_AND_PLAN.md §1+P4,
+  docs/ARCHITECTURE.md, PLAN.md, pyengine docstrings (CLAUDE.md rule 1,
+  B1.1 precedent). FLAGGED FOR HUMAN (loop may not edit these): B2.10
+  wording "dense layer 2 MLP" → should be "dense layers 0–1"; B1.2's own
+  parenthetical above left as-written; engine/include/tmopt/config.h:43
+  comment "(every layer except dense_mlp_idx)" (C++ side, outside pyengine
+  scope; values are correct, comment gloss is not). ENV FLAG for human: 7 of
+  .git/objects/* fan-out dirs are root:root without group write (created
+  2026-07-26 ~04:56, root-run git); ralph commits fail ~3%/object with
+  "insufficient permission … failed to write commit object" — needs
+  `chown -R ralph:ralph .git/objects` by root.
