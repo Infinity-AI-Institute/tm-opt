@@ -119,9 +119,13 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
       COUNT, layer 2 is MoE; flagged B1.2) frozen anchors bit-exact 2/2;
       conversion pinned vs HF's own Interleave/Chunk; 6/6 native InklingMLP
       cross-checks bit-exact; live global_scale + fp64 pins (commit f763e28)
-- [ ] B2.11 full 66-layer forward, next-token logits: top-1 matches
+- [x] B2.11 full 66-layer forward, next-token logits: top-1 matches
       transformers greedy for 5 tiny prompts.
       test: `python -m engine.pyengine.tests.t_b2 logits`
+      — green: top-1 MATCH 5/5 (Berlin/Au/oxygen/cold/four) vs native
+      transformers streamed 66-layer reference; ref composition pinned
+      bit-exact vs frozen B2.1 captures (13 pins); ours bit-exact through
+      dense layers 0-1, MoE drift <= 2.9e-03; wall 130 s (commit 7b63ab6)
 
 ## B3 — KV + decode + scheduler + server (parity milestone)
 - [ ] B3.1 KV structs: paged global (page 16) + ring-512 SWA + sconv ring;
@@ -661,3 +665,49 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
   eae8f3a95804 unchanged) + embed + rmsnorm + relbias + sconv + attn_global
   + attn_swa + gate + moe; t_b1 index + census + dtypes + plan. Code
   committed first (f763e28) per convention; this tick is its own commit.
+- 2026-07-26 B2.11: implemented model.layer_prefill (exact
+  InklingDecoderLayer op order, modeling_inkling.py:566-591, composing the
+  B2.2-B2.10 functions; weight-dict keys documented in the docstring) +
+  model.final_logits (norm -> hidden DIVIDED by logits_mup_width_multiplier
+  24.0 -> bias-free lm_head (unembed) -> slice to unpadded_vocab_size
+  200058, exact transcription of modeling_inkling.py:783-789; identical in
+  the multimodal wrapper :1280-1286) + t_b2 logits; config.py load_verified
+  now also checks unpadded_vocab_size + logits_mup_width_multiplier (newly
+  relied on, B2.4 convention). REFERENCE DESIGN (forced by the same P2
+  facts as B2.1): full-model from_pretrained is impossible here — bf16
+  routed experts are ~1.8 TB and the packed layers re-init — so the
+  reference STREAMS the actual native transformers InklingDecoderLayer
+  one layer at a time on GPU 4 (eager attention + grouped_mm experts
+  dispatch, exactly from_pretrained's defaults per modeling_utils.py:2100 /
+  the B2.9 provenance pin), each built from the same converted disk weights
+  our engine consumes (B1.4 chunked nvfp4 dequant + proven de-interleave),
+  then final norm + the :783-789 logits head. The composition is NOT taken
+  on faith: prompt 0 is the frozen B2.1 prompt and the streaming ref had to
+  reproduce the frozen captures BIT-exactly at 13 pins (embed +
+  embed_norm, layers {0,1,2,5,6} in/out — covering dense, bf16-MoE,
+  nvfp4-MoE, SWA and global arms — and final_norm applied at layer 6);
+  masks bit-equal the native create_*_mask builders on all 5 prompts;
+  conv_mask pinned None; and OUR logit head run on the REF hidden states
+  is bitwise identical to the native head, isolating all ours-vs-ref
+  divergence to the expert kernels (eager loop vs grouped_mm, B2.9).
+  Ran test verbatim from /workspace/tm-opt (venv active,
+  CUDA_VISIBLE_DEVICES=4,5,6,7), foreground. Real output (after 9
+  per-8-layer stderr progress lines):
+  ```
+  logits ok: full 66-layer streamed forward, 5 tiny prompts (T 4-13) — greedy top-1 MATCH 5/5 vs native transformers (' Berlin',' Au',' oxygen',' cold',' four'); streaming ref pinned bit-exact vs frozen captures (13 pins: embed+norm, layers {0,1,2,5,6} in/out under grouped_mm dispatch, final_norm@L6); our engine bit-exact vs frozen layers 0-1 out (2/2), MoE-layer drift @2/5/6 4.8e-04/2.1e-03/2.9e-03 < 1e-2 (expert-kernel order, B2.9); masks bit-equal native builders x5 prompts, conv_mask None; logit head bit-equal on shared hidden; last-pos logits rel err 9.2e-02 max, top-1 margins ref [6.0,0.8,4.5,1.0,1.8] ours [6.1,0.9,4.5,0.8,1.5]; wall 130 s
+  ```
+  Prompts: the frozen B2.1 prompt + 4 with confidently-determined next
+  tokens; all five continuations are the factually right ones. NOTE for
+  B3: the 9.2e-02 last-position logits rel err is the accumulated
+  eager-vs-grouped_mm drift over 63 MoE layers (per-layer ~3e-03, B2.9) —
+  top-1 held with margins 0.8-6.0 but B3.2's 32-token decode gate should
+  expect occasional divergence risk on low-margin steps; our engine is
+  internally deterministic, and the B3.5 parity gate vs vLLM goldens (not
+  vs transformers) is the binding one. Wall 130 s: streams the 551 GiB
+  checkpoint once, both engines advance in lockstep per layer sharing one
+  weight load (~2.7 s/MoE layer read+dequant, page cache warm).
+  Regressions all green after the config.py addition: t_b2 ref (verify
+  path, sha eae8f3a95804 unchanged) + embed + rmsnorm + relbias + sconv +
+  attn_global + attn_swa + gate + moe + dense; t_b1 index + census +
+  dtypes + plan. Code committed first (7b63ab6) per convention; this tick
+  is its own commit. B2 track complete; next is B3.1 (KV structs).
