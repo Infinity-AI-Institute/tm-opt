@@ -17,8 +17,10 @@ Env for all items: `cd /workspace/tm-opt && source /workspace/venv/bin/activate
       pre-existing from scaffolding; no code change needed)
 
 ## B1 — loader (safetensors → GPU tensors, NVFP4-aware)
-- [ ] B1.1 shard index: enumerate 33 shards + mtp.safetensors, map tensor
+- [x] B1.1 shard index: enumerate 33 shards + mtp.safetensors, map tensor
       name → shard file.  test: `python -m engine.pyengine.tests.t_b1 index`
+      — green: 34 files (33 model + mtp), 2056 tensors mapped, per-shard
+      safetensors headers match index exactly (commit 5400822)
 - [ ] B1.2 tensor census vs config: counts per layer match config.h shapes
       (66 layers; layer 2 dense; 11 global / 55 swa; MoE 256×ffn3072).
       test: `python -m engine.pyengine.tests.t_b1 census`
@@ -109,3 +111,19 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
   on GPU 4 (first visible device), allclose check passed. No code change.
   Same staging convention as B0.1: PROGRESS.md only (ralph_*.sh edits remain
   unstaged, loop scripts off-limits).
+- 2026-07-26 B1.1: implemented `build_shard_index()` in engine/pyengine/loader.py
+  (reads model.safetensors.index.json — its weight_map already covers
+  mtp.safetensors, 34 distinct files) + new tests/t_b1.py with subcommand
+  dispatch (census..load fail loud with their item ids until implemented).
+  Ran test verbatim from /workspace/tm-opt (venv active,
+  CUDA_VISIBLE_DEVICES=4,5,6,7). Real output:
+  ```
+  shard index ok: 34 files (33 model + mtp.safetensors), 2056 tensors mapped (160 in mtp), headers match index
+  ```
+  Test cross-checks every shard's safetensors header against the index map.
+  Doc conflict found & fixed in same code commit (5400822):
+  CONTEXT_AND_PLAN.md §1 said "34 shards + mtp.safetensors"; disk has 33
+  model-*-of-00033 shards + mtp (34 files total) — corrected to 33, matching
+  CLAUDE.md and this file. Code committed first (5400822) so this tick can
+  cite the real hash; PROGRESS tick is its own follow-up commit. ralph_*.sh
+  edits remain unstaged per B0.1 convention (loop scripts off-limits).
