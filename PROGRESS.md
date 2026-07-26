@@ -39,9 +39,12 @@ Env for all items: `cd /workspace/tm-opt && source /workspace/venv/bin/activate
       — green: layers.3 w13 experts [0,7,255] + 2D arm BIT-EXACT vs vLLM
       dequantize_to_dtype(swizzle=False) on GPU 4; max|deq|=6*448*scale2
       exactly (ratio 1.000 all three) (commit 4db87e1)
-- [ ] B1.5 TP=4 sharding plan: head-parallel attention, expert-parallel MoE;
+- [x] B1.5 TP=4 sharding plan: head-parallel attention, expert-parallel MoE;
       per-GPU byte budget printed and ≤150 GiB.
       test: `python -m engine.pyengine.tests.t_b1 plan`
+      — green: per-GPU 142.04 GiB ≤ 150 (sharded 136.38 + replicated 5.67;
+      16q+2/4kv heads/rank, 64 experts/rank, embed+unembed replicated by
+      choice) (commit 5c3a636)
 - [ ] B1.6 full load onto GPUs 4-7 under budget, wall time printed.
       test: `python -m engine.pyengine.tests.t_b1 load`
 
@@ -226,3 +229,29 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
   files changed): checkpoint w13 expert rows are INTERLEAVED [g0,u0,g1,u1,..]
   — vLLM de-interleaves at load into [w1;w3] halves (nvidia/moe.py:583-595);
   our model.py must account for this when consuming w13.
+- 2026-07-26 B1.5: implemented loader.build_shard_plan() (+ ShardPlan,
+  DTYPE_BYTES/nbytes, suffix policy tables) and t_b1 plan. Placement: attn
+  head-parallel (wq/wk/wv + per-channel k/v sconvs dim0 = whole heads; wo
+  row-parallel dim1; 16q + 2kv-global/4kv-swa heads/rank, GQA rank-local);
+  MoE expert-parallel (experts + nvfp4 scale/scale2 dim0, 64/rank; gate
+  replicated so every rank routes); shared experts + dense MLPs + mtp MLP
+  ffn-split (fused-w13 out-dim/w2 in-dim; interleaved [g,u] pairs keep
+  contiguous slices whole-channel, vLLM nvidia/moe.py:583-595); mtp
+  input_proj row-parallel; embed/unembed REPLICATED by choice (+4.60 GiB/GPU,
+  buys local lookup + full-logits argmax; Stage-3 may revisit); multimodal
+  SKIP (text-only v1). Builder fails loud on unknown suffixes, non-divisible
+  splits, split heads, incoherent packs. Ran test verbatim from
+  /workspace/tm-opt (venv active, CUDA_VISIBLE_DEVICES=4,5,6,7). Real output:
+  ```
+  plan ok: tp=4, head-parallel attn (16q + 2kv-global/4kv-swa heads/rank) + expert-parallel moe (64 experts/rank), ffn-split shared/dense/mtp mlp; per-GPU 142.04 GiB <= 150 GiB budget (sharded 136.38 + replicated 5.67, of which embed+unembed 4.60); skipped multimodal 0.17 GiB; checkpoint total 551.35 GiB
+  ```
+  Byte accounting reconciles to the checkpoint total exactly (551.35 GiB,
+  matches CLAUDE.md). New facts pinned while planning: mtp.safetensors is
+  9.80 GiB — each of the 8 draft layers is a DENSE-MLP transformer block
+  (w13_dn [49152,6144] / w2_md [6144,24576], same as dense layers 0-1) with
+  16-kv-head attention + input_proj [6144,12288] (consumes
+  concat(embed,hidden)) + embed_norm/hidden_norm; multimodal is only
+  0.17 GiB (audio encoder + 4 visual linears). Regression: t_b1 index +
+  census + dtypes + dequant all still green. vLLM measured 137.46 GiB/GPU
+  weights (BASELINE_NOTES) — our +4.6 GiB delta is exactly the replicated
+  embed/unembed, headroom for it verified by this budget.
