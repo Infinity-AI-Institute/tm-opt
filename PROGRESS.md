@@ -99,9 +99,13 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
       window mask bit-equal native create_sliding_window_causal_mask; 6/6
       native-module cross-checks bit-exact incl. T600 > window; window
       cutoff pinned exactly both sides (commit a0c007b)
-- [ ] B2.8 MoE gate: sigmoid+bias → top-6 → norm_after_topk → route_scale 8
+- [x] B2.8 MoE gate: sigmoid+bias → top-6 → norm_after_topk → route_scale 8
       matches ref router outputs exactly (indices) / 1e-2 (weights).
       test: `python -m engine.pyengine.tests.t_b2 gate`
+      — green: layers 2/5/6 frozen anchors — indices EXACT 3/3, weights/
+      logits/gammas rel err 0.0 (bit-exact 9/9); 5/5 native-module
+      cross-checks bit-exact (all 4 outputs); bias-steers-choice-only +
+      top-6-largest + slot-sum pins all pass (commit 542fb1e)
 - [ ] B2.9 MoE expert GEMMs + 2 shared experts (sink) match ref layer out.
       test: `python -m engine.pyengine.tests.t_b2 moe`
 - [ ] B2.10 dense layer 2 MLP matches ref.
@@ -528,3 +532,41 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
   (verify path, sha eae8f3a95804 unchanged) + embed + rmsnorm + relbias +
   sconv + attn_global; t_b1 index + census + dtypes + plan. Code committed
   first (a0c007b) per convention; this tick is its own commit.
+- 2026-07-26 B2.8: implemented model.moe_gate (pure torch, exact
+  InklingTopkRouter semantics per modeling_inkling.py:342-377 — the router
+  weight is (258, 6144): ONE linear scores 256 routed + 2 shared slots;
+  CHOICE = top-6 of sigmoid(routed logits) + e_score_correction_bias
+  (checkpoint name mlp.gate.bias, f32, DeepSeek-V3-style choice steering);
+  WEIGHTS ignore the bias — softmax over logsigmoid (= sigmoids normalized
+  to sum 1) of the 6 CHOSEN routed logits AND the 2 shared logits jointly
+  (:366-370, the norm_after_topk form), then * route_scale 8 *
+  global_scale (:372, a per-layer f32 scalar ~0.006 — live math, not a
+  1.0); shared slots split off as shared_gammas for the sink experts) +
+  t_b2 gate; config.py load_verified now also checks n_shared_experts +
+  route_scale vs checkpoint (declared-but-unverified, B2.4 convention).
+  Ref-run dtype fact: the router is NOT in _keep_in_fp32_modules_strict
+  (:610), so the ref load downcast the f32 bias/global_scale to bf16 —
+  the downcast is value-exact on all 3 layers (down_exact=True) and all
+  gate captures are bf16; our replay feeds bf16 everywhere. Ran test
+  verbatim from /workspace/tm-opt (venv active,
+  CUDA_VISIBLE_DEVICES=4,5,6,7). Real output:
+  ```
+  gate ok: frozen anchors layers {2,5,6} — topk_indices EXACT 3/3 layers (234 slots), weights rel err 0.0e+00/0.0e+00/0.0e+00 < 1e-2 (+ routed_logits/shared_gammas, bit-exact 9/9); native-module cross-check bit-exact 5/5 cases x all 4 outputs (real+random weights incl. global_scale!=1, T {1,13,257,600}, batch 2); top-6 = 6 largest sigmoid+bias scores (distinct, in-range), fp64 bias-free normalized-sigmoid weights agree 6.4e-03 (bias steers choice only; +100 spike forces expert into all top-6), slot sums = route_scale*global_scale (max dev 1.3e-02); router all-bf16 like ref (f32 bias/global_scale downcast exact=True)
+  ```
+  Everything bit-exact (indices torch.equal incl. topk sorted=False order;
+  all 12 anchor tensors + 20 cross-check tensors), not just within 1e-2.
+  Structural pins: chosen 6 proven the 6 LARGEST sigmoid+bias scores by
+  direct min-chosen >= max-unchosen comparison (no topk); independent fp64
+  bias-free normalized-sigmoid formula reproduces weights (6.4e-03, bf16
+  rounding) — proves bias steers choice ONLY; +100 bias spike forces an
+  unchosen expert into every token's top-6; per-token slot sums ==
+  route_scale*global_scale. NOTE for B2.9: InklingMoE.forward (:419-425)
+  passes topk_weights/indices to InklingExperts (weights applied per-slot
+  AFTER down_proj, index_add accumulation in input dtype) and
+  shared_gammas to InklingSharedExperts (gamma applied to act_fn(gate)*up
+  BEFORE down_proj; fp32 sum over the 2 shared experts, :399-404); routed
+  out + shared out added at :424. Regressions green after the config.py
+  addition: t_b2 ref (verify path, sha eae8f3a95804 unchanged) + embed +
+  rmsnorm + relbias + sconv + attn_global + attn_swa; t_b1 index + census
+  + dtypes + plan. Code committed first (542fb1e) per convention; this
+  tick is its own commit.
