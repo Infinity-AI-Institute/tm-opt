@@ -54,6 +54,33 @@ def rel_bias(relative_states, proj, q_positions, kv_positions):
         (distance < 0) | (distance >= extent), 0.0)
 
 
+def sconv_prefill(x, weight):
+    """Window-4 short convolution (sconv), PREFILL form — exact
+    InklingShortConvolution semantics (transformers models/inkling/
+    modeling_inkling.py:500-542). The whole module runs in fp32: conv
+    weights are held fp32 (_keep_in_fp32_modules_strict :610; checkpoint
+    stores bf16 — the upcast is exact) and the input is upcast on entry.
+    Depthwise causal conv1d, no bias (conv1d bias=False :498) and no
+    activation (causal_conv1d_fn :461-481: pad kernel-1 both ends, keep the
+    first T outputs — so out[t] = sum_j w[c,0,j] * x[t-(k-1)+j, c], i.e.
+    weight[..., -1] taps the CURRENT token; torch conv1d is
+    cross-correlation, no kernel flip). The module then adds its OWN input
+    back (residual INSIDE the module, in fp32, :515+:542) and downcasts to
+    the input dtype. x [B, T, C]; weight (C, 1, k). The decode form (ring
+    state, causal_conv1d_update :441-457) is B3.1's job; the fused Triton
+    kernel is Stage-3 work (D4)."""
+    #1. fp32 upcast — module computes everything in fp32
+    xf = x.float()
+    w = weight.float()
+    #2. depthwise causal conv over time, channels-first, same F.conv1d call
+    #   as the ref (pad k-1, truncate to the first T outputs = causal)
+    conv = torch.nn.functional.conv1d(
+        xf.transpose(1, 2), w, bias=None, padding=w.shape[-1] - 1,
+        groups=w.shape[0])[:, :, : x.shape[1]]
+    #3. own-input residual in fp32, then downcast to the input dtype
+    return (conv.transpose(1, 2) + xf).to(x.dtype)
+
+
 def log_scale_tau(q_positions, alpha, n_floor):
     """Per-query log length-scaling factor tau in fp32, exact ref math
     (modeling_inkling.py:254-258): tau = 1 + alpha*ln(clamp((pos+1)/floor,

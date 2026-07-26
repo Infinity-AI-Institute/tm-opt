@@ -659,6 +659,146 @@ def t_relbias():
           f"apply op-order bit-exact (modeling_inkling.py:259-261)")
 
 
+def t_sconv():
+    """B2.5: sconv (window-4, prefill form; model.sconv_prefill) matches ref
+    on layer 0. Gates:
+      (a) frozen anchors — all FOUR layer-0 sconvs (k/v_sconv C=2048,
+          attn/mlp_sconv C=6144) replayed from their captured module inputs
+          (k/v_sconv.in captured directly; attn_sconv's input IS
+          self_attn.out and mlp_sconv's input IS mlp.out, per the decoder
+          forward modeling_inkling.py:576-591) with the real checkpoint
+          weights, vs the captured module outputs: rel err < 1e-2 (B2
+          header budget), bit-exactness reported as evidence;
+      (b) native-module cross-check — the ACTUAL transformers
+          InklingShortConvolution run in-process (past_key_values=None,
+          conv_mask=None — identical to the ref forward: batch-1 makes
+          apply_mask_to_padding_states a no-op, :433), torch.equal REQUIRED,
+          on the 4 real-weight frozen inputs AND random cases spanning
+          T {1,3,4,13,600} x C {1024,2048,6144} x batch {1,2} (decode-shaped,
+          shorter-than-kernel, exactly-kernel, ref-length, long);
+      (c) structural facts — window/causality: perturbing token t changes
+          ONLY outputs t..t+k-1 (bit-checked both sides); tap orientation:
+          delta weight at the LAST tap gives out == 2x exactly (current
+          token; cross-correlation, no flip) while delta at tap 0 reproduces
+          x[t-3]+x[t] by manual indexing; zero input -> exact zero out (no
+          bias); output dtype == input dtype."""
+    from transformers.models.inkling.modeling_inkling import (
+        InklingShortConvolution)
+    torch.manual_seed(0)
+    tens, meta, _ = _load_refs()
+    mc = pcfg.load_verified(MODEL_DIR)
+    idx = loader.build_shard_index(MODEL_DIR)
+    k = mc.sconv_k
+
+    #1. the four layer-0 sconvs: (tag, checkpoint weight, in-key, out-key).
+    #   attn_sconv consumes self_attn.out, mlp_sconv consumes mlp.out
+    #   (decoder forward modeling_inkling.py:576-591)
+    L0 = "model.llm.layers.0."
+    anchors = (
+        ("k_sconv", L0 + "attn.k_sconv.weight",
+         "layers.0.self_attn.k_sconv.in", "layers.0.self_attn.k_sconv.out"),
+        ("v_sconv", L0 + "attn.v_sconv.weight",
+         "layers.0.self_attn.v_sconv.in", "layers.0.self_attn.v_sconv.out"),
+        ("attn_sconv", L0 + "attn_sconv.weight",
+         "layers.0.self_attn.out", "layers.0.attn_sconv.out"),
+        ("mlp_sconv", L0 + "mlp_sconv.weight",
+         "layers.0.mlp.out", "layers.0.mlp_sconv.out"),
+    )
+
+    def native(w_f32, x):
+        #2. the reference module itself, in-process, prefill path (no cache,
+        #   no mask); default module dtype fp32 == _keep_in_fp32_modules_strict
+        mod = InklingShortConvolution(w_f32.shape[0], k, layer_idx=0,
+                                      conv_idx=2).to(DEV)
+        assert mod.conv1d.bias is None
+        assert mod.conv1d.weight.dtype == torch.float32
+        with torch.no_grad():
+            mod.conv1d.weight.copy_(w_f32)
+            return mod(x, past_key_values=None, conv_mask=None)
+
+    #3. gate (a)+(b) on real weights/activations: our function vs the frozen
+    #   capture (rel err) AND vs the in-process native module (torch.equal)
+    anchor_re, anchor_bit = {}, {}
+    for tag, wname, ikey, okey in anchors:
+        w = _disk(idx, wname).to(DEV)
+        assert w.dtype == torch.bfloat16 and w.shape[1:] == (1, k), (tag, w.shape)
+        x = tens[ikey].to(DEV)
+        want = tens[okey].to(DEV)
+        got = pmodel.sconv_prefill(x, w)
+        assert got.dtype == x.dtype == torch.bfloat16 and got.shape == want.shape
+        re = _rel_err(got, want)
+        if re >= 1e-2:
+            raise SystemExit(f"[t_b2 sconv] {tag} anchor rel err {re:.3e}"
+                             f" >= 1e-2")
+        anchor_re[tag], anchor_bit[tag] = re, torch.equal(got, want)
+        if not torch.equal(got, native(w.float(), x)):
+            raise SystemExit(f"[t_b2 sconv] {tag}: ours != native module "
+                             f"on the frozen input")
+
+    #4. gate (b) random cases: bf16-representable weights (checkpoint dtype)
+    #   upcast to fp32, bf16 inputs; torch.equal required vs native module
+    rand_cases = ((1, 1, 2048), (1, 3, 1024), (1, 4, 6144),
+                  (2, 13, 2048), (1, 600, 6144))
+    for B, T, C in rand_cases:
+        w = torch.randn(C, 1, k, device=DEV).to(torch.bfloat16)
+        x = torch.randn(B, T, C, device=DEV).to(torch.bfloat16)
+        got = pmodel.sconv_prefill(x, w)
+        if not torch.equal(got, native(w.float(), x)):
+            raise SystemExit(f"[t_b2 sconv] random case B{B} T{T} C{C}: "
+                             f"ours != native module")
+        assert got.dtype == torch.bfloat16 and got.shape == x.shape
+
+    #5. gate (c) structural facts, C=8 T=32 keeps them readable.
+    #   (c1) window/causality: perturb token t -> only out[t..t+k-1] moves
+    C, T, t = 8, 32, 11
+    w = torch.randn(C, 1, k, device=DEV).to(torch.bfloat16)
+    x1 = torch.randn(1, T, C, device=DEV).to(torch.bfloat16)
+    x2 = x1.clone()
+    x2[0, t] += 1.0
+    o1, o2 = pmodel.sconv_prefill(x1, w), pmodel.sconv_prefill(x2, w)
+    if not torch.equal(o1[:, :t], o2[:, :t]):
+        raise SystemExit("[t_b2 sconv] non-causal: past outputs changed")
+    if not torch.equal(o1[:, t + k:], o2[:, t + k:]):
+        raise SystemExit(f"[t_b2 sconv] window > {k}: far-future outputs "
+                         f"changed")
+    if torch.equal(o1[0, t], o2[0, t]):
+        raise SystemExit("[t_b2 sconv] perturbed token's own output frozen")
+    #   (c2) tap orientation: delta at the LAST tap == identity conv
+    #   -> conv(x)=x, +residual -> exactly 2x (fp32 doubling is exact)
+    w_last = torch.zeros(C, 1, k, device=DEV)
+    w_last[:, 0, -1] = 1.0
+    if not torch.equal(pmodel.sconv_prefill(x1, w_last),
+                       (x1.float() * 2).to(torch.bfloat16)):
+        raise SystemExit("[t_b2 sconv] last tap is not the current token")
+    #   delta at tap 0 -> conv(x)[t] = x[t-(k-1)], zeros before that
+    w_first = torch.zeros(C, 1, k, device=DEV)
+    w_first[:, 0, 0] = 1.0
+    xf = x1.float()
+    shifted = torch.cat([torch.zeros(1, k - 1, C, device=DEV),
+                         xf[:, : T - (k - 1)]], dim=1)
+    if not torch.equal(pmodel.sconv_prefill(x1, w_first),
+                       (shifted + xf).to(torch.bfloat16)):
+        raise SystemExit(f"[t_b2 sconv] tap 0 is not the token {k-1} back")
+    #   (c3) zero input -> exact zero output (proves no bias term)
+    if not (pmodel.sconv_prefill(torch.zeros(1, T, C, device=DEV,
+                                             dtype=torch.bfloat16), w)
+            == 0).all():
+        raise SystemExit("[t_b2 sconv] zero input gave nonzero output")
+
+    #6. summary line = the test's green evidence
+    a = anchor_re
+    print(f"sconv ok: layer-0 frozen anchors k/v/attn/mlp rel err "
+          f"{a['k_sconv']:.1e}/{a['v_sconv']:.1e}/{a['attn_sconv']:.1e}/"
+          f"{a['mlp_sconv']:.1e} < 1e-2 (bit-exact "
+          f"{anchor_bit['k_sconv']}/{anchor_bit['v_sconv']}/"
+          f"{anchor_bit['attn_sconv']}/{anchor_bit['mlp_sconv']}); "
+          f"native-module cross-check bit-exact 4 real + "
+          f"{len(rand_cases)} random cases (T {{1,3,4,13,600}} x "
+          f"C {{1024,2048,6144}}); window-{k} causality bit-checked, "
+          f"last-tap-is-current + tap-0 orientation exact, zero-in zero-out "
+          f"(no bias), fp32 module math (modeling_inkling.py:500-542)")
+
+
 def _todo(item):
     def f():
         raise SystemExit(f"[t_b2] not implemented — that is item {item}'s job")
@@ -669,7 +809,7 @@ def main():
     #1. dispatch on subcommand; unimplemented ones fail loud with their item
     cmds = {"ref": t_ref,
             "embed": t_embed, "rmsnorm": t_rmsnorm,
-            "relbias": t_relbias, "sconv": _todo("B2.5"),
+            "relbias": t_relbias, "sconv": t_sconv,
             "attn_global": _todo("B2.6"), "attn_swa": _todo("B2.7"),
             "gate": _todo("B2.8"), "moe": _todo("B2.9"),
             "dense": _todo("B2.10"), "logits": _todo("B2.11")}
