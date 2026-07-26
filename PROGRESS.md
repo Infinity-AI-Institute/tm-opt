@@ -82,8 +82,11 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
       captures; 12/12 bit-exact vs native InklingRelativeLogits at long
       positions; tau fp64 agreement 6.1e-08, ==1.0 below floor (16K serve
       window inert) (commit 7545848)
-- [ ] B2.5 sconv (window-4, prefill form) matches ref on layer 0.
+- [x] B2.5 sconv (window-4, prefill form) matches ref on layer 0.
       test: `python -m engine.pyengine.tests.t_b2 sconv`
+      — green: all 4 layer-0 sconvs (k/v/attn/mlp) bit-exact vs frozen
+      anchors; native-module cross-check bit-exact 4 real + 5 random cases;
+      window-4 causality + tap orientation + no-bias pinned (commit 506c98f)
 - [ ] B2.6 global-attention layer (idx 5) forward matches ref slice.
       test: `python -m engine.pyengine.tests.t_b2 attn_global`
 - [ ] B2.7 SWA layer (idx 0, window 512, 16 KV heads) matches ref slice.
@@ -414,3 +417,38 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
   would only surface >128K — the bit-check vs :259-261 transcription is the
   guard. Code committed first (7545848) per convention; this tick is its
   own commit.
+- 2026-07-26 B2.5: implemented model.py sconv_prefill (pure torch, exact
+  InklingShortConvolution prefill semantics per modeling_inkling.py:500-542
+  — whole module in fp32 (_keep_in_fp32_modules_strict :610, conv weights
+  bf16-on-disk upcast exactly), depthwise causal F.conv1d pad k-1/truncate-
+  to-T with no bias (:498) and no activation (causal_conv1d_fn :461-481),
+  then the module's OWN-input residual added in fp32 before downcast to
+  input dtype — so captures are pre-OUTER-residual, per the B2.1 note) +
+  t_b2 sconv; config.py load_verified now also checks sconv_kernel_size=4
+  vs checkpoint (was declared but unverified, B2.4 convention). Test
+  design: anchors cover ALL FOUR layer-0 sconvs — k/v_sconv have .in/.out
+  captured directly; attn_sconv's input IS self_attn.out and mlp_sconv's
+  input IS mlp.out (decoder forward :576-591) — replayed through our
+  function with real checkpoint weights (shapes (C,1,4): 2048 k/v, 6144
+  attn/mlp) vs captured outputs; plus the ACTUAL transformers
+  InklingShortConvolution run in-process (past_key_values=None,
+  conv_mask=None — identical to the ref path: batch-1 makes
+  apply_mask_to_padding_states a no-op, :433), torch.equal REQUIRED, on the
+  4 real frozen inputs + 5 random cases (T {1,3,4,13,600} x C
+  {1024,2048,6144} x batch {1,2}); plus structural pins: perturb-one-token
+  causality (only out[t..t+3] moves, both sides bit-checked), delta-at-last-
+  tap == exactly 2x (current token, cross-correlation no flip), delta-at-
+  tap-0 == x[t-3]+x[t] by manual indexing, zero-in -> zero-out (no bias).
+  Decode form (causal_conv1d_update ring state) is B3.1's job; fused kernel
+  is Stage-3 (D4) — kernels/sconv.py stub untouched. Ran test verbatim from
+  /workspace/tm-opt (venv active, CUDA_VISIBLE_DEVICES=4,5,6,7). Real output:
+  ```
+  sconv ok: layer-0 frozen anchors k/v/attn/mlp rel err 0.0e+00/0.0e+00/0.0e+00/0.0e+00 < 1e-2 (bit-exact True/True/True/True); native-module cross-check bit-exact 4 real + 5 random cases (T {1,3,4,13,600} x C {1024,2048,6144}); window-4 causality bit-checked, last-tap-is-current + tap-0 orientation exact, zero-in zero-out (no bias), fp32 module math (modeling_inkling.py:500-542)
+  ```
+  Regressions green after the config.py check addition: t_b2 ref (verify
+  path, sha eae8f3a95804 unchanged) + embed + rmsnorm + relbias; t_b1
+  index + census + dtypes + plan. NOTE for B2.6/B2.7: k/v sconv sits
+  BETWEEN k/v_proj and the attention math (k_sconv(k_proj(x)),
+  modeling_inkling.py:229-230); attn items must thread it there, and
+  sconv_prefill also covers the attn-out + moe-out positions. Code
+  committed first (506c98f) per convention; this tick is its own commit.
