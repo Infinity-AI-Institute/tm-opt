@@ -70,8 +70,11 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
       test: `python -m engine.pyengine.tests.t_b2 embed`
       — green: rel err 0.0 (bit-exact, both lookup and embed_norm) vs frozen
       refs; torch-ref rmsnorm + embed in model.py (commit 7a37c70)
-- [ ] B2.3 rmsnorm Triton kernel matches torch reference on random tensors.
+- [x] B2.3 rmsnorm Triton kernel matches torch reference on random tensors.
       test: `python -m engine.pyengine.tests.t_b2 rmsnorm`
+      — green: 17.9M random elements (widths 6144+128, 8 cases), all within
+      2 bf16 ulp of torch ref (35 off-by-ulp, worst rel err 1.1e-05); frozen
+      embed_norm anchor bit-exact (commit 0162160)
 - [ ] B2.4 relative-attention bias table + log scaling matches ref math
       (pure torch first; d_rel 16, extent 1024, α 0.1, floor 128000).
       test: `python -m engine.pyengine.tests.t_b2 relbias`
@@ -350,3 +353,29 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
   green after the config.py + t_b2 refactor: t_b2 ref (verify path, sha
   eae8f3a95804 unchanged), t_b1 index + census + dtypes. Code committed
   first (7a37c70) per B1.1 convention; this tick is its own commit.
+- 2026-07-26 B2.3: implemented kernels/rmsnorm.py (triton row-per-program:
+  fp32 mean-of-squares over the real width via masked block, rsqrt, downcast
+  to input dtype BEFORE the weight multiply — exact InklingRMSNorm op order;
+  weight mul at fp32 opmath with single rounding on store, which equals
+  torch's promoted-bf16 mul bit-for-bit given equal inputs) + t_b2 rmsnorm
+  (+ _ulp_bf16 exact-ulp helper via sign-magnitude→monotonic-int mapping).
+  Gate chosen: elementwise <= 2 bf16 ulp AND fp32 L2 rel err < 1e-3 per case
+  — bit-exactness is unattainable in principle (tl.sum tree order vs torch's
+  reduction order differ by a few fp32 ulps in the variance; after bf16
+  downcast that bounds to 1 ulp on xhat, 2 on the product), and this gate is
+  ~100x tighter than the B2 header's 1e-2 budget, so nothing is weakened.
+  Cases: widths 6144 (BLOCK 8192, masked) + head_dim 128 3D q/k-norm shape;
+  rows 1/13/64/257/512/2048; scales 1e-4 (eps-dominated variance) / 1 / 1e4;
+  all-zero rows required bit-exact. model.py untouched — graph items choose
+  torch-ref vs kernel later. Ran test verbatim from /workspace/tm-opt (venv
+  active, CUDA_VISIBLE_DEVICES=4,5,6,7). Real output:
+  ```
+  rmsnorm ok: triton kernel vs torch ref, 8 random cases (widths {6144,128}, rows 1-2048, scales 0/1e-4/1/1e4): 17924096 elements, bit-exact 17924061 (35 off), max 2 ulp <= 2, worst rel err 1.1e-05 < 1e-3; frozen embed_norm anchor rel err 0.0e+00 < 1e-2 (max 0 ulp)
+  ```
+  (An earlier identical-gate run printed a rounded "bit-exact 100.000%"
+  alongside "max 2 ulp"; evidence line switched to exact counts — 35 of
+  17.9M off — before committing, no gate change.) The real-weights anchor
+  (kernel on frozen embed lookup vs frozen embed_norm.out) came out fully
+  bit-exact, 0 ulp. Regressions green: t_b2 ref (verify path, sha
+  eae8f3a95804 unchanged) + t_b2 embed. Code committed first (0162160) per
+  convention; this tick is its own commit.
