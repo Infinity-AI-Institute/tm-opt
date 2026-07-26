@@ -106,8 +106,13 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
       logits/gammas rel err 0.0 (bit-exact 9/9); 5/5 native-module
       cross-checks bit-exact (all 4 outputs); bias-steers-choice-only +
       top-6-largest + slot-sum pins all pass (commit 542fb1e)
-- [ ] B2.9 MoE expert GEMMs + 2 shared experts (sink) match ref layer out.
+- [x] B2.9 MoE expert GEMMs + 2 shared experts (sink) match ref layer out.
       test: `python -m engine.pyengine.tests.t_b2 moe`
+      — green: layers 2/5/6 anchors experts/shared/full all < 1e-2 (shared
+      bit-exact 3/3); ref-capture provenance pinned — ref ran grouped_mm
+      dispatch, native grouped_mm reproduces frozen experts.out BIT-exactly;
+      native eager cross-checks 5/5 bit-exact; structural + fp64 pins all
+      pass (commit e14e430)
 - [ ] B2.10 dense layer 2 MLP matches ref.
       test: `python -m engine.pyengine.tests.t_b2 dense`
 - [ ] B2.11 full 66-layer forward, next-token logits: top-1 matches
@@ -570,3 +575,44 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
   rmsnorm + relbias + sconv + attn_global + attn_swa; t_b1 index + census
   + dtypes + plan. Code committed first (542fb1e) per convention; this
   tick is its own commit.
+- 2026-07-26 B2.9: implemented model.moe_experts (exact InklingExperts
+  eager-loop semantics per modeling_inkling.py:315-339 — ascending-expert
+  iteration fixes the bf16 index_add_ rounding order, routing weight applied
+  AFTER down_proj, accumulate in input dtype; w13 rows de-interleaved
+  [gates;ups] per conversion_mapping.py "inkling_mm_model" / vLLM
+  nvidia/moe.py:583-595, consumed as chunk halves), model.moe_shared (exact
+  InklingSharedExperts :394-405 — bmm stacks, gammas multiply act*up BEFORE
+  down_proj, fp32 sum over the 2 sinks), model.moe (InklingMoE :418-425 —
+  gate → routed on flattened tokens + shared on pre-flatten residuals) +
+  t_b2 moe. Layer-2 experts read bf16 from shards; layers 5/6 rebuilt by
+  B1.4 dequant + de-interleave (identical to the ref run's own repair). Ran
+  test verbatim from /workspace/tm-opt (venv active,
+  CUDA_VISIBLE_DEVICES=4,5,6,7). Real output (after transformers'
+  standalone-module dispatch warning line):
+  ```
+  moe ok: frozen anchors layers {2,5,6} — experts/shared/full-block rel err 3.3e-03/0.0e+00/1.0e-03 | 3.9e-03/0.0e+00/3.8e-03 | 3.2e-03/0.0e+00/3.2e-03 < 1e-2 (bit-exact 3/9; composition routed+shared bitwise 3/3; layers 5/6 via B1.4 nvfp4 dequant + de-interleave); capture provenance PINNED: native grouped_mm dispatch (the ref run's path, modeling_utils.py:2100) reproduces frozen experts.out bit-exactly; native InklingMoE eager cross-check bit-exact 5/5 cases (real layer-2 weights T {13,57} batch 2 + random small-config T {13,600}); pins: one-chooser batch-1 chain bit-exact (weight AFTER down_proj), zero-weights/zero-gammas exact zeros, unchosen-expert perturbation invisible, slot-permutation no-op; fp64 replay agrees routed/shared/full 4.4e-03/2.5e-03/2.5e-03 < 1e-2
+  ```
+  FACT PINNED (first B2 item where anchors are legitimately NOT bit-exact):
+  the B2.1 ref run's from_pretrained dispatched InklingExperts to
+  "grouped_mm" (torch._grouped_mm; modeling_utils.py:2100 defaults it when
+  no experts_implementation kwarg is passed, _grouped_mm_can_dispatch :2113
+  always passes for this class) — NOT the eager masked loop. Proven
+  decisively inside the test: the native module FORCED onto grouped_mm
+  reproduces the frozen layer-2 experts.out bit-for-bit (rel 0.0), while
+  the eager loop (our transcription target, and the standalone-module
+  dispatch fallback integrations/moe.py:497-509) lands 3.3e-03 away —
+  same math, different accumulation order. Our functions ARE bit-exact vs
+  the native eager modules in-process (5/5 InklingMoE cases incl. a
+  hidden-512/8-expert random config; shared-experts anchors bit-exact 3/3
+  because InklingSharedExperts is undecorated plain bmm). NOTE for B2.11:
+  the full-forward ref logits carry grouped_mm expert numerics on all MoE
+  layers; per-layer deltas ~3-4e-03 are expected and the item's gate is
+  top-1 agreement, not bitwise. NOTE for B3.1+: sconv ring aside, MoE decode
+  reuses these functions unchanged (token count is just T=1). ENV NOTE:
+  three more root-owned .git/objects fan-out dirs (62 85 97) blocked the
+  commit; fixed as ralph via the B1.3 same-parent-rename recipe, originals
+  parked at .git/objects/zz-{62,85,97}-rootowned (root may delete), fsck
+  clean. Regressions all green after the change: t_b2 ref (verify path, sha
+  eae8f3a95804 unchanged) + embed + rmsnorm + relbias + sconv + attn_global
+  + attn_swa + gate; t_b1 index + census + dtypes + plan. Code committed
+  first (e14e430) per convention; this tick is its own commit.
