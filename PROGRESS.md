@@ -33,9 +33,12 @@ Env for all items: `cd /workspace/tm-opt && source /workspace/venv/bin/activate
       — green: 479-entry exclude list reconciled exactly both directions;
       nvfp4 = 126 expert weights (layers 3–65 × w13/w2) ONLY, all attn bf16
       on all 66 layers, mtp 160 bf16 (commit 5c74500)
-- [ ] B1.4 NVFP4 dequant of ONE expert weight to bf16 matches vLLM's
+- [x] B1.4 NVFP4 dequant of ONE expert weight to bf16 matches vLLM's
       dequant of the same tensor (read vLLM modelopt code for the block-scale
       layout; cite file:line).  test: `python -m engine.pyengine.tests.t_b1 dequant`
+      — green: layers.3 w13 experts [0,7,255] + 2D arm BIT-EXACT vs vLLM
+      dequantize_to_dtype(swizzle=False) on GPU 4; max|deq|=6*448*scale2
+      exactly (ratio 1.000 all three) (commit 4db87e1)
 - [ ] B1.5 TP=4 sharding plan: head-parallel attention, expert-parallel MoE;
       per-GPU byte budget printed and ≤150 GiB.
       test: `python -m engine.pyengine.tests.t_b1 plan`
@@ -196,3 +199,30 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
   the well-known empty-tree object (4b825dc, was fsck "missing", referenced
   only by a dangling tree from a failed root-era commit). git fsck now clean
   apart from danglers; commit path verified working.
+- 2026-07-26 B1.4: implemented loader.dequant_nvfp4() (pure torch; E2M1 LUT,
+  low-nibble-first, f8e4m3 block scale /16 * per-expert f32 scale2, same f32
+  op association as vLLM's triton kernel) + t_b1 dequant. Layout citations in
+  the docstring: break_fp4_bytes nvfp4_emulation_utils.py:316-333 (low nibble
+  = element 2j), kE2M1ToFloat :20-22, dequantize_to_dtype :346-400 (tensor_sf
+  * global_scale, NO reciprocal), run_nvfp4_emulations :484-491 (weight-
+  dequant entry), modelopt.py:1253-1262 (weight_scale_2 = amax/(6*448),
+  renamed "without reciprocation"), inkling name map .scale/.scale2 ->
+  weight_scale/_2 nvidia/model.py:381-386 + per-expert scale2 load
+  moe.py:578-582; checkpoint scales LINEAR (modelopt.py:1873 "2D, not
+  swizzled"; swizzle is load-time for cutlass) => swizzle=False reference.
+  Ran test verbatim from /workspace/tm-opt (venv active,
+  CUDA_VISIBLE_DEVICES=4,5,6,7). Real output:
+  ```
+  dequant ok: model.llm.layers.3.mlp.experts.w13_weight experts [0, 7, 255] + 2D arm, shape (3, 6144, 6144): bit-exact vs vLLM dequantize_to_dtype(swizzle=False) in bf16; e2m1 low-nibble-first, f8e4m3 block scale /16 * f32 scale2 (amax/2688, no reciprocal); max|deq|/(6*448*scale2) = ['1.000', '1.000', '1.000'], nonzero 91.7%
+  ```
+  Reference really is vLLM's code path (triton _dequantize_nvfp4_kernel via
+  dequantize_to_dtype swizzle=False on cuda:0 = GPU 4), exercising both the
+  3D per-expert-global-scale arm and the 2D scalar arm; torch.equal (bit
+  equality), not allclose. Extra checkpoint anchors: .original_shape ==
+  (256, 6144, 6144) confirms 2 fp4/byte on the input dim; max|deq| ==
+  6*448*scale2 exactly per expert confirms the ModelOpt amax/2688 invariant.
+  Regression: t_b1 index + census + dtypes all still green (loader now
+  imports torch at module top). NOTE for B2.9 (not this item's scope, no
+  files changed): checkpoint w13 expert rows are INTERLEAVED [g0,u0,g1,u1,..]
+  — vLLM de-interleaves at load into [w1;w3] halves (nvidia/moe.py:583-595);
+  our model.py must account for this when consuming w13.
