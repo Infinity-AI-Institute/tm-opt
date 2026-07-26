@@ -285,7 +285,8 @@ def dense_mlp(x, w_gate, w_up, w_down, global_scale):
 
 def attn_prefill(x, wq, wk, wv, wr, wo, w_k_sconv, w_v_sconv, w_q_norm,
                  w_k_norm, rel_proj, attn_mask, q_positions, kv_positions,
-                 head_dim, is_global, alpha=None, n_floor=None, eps=1e-6):
+                 head_dim, is_global, alpha=None, n_floor=None, eps=1e-6,
+                 state=None):
     """One attention layer, PREFILL (no-cache) form — exact InklingAttention
     semantics (transformers models/inkling/modeling_inkling.py:217-282 with
     eager_attention_forward :157-182). Both layer shapes run through here:
@@ -294,21 +295,37 @@ def attn_prefill(x, wq, wk, wv, wr, wo, w_k_sconv, w_v_sconv, w_q_norm,
     `is_global`. x [B, T, C] is the POST-input_layernorm hidden state;
     attn_mask is the additive eager mask (additive_causal_mask). Scaling is
     1/head_dim, not 1/sqrt, because q/k are per-head RMS-normalized
-    (:197-198). No biases anywhere. The decode form (cached KV + sconv ring
-    state) is B3's job; fused kernels are Stage-3 work (D4)."""
+    (:197-198). No biases anywhere. `state` (a kv.LayerKV, batch-1 only)
+    makes prefill POPULATE the layer's recurrent state — post-norm K +
+    post-sconv V into the cache, raw pre-conv k/v tails into the sconv
+    rings — with numerics untouched (same ops either way; B3.1).
+    attn_decode is the cached single-token form; fused kernels are Stage-3
+    work (D4)."""
     F = torch.nn.functional
     B, T = x.shape[0], x.shape[1]
     n_heads, n_kv = wq.shape[0] // head_dim, wk.shape[0] // head_dim
     #1. projections (:228-231); K and V pass their window-4 sconv first
     q = F.linear(x, wq)
-    k = sconv_prefill(F.linear(x, wk), w_k_sconv)
-    v = sconv_prefill(F.linear(x, wv), w_v_sconv)
+    k_raw = F.linear(x, wk)
+    v_raw = F.linear(x, wv)
+    k = sconv_prefill(k_raw, w_k_sconv)
+    v = sconv_prefill(v_raw, w_v_sconv)
     r = F.linear(x, wr)
     #2. per-head q/k rmsnorm over head_dim, then [B,T,H,D] -> [B,H,T,D]
     #   (:233-235; v is not normalized)
     q = rmsnorm(q.view(B, T, n_heads, head_dim), w_q_norm, eps).transpose(1, 2)
-    k = rmsnorm(k.view(B, T, n_kv, head_dim), w_k_norm, eps).transpose(1, 2)
-    v = v.view(B, T, n_kv, head_dim).transpose(1, 2)
+    kn = rmsnorm(k.view(B, T, n_kv, head_dim), w_k_norm, eps)
+    vv = v.view(B, T, n_kv, head_dim)
+    k = kn.transpose(1, 2)
+    v = vv.transpose(1, 2)
+    #2b. populate the recurrent state: cache holds per-token values that
+    #    never change once written (post-norm K, post-sconv V); the rings
+    #    hold the last sconv_k-1 RAW inputs (B3.1)
+    if state is not None:
+        assert B == 1, "cache population is batch-1 in bring-up scope"
+        state.k_ring.seed(k_raw[0])
+        state.v_ring.seed(v_raw[0])
+        state.cache.append(kn[0], vv[0])
     #3. rel-pos bias from the relative states (:248-251)
     bias = rel_bias(r.view(B, T, n_heads, -1), rel_proj, q_positions,
                     kv_positions)
@@ -338,7 +355,7 @@ def attn_prefill(x, wq, wk, wv, wr, wo, w_k_sconv, w_v_sconv, w_q_norm,
     return F.linear(out.reshape(B, T, n_heads * head_dim), wo)
 
 
-def layer_prefill(x, w, mask, pos, mc, layer_idx):
+def layer_prefill(x, w, mask, pos, mc, layer_idx, state=None):
     """One full decoder layer, PREFILL form — exact InklingDecoderLayer
     op order (transformers models/inkling/modeling_inkling.py:566-591):
     input_layernorm -> attention (B2.6 global / B2.7 SWA) -> attn_sconv
@@ -346,13 +363,16 @@ def layer_prefill(x, w, mask, pos, mc, layer_idx):
     separate) -> + residual (bf16) -> post_attention_layernorm -> MLP
     (dense for layer_idx < mc.dense_idx — a COUNT, census B1.2 — else MoE)
     -> mlp_sconv -> + residual. `w` maps fixed keys to converted-to-module-
-    layout tensors (conversions per B2.5-B2.10; built by t_b2.t_logits):
-    attention wq/wk/wv/wr/wo/ksc/vsc/qn/kn/proj; norms attn_norm/mlp_norm
-    (checkpoint attn_norm/mlp_norm -> input/post_attention_layernorm,
-    conversion_mapping.py); layer sconvs attn_sconv/mlp_sconv; and either
-    mlp_gate/mlp_up/mlp_down/mlp_gs (dense) or gate_w/gate_b/gate_gs/
-    gu/w2/shg/shu/shd (MoE). mc is the verified ModelConfig; the caller's
-    mask must match the layer type (window=mc.window on SWA layers)."""
+    layout tensors (conversions per B2.5-B2.10; built by
+    t_b2.load_layer_weights): attention wq/wk/wv/wr/wo/ksc/vsc/qn/kn/proj;
+    norms attn_norm/mlp_norm (checkpoint attn_norm/mlp_norm ->
+    input/post_attention_layernorm, conversion_mapping.py); layer sconvs
+    attn_sconv/mlp_sconv; and either mlp_gate/mlp_up/mlp_down/mlp_gs
+    (dense) or gate_w/gate_b/gate_gs/gu/w2/shg/shu/shd (MoE). mc is the
+    verified ModelConfig; the caller's mask must match the layer type
+    (window=mc.window on SWA layers). `state` (kv.LayerKV, batch-1)
+    additionally populates the layer's KV cache + all four sconv rings —
+    same numerics either way (B3.1)."""
     is_global = layer_idx in mc.global_layers
     #1. attention half: pre-norm, attention, attn_sconv, outer residual
     #   in the ref's order residual + hidden (:574-583)
@@ -361,7 +381,9 @@ def layer_prefill(x, w, mask, pos, mc, layer_idx):
                      w["ksc"], w["vsc"], w["qn"], w["kn"], w["proj"],
                      mask, pos, pos, mc.head_dim, is_global,
                      alpha=mc.log_alpha, n_floor=mc.log_floor,
-                     eps=mc.rms_eps)
+                     eps=mc.rms_eps, state=state)
+    if state is not None:
+        state.attn_ring.seed(h[0])
     h = sconv_prefill(h, w["attn_sconv"])
     x = x + h
     #2. MLP half: pre-norm, dense MLP or MoE block, mlp_sconv, residual
@@ -374,7 +396,113 @@ def layer_prefill(x, w, mask, pos, mc, layer_idx):
         h = moe(h, w["gate_w"], w["gate_b"], w["gate_gs"], w["gu"],
                 w["w2"], w["shg"], w["shu"], w["shd"], mc.topk,
                 mc.n_shared, mc.route_scale)
+    if state is not None:
+        state.mlp_ring.seed(h[0])
     h = sconv_prefill(h, w["mlp_sconv"])
+    return x + h
+
+
+def sconv_decode(x, weight, ring):
+    """Window-4 sconv, DECODE form — one new token x [1, C] (the site's RAW
+    input), history in `ring` (kv.SconvRing: the previous kernel-1 raw
+    inputs, zeros before t=0). Same math as sconv_prefill at this position
+    (causal_conv1d_update semantics, modeling_inkling.py:441-457: roll
+    state, weight[..., -1] taps the current token): fp32 depthwise dot over
+    the exact 4-token window via the SAME F.conv1d op (padding=0 emits
+    exactly the one full-window output), own-input residual in fp32,
+    downcast to the input dtype."""
+    #1. full conv window (oldest first) from the ring; fp32 module math
+    win = ring.step(x)
+    wf = weight.float()
+    #2. depthwise conv, one output per channel: [1, C, k] -> [1, C, 1]
+    conv = torch.nn.functional.conv1d(
+        win.float().t()[None], wf, bias=None, padding=0, groups=wf.shape[0])
+    #3. own-input residual in fp32, then downcast to the input dtype
+    return (conv[:, :, 0] + x.float()).to(x.dtype)
+
+
+def attn_decode(x, wq, wk, wv, wr, wo, w_k_sconv, w_v_sconv, w_q_norm,
+                w_k_norm, rel_proj, state, pos, head_dim, is_global,
+                alpha=None, n_floor=None, eps=1e-6):
+    """One attention layer, DECODE form — a single new token at absolute
+    position `pos` (int), K/V history from state.cache (kv.LayerKV). Same
+    ops as attn_prefill with Q=1: project, k/v raw through their sconv
+    rings (sconv_decode), per-head q/k rmsnorm, append post-norm K +
+    post-sconv V, gather the visible key set, rel bias at backward
+    distances pos - kv_pos, tau round-trip on global layers, GQA repeat,
+    bf16 scores * 1/head_dim + bias, fp32 softmax, @V, o_proj. NO additive
+    mask: every gathered key is visible by construction — the cache only
+    holds positions <= pos (causal), and the SWA ring holds exactly the
+    window-512 allowed set (kv.RingKV); beyond-extent global keys get bias
+    0 from rel_bias, same as prefill where the mask never hides them."""
+    F = torch.nn.functional
+    n_heads, n_kv = wq.shape[0] // head_dim, wk.shape[0] // head_dim
+    #1. projections for the new token; k/v raw through their sconv rings
+    q = F.linear(x, wq)
+    k = sconv_decode(F.linear(x, wk), w_k_sconv, state.k_ring)
+    v = sconv_decode(F.linear(x, wv), w_v_sconv, state.v_ring)
+    r = F.linear(x, wr)
+    #2. per-head q/k rmsnorm; append this token, then gather the key set
+    q = rmsnorm(q.view(1, n_heads, head_dim), w_q_norm, eps)
+    k = rmsnorm(k.view(1, n_kv, head_dim), w_k_norm, eps)
+    state.cache.append(k, v.view(1, n_kv, head_dim))
+    ck, cv, kv_pos = state.cache.gather()
+    #3. rel bias for the (1-query, N-key) pair grid
+    qpos = torch.tensor([pos], device=x.device)
+    bias = rel_bias(r.view(1, 1, n_heads, -1), rel_proj, qpos, kv_pos)
+    #4. [B=1, H, Q=1, D] query; tau round-trip on global layers (==1.0
+    #   below the 128000 floor, applied unconditionally like the ref)
+    qh = q.view(1, 1, n_heads, head_dim).transpose(1, 2)
+    if is_global and n_floor is not None:
+        qh, bias = apply_log_scaling(qh, bias, qpos, alpha, n_floor)
+    #5. GQA repeat over the gathered keys: [N,n_kv,D] -> [1,n_heads,N,D]
+    N = ck.shape[0]
+    rep = n_heads // n_kv
+    kh = ck.transpose(0, 1)[None, :, None].expand(
+        1, n_kv, rep, N, head_dim).reshape(1, n_heads, N, head_dim)
+    vh = cv.transpose(0, 1)[None, :, None].expand(
+        1, n_kv, rep, N, head_dim).reshape(1, n_heads, N, head_dim)
+    #6. bf16 scores * 1/head_dim + bias (same association order as prefill)
+    attn = torch.matmul(qh, kh.transpose(2, 3)) * (1.0 / head_dim) + bias
+    #7. fp32 softmax downcast, weighted values, output projection
+    attn = F.softmax(attn, dim=-1, dtype=torch.float32).to(qh.dtype)
+    out = torch.matmul(attn, vh).transpose(1, 2).reshape(
+        1, n_heads * head_dim)
+    return F.linear(out, wo)
+
+
+def layer_decode(x, w, state, pos, mc, layer_idx, trace=None):
+    """One full decoder layer, DECODE form — x [1, hidden] is the new
+    token's layer input at absolute position `pos`; `state` the layer's
+    kv.LayerKV (populated by layer_prefill / earlier decode steps). Exact
+    layer_prefill op order with the cached single-token attention and
+    ring-state sconvs; the MLP half is position-independent so dense_mlp /
+    moe are reused unchanged at T=1 (B2.9 note). `trace` (a dict, tests
+    only) records the attention-half residual ('x1') and the MLP input
+    ('mlpin') so t_b3 can gate the KV-fed attention half separately from
+    the MoE half's bf16 routing-weight granularity."""
+    is_global = layer_idx in mc.global_layers
+    #1. attention half: pre-norm, cached attention, attn_sconv, residual
+    h = rmsnorm(x, w["attn_norm"], mc.rms_eps)
+    h = attn_decode(h, w["wq"], w["wk"], w["wv"], w["wr"], w["wo"],
+                    w["ksc"], w["vsc"], w["qn"], w["kn"], w["proj"],
+                    state, pos, mc.head_dim, is_global, alpha=mc.log_alpha,
+                    n_floor=mc.log_floor, eps=mc.rms_eps)
+    h = sconv_decode(h, w["attn_sconv"], state.attn_ring)
+    x = x + h
+    #2. MLP half: pre-norm, dense MLP or MoE block, mlp_sconv, residual
+    h = rmsnorm(x, w["mlp_norm"], mc.rms_eps)
+    if trace is not None:
+        trace["x1"] = x
+        trace["mlpin"] = h
+    if layer_idx < mc.dense_idx:
+        h = dense_mlp(h, w["mlp_gate"], w["mlp_up"], w["mlp_down"],
+                      w["mlp_gs"])
+    else:
+        h = moe(h, w["gate_w"], w["gate_b"], w["gate_gs"], w["gu"],
+                w["w2"], w["shg"], w["shu"], w["shd"], mc.topk,
+                mc.n_shared, mc.route_scale)
+    h = sconv_decode(h, w["mlp_sconv"], state.mlp_ring)
     return x + h
 
 
