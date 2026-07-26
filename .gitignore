@@ -7,4 +7,5 @@ baseline_vllm.log
 serve.log
 build/
 *.safetensors
+!engine/pyengine/tests/ref/*.safetensors
 *.whl

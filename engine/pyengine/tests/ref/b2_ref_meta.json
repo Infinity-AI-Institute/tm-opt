@@ -1,0 +1,833 @@
+{
+ "attn_implementation": "eager",
+ "dtype": "bf16 weights/activations; sconv convs fp32 (_keep_in_fp32_modules_strict); softmax fp32 (eager)",
+ "fixup": {
+  "layers": [
+   3,
+   4,
+   5,
+   6
+  ],
+  "max_deq_over_6x448xscale2_expert0": {
+   "3.w13_weight": 1.0,
+   "3.w2_weight": 1.0,
+   "4.w13_weight": 1.0,
+   "4.w2_weight": 1.0,
+   "5.w13_weight": 1.0,
+   "5.w2_weight": 1.0,
+   "6.w13_weight": 1.0,
+   "6.w2_weight": 1.0
+  },
+  "method": "loader.dequant_nvfp4 (B1.4 bit-exact vs vLLM) + Interleave(dim=1) de-interleave, proven vs layer-2 bf16 experts"
+ },
+ "item": "B2.1",
+ "layer_types": [
+  "hybrid_sliding",
+  "hybrid_sliding",
+  "hybrid_sliding",
+  "hybrid_sliding",
+  "hybrid_sliding",
+  "hybrid",
+  "hybrid_sliding"
+ ],
+ "loading_info": {
+  "mismatched": [
+   "model.language_model.layers.3.mlp.experts.down_proj",
+   "model.language_model.layers.3.mlp.experts.gate_up_proj",
+   "model.language_model.layers.4.mlp.experts.down_proj",
+   "model.language_model.layers.4.mlp.experts.gate_up_proj",
+   "model.language_model.layers.5.mlp.experts.down_proj",
+   "model.language_model.layers.5.mlp.experts.gate_up_proj",
+   "model.language_model.layers.6.mlp.experts.down_proj",
+   "model.language_model.layers.6.mlp.experts.gate_up_proj"
+  ],
+  "missing_total": 0,
+  "unexpected_total": 1802
+ },
+ "mlp_layer_types": [
+  "dense",
+  "dense",
+  "sparse",
+  "sparse",
+  "sparse",
+  "sparse",
+  "sparse"
+ ],
+ "n_trunc_layers": 7,
+ "prompt": "The capital of France is Paris, and the capital of Germany is",
+ "ref_layers": [
+  0,
+  1,
+  2,
+  5,
+  6
+ ],
+ "sha256": "eae8f3a958049686dacd84bba6fcbcd2cd3b77e0bb8a89ba4855fdd79d68353c",
+ "tensors": {
+  "embed_norm.out": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "embed_tokens.out": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "final_norm.out": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "input_ids": [
+   "int64",
+   [
+    1,
+    13
+   ]
+  ],
+  "layers.0.attn_sconv.out": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.0.in": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.0.input_layernorm.out": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.0.mlp.in": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.0.mlp.out": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.0.mlp_sconv.out": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.0.out": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.0.post_attention_layernorm.out": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.0.self_attn.in": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.0.self_attn.k_norm.out": [
+   "bfloat16",
+   [
+    1,
+    13,
+    16,
+    128
+   ]
+  ],
+  "layers.0.self_attn.k_sconv.in": [
+   "bfloat16",
+   [
+    1,
+    13,
+    2048
+   ]
+  ],
+  "layers.0.self_attn.k_sconv.out": [
+   "bfloat16",
+   [
+    1,
+    13,
+    2048
+   ]
+  ],
+  "layers.0.self_attn.out": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.0.self_attn.q_norm.out": [
+   "bfloat16",
+   [
+    1,
+    13,
+    64,
+    128
+   ]
+  ],
+  "layers.0.self_attn.r_proj.out": [
+   "bfloat16",
+   [
+    1,
+    13,
+    1024
+   ]
+  ],
+  "layers.0.self_attn.rel_logits_proj.out": [
+   "bfloat16",
+   [
+    1,
+    64,
+    13,
+    13
+   ]
+  ],
+  "layers.0.self_attn.v_sconv.in": [
+   "bfloat16",
+   [
+    1,
+    13,
+    2048
+   ]
+  ],
+  "layers.0.self_attn.v_sconv.out": [
+   "bfloat16",
+   [
+    1,
+    13,
+    2048
+   ]
+  ],
+  "layers.1.attn_sconv.out": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.1.in": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.1.input_layernorm.out": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.1.mlp.in": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.1.mlp.out": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.1.mlp_sconv.out": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.1.out": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.1.post_attention_layernorm.out": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.1.self_attn.in": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.1.self_attn.out": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.2.attn_sconv.out": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.2.in": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.2.input_layernorm.out": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.2.mlp.experts.in": [
+   "bfloat16",
+   [
+    13,
+    6144
+   ]
+  ],
+  "layers.2.mlp.experts.out": [
+   "bfloat16",
+   [
+    13,
+    6144
+   ]
+  ],
+  "layers.2.mlp.gate.routed_logits": [
+   "bfloat16",
+   [
+    13,
+    256
+   ]
+  ],
+  "layers.2.mlp.gate.shared_gammas": [
+   "bfloat16",
+   [
+    13,
+    2
+   ]
+  ],
+  "layers.2.mlp.gate.topk_indices": [
+   "int64",
+   [
+    13,
+    6
+   ]
+  ],
+  "layers.2.mlp.gate.topk_weights": [
+   "bfloat16",
+   [
+    13,
+    6
+   ]
+  ],
+  "layers.2.mlp.in": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.2.mlp.out": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.2.mlp.shared_experts.in": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.2.mlp.shared_experts.out": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.2.mlp_sconv.out": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.2.out": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.2.post_attention_layernorm.out": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.2.self_attn.in": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.2.self_attn.out": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.5.attn_sconv.out": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.5.in": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.5.input_layernorm.out": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.5.mlp.experts.in": [
+   "bfloat16",
+   [
+    13,
+    6144
+   ]
+  ],
+  "layers.5.mlp.experts.out": [
+   "bfloat16",
+   [
+    13,
+    6144
+   ]
+  ],
+  "layers.5.mlp.gate.routed_logits": [
+   "bfloat16",
+   [
+    13,
+    256
+   ]
+  ],
+  "layers.5.mlp.gate.shared_gammas": [
+   "bfloat16",
+   [
+    13,
+    2
+   ]
+  ],
+  "layers.5.mlp.gate.topk_indices": [
+   "int64",
+   [
+    13,
+    6
+   ]
+  ],
+  "layers.5.mlp.gate.topk_weights": [
+   "bfloat16",
+   [
+    13,
+    6
+   ]
+  ],
+  "layers.5.mlp.in": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.5.mlp.out": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.5.mlp.shared_experts.in": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.5.mlp.shared_experts.out": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.5.mlp_sconv.out": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.5.out": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.5.post_attention_layernorm.out": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.5.self_attn.in": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.5.self_attn.k_norm.out": [
+   "bfloat16",
+   [
+    1,
+    13,
+    8,
+    128
+   ]
+  ],
+  "layers.5.self_attn.k_sconv.in": [
+   "bfloat16",
+   [
+    1,
+    13,
+    1024
+   ]
+  ],
+  "layers.5.self_attn.k_sconv.out": [
+   "bfloat16",
+   [
+    1,
+    13,
+    1024
+   ]
+  ],
+  "layers.5.self_attn.out": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.5.self_attn.q_norm.out": [
+   "bfloat16",
+   [
+    1,
+    13,
+    64,
+    128
+   ]
+  ],
+  "layers.5.self_attn.r_proj.out": [
+   "bfloat16",
+   [
+    1,
+    13,
+    1024
+   ]
+  ],
+  "layers.5.self_attn.rel_logits_proj.out": [
+   "bfloat16",
+   [
+    1,
+    64,
+    13,
+    13
+   ]
+  ],
+  "layers.5.self_attn.v_sconv.in": [
+   "bfloat16",
+   [
+    1,
+    13,
+    1024
+   ]
+  ],
+  "layers.5.self_attn.v_sconv.out": [
+   "bfloat16",
+   [
+    1,
+    13,
+    1024
+   ]
+  ],
+  "layers.6.attn_sconv.out": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.6.in": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.6.input_layernorm.out": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.6.mlp.experts.in": [
+   "bfloat16",
+   [
+    13,
+    6144
+   ]
+  ],
+  "layers.6.mlp.experts.out": [
+   "bfloat16",
+   [
+    13,
+    6144
+   ]
+  ],
+  "layers.6.mlp.gate.routed_logits": [
+   "bfloat16",
+   [
+    13,
+    256
+   ]
+  ],
+  "layers.6.mlp.gate.shared_gammas": [
+   "bfloat16",
+   [
+    13,
+    2
+   ]
+  ],
+  "layers.6.mlp.gate.topk_indices": [
+   "int64",
+   [
+    13,
+    6
+   ]
+  ],
+  "layers.6.mlp.gate.topk_weights": [
+   "bfloat16",
+   [
+    13,
+    6
+   ]
+  ],
+  "layers.6.mlp.in": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.6.mlp.out": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.6.mlp.shared_experts.in": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.6.mlp.shared_experts.out": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.6.mlp_sconv.out": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.6.out": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.6.post_attention_layernorm.out": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.6.self_attn.in": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ],
+  "layers.6.self_attn.out": [
+   "bfloat16",
+   [
+    1,
+    13,
+    6144
+   ]
+  ]
+ },
+ "token_ids": [
+  976,
+  9029,
+  328,
+  10128,
+  382,
+  12650,
+  11,
+  326,
+  290,
+  9029,
+  328,
+  17237,
+  382
+ ],
+ "versions": {
+  "cuda": "13.0",
+  "gpu": "NVIDIA B300 SXM6 AC",
+  "torch": "2.11.0+cu130",
+  "transformers": "5.14.1"
+ },
+ "wall_s": {
+  "fixup": 7.7,
+  "load": 20.4,
+  "total": 63.5
+ }
+}
