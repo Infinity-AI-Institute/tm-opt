@@ -8,6 +8,12 @@ class ModelConfig:
     num_layers: int = 66            #cfg: num_hidden_layers
     hidden: int = 6144              #cfg: hidden_size
     vocab: int = 201024             #cfg: vocab_size
+    vocab_unpadded: int = 200058    #cfg: unpadded_vocab_size — logits sliced
+                                    #to this before sampling (transformers
+                                    #modeling_inkling.py:787-789)
+    logits_mult: float = 24.0       #cfg: logits_mup_width_multiplier — final
+                                    #hidden DIVIDED by this before lm_head
+                                    #(modeling_inkling.py:783)
     eos: int = 200006               #top: eos_token_id
     g_q_heads: int = 64; g_kv_heads: int = 8     #cfg: num_attention_heads / num_key_value_heads
     s_q_heads: int = 64; s_kv_heads: int = 16    #cfg: swa_*
@@ -33,7 +39,9 @@ def load_verified(model_dir: str) -> ModelConfig:
     mc = ModelConfig()
     checks = {
         "num_hidden_layers": mc.num_layers, "hidden_size": mc.hidden,
-        "vocab_size": mc.vocab, "sliding_window_size": mc.window,
+        "vocab_size": mc.vocab, "unpadded_vocab_size": mc.vocab_unpadded,
+        "logits_mup_width_multiplier": mc.logits_mult,
+        "sliding_window_size": mc.window,
         "num_attention_heads": mc.g_q_heads, "num_key_value_heads": mc.g_kv_heads,
         "swa_num_key_value_heads": mc.s_kv_heads, "head_dim": mc.head_dim,
         "swa_num_attention_heads": mc.s_q_heads, "swa_head_dim": mc.head_dim,

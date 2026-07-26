@@ -2005,6 +2005,420 @@ def t_dense():
           f"< 1e-2")
 
 
+#B2.11: five tiny prompts for the full-forward greedy gate. Prompt 0 IS the
+#frozen B2.1 prompt (its token ids are pinned against the frozen capture, and
+#it carries the streaming-composition bit-exactness pins on layers 0-6); the
+#rest are chosen for a confidently-determined next token, so the top-1 gate
+#measures engine agreement rather than coin-flip ties between near-equal
+#candidates.
+PROMPTS5 = (
+    PROMPT,
+    "The chemical symbol for gold is",
+    "Water is made of hydrogen and",
+    "The opposite of hot is",
+    "Two plus two equals",
+)
+
+
+def t_logits():
+    """B2.11: full 66-layer forward, next-token logits — our engine's top-1
+    greedy token must match transformers' for 5 tiny prompts.
+
+    Why a STREAMING reference and not one from_pretrained call: the full
+    model's routed experts are ~1.8 TB in bf16 (63 NVFP4 layers x 256
+    experts) — they fit on no GPU set here, and from_pretrained re-inits
+    them anyway (the B2.1 P2-probe fact). So the reference runs the NATIVE
+    transformers modules layer by layer on one GPU: for each of the 66
+    layers, build the real InklingDecoderLayer (eager attention, grouped_mm
+    experts dispatch — exactly what from_pretrained defaulted to in the ref
+    run, modeling_utils.py:2100, pinned in B2.9), load the real checkpoint
+    weights through the proven conversions (B1.4 dequant + Interleave
+    de-interleave), run every prompt's hidden state through it, free it.
+    A causal decoder is exactly this sequential composition (the B2.1
+    truncation argument, extended one layer at a time). The composition is
+    not taken on faith — it is PINNED bit-exactly against the frozen B2.1
+    from_pretrained captures on prompt 0: embed + embed_norm, layer
+    {0,1,2,5,6} in/out boundaries (covering dense, bf16-MoE, NVFP4-MoE,
+    SWA and global arms), and the final norm applied at layer 6 must all
+    reproduce the frozen tensors bit-for-bit; masks must be bit-equal to
+    the native builders' output per prompt, conv_mask must be None (B2.6
+    fact). The logits head (final norm -> / logits_mup_width_multiplier ->
+    lm_head -> unpadded-vocab slice) transcribes modeling_inkling.py
+    :783-789 and is pinned by running our final_logits on the REF hidden
+    state: it must equal the ref logits bitwise, which isolates ALL
+    ours-vs-ref divergence to the layer stack (eager-vs-grouped_mm expert
+    kernels, B2.9).
+
+    Our engine's side composes model.layer_prefill (B2.2-B2.10 functions)
+    over the same converted weights. Gates: streaming-ref pins above
+    (torch.equal REQUIRED); our layer 0/1 outputs bit-exact vs frozen
+    (every dense-layer component is bit-exact); our layer {2,5,6} outputs
+    < 1e-2 vs frozen (expected ~1e-3: expert-kernel accumulation-order
+    drift only); both engines' logits finite; and the item's gate — argmax
+    of the last-position unpadded logits EQUAL on 5/5 prompts."""
+    from transformers import AutoConfig, AutoTokenizer
+    from transformers.masking_utils import (
+        create_causal_mask, create_recurrent_attention_mask,
+        create_sliding_window_causal_mask)
+    from transformers.models.inkling.modeling_inkling import (
+        InklingDecoderLayer, InklingRMSNorm)
+    torch.manual_seed(0)
+    t0 = time.time()
+    tens, meta, _ = _load_refs()
+    mc = pcfg.load_verified(MODEL_DIR)
+    idx = loader.build_shard_index(MODEL_DIR)
+    hdr = loader.read_headers(idx)
+    dm = loader.build_dtype_map(idx, hdr)
+
+    #1. full 66-layer text config with the ref run's dispatch policy: eager
+    #   attention, grouped_mm experts (from_pretrained's default; its
+    #   provenance over the frozen captures is the B2.9 pin); layer-type
+    #   tables must agree with the verified config on every layer
+    tc = AutoConfig.from_pretrained(MODEL_DIR,
+                                    trust_remote_code=True).text_config
+    tc._attn_implementation = "eager"
+    tc._experts_implementation = "grouped_mm"
+    assert tc.num_hidden_layers == mc.num_layers
+    for i in range(mc.num_layers):
+        assert (tc.layer_types[i] == "hybrid") == (i in mc.global_layers), i
+        assert (tc.mlp_layer_types[i] == "dense") == (i < mc.dense_idx), i
+    assert tc.logits_mup_width_multiplier == mc.logits_mult
+    assert tc.unpadded_vocab_size == mc.vocab_unpadded
+    assert tc.sliding_window_size == mc.window
+
+    #2. tokenize the 5 tiny prompts; prompt 0's ids are pinned against the
+    #   frozen capture (same prompt, same tokenizer -> same ids)
+    tok = AutoTokenizer.from_pretrained(MODEL_DIR, trust_remote_code=True)
+    ids = [tok(p, return_tensors="pt").input_ids.to(DEV) for p in PROMPTS5]
+    if not torch.equal(ids[0], tens["input_ids"].to(DEV)):
+        raise SystemExit("[t_b2 logits] prompt-0 ids != frozen input_ids")
+    lens = [t.shape[1] for t in ids]
+    assert len(ids) == 5 and all(1 <= T <= 16 for T in lens), lens
+    poss = [torch.arange(T, device=DEV) for T in lens]
+
+    #3. top-level weights (shapes pinned vs verified config) + the native
+    #   embedding/norm modules for the reference side
+    w_emb = _disk(idx, "model.llm.embed.weight").to(DEV)
+    w_en = _disk(idx, "model.llm.embed_norm.weight").to(DEV)
+    w_fn = _disk(idx, "model.llm.norm.weight").to(DEV)
+    w_un = _disk(idx, "model.llm.unembed.weight").to(DEV)
+    assert w_emb.shape == w_un.shape == (mc.vocab, mc.hidden)
+    assert w_en.shape == w_fn.shape == (mc.hidden,)
+    assert all(t.dtype == torch.bfloat16 for t in (w_emb, w_en, w_fn, w_un))
+    nat_embed = torch.nn.Embedding.from_pretrained(w_emb, freeze=True)
+    nat_en = InklingRMSNorm(mc.hidden, mc.rms_eps).to(DEV, torch.bfloat16)
+    nat_fn = InklingRMSNorm(mc.hidden, mc.rms_eps).to(DEV, torch.bfloat16)
+    with torch.no_grad():
+        nat_en.weight.copy_(w_en)
+        nat_fn.weight.copy_(w_fn)
+
+    #4. per-prompt initial hidden states + masks. Ref side: native modules;
+    #   our side: model.embed. Pins: both sides bit-equal; prompt 0 vs the
+    #   frozen captures; our masks bit-equal the native builders' (B2.6/
+    #   B2.7 exact-call form); conv_mask None for unpadded batch-1 input
+    h_ref, h_ours, m_ours, m_nat = [], [], [], []
+    with torch.no_grad():
+        for p in range(5):
+            hr = nat_en(nat_embed(ids[p]))
+            _, ho = pmodel.embed(ids[p], w_emb, w_en, eps=mc.rms_eps)
+            if not torch.equal(hr, ho):
+                raise SystemExit(f"[t_b2 logits] prompt {p}: our embed != "
+                                 f"native embed")
+            if p == 0 and not (
+                    torch.equal(nat_embed(ids[0]),
+                                tens["embed_tokens.out"].to(DEV))
+                    and torch.equal(hr, tens["embed_norm.out"].to(DEV))):
+                raise SystemExit("[t_b2 logits] streaming ref embed != "
+                                 "frozen captures")
+            mf = pmodel.additive_causal_mask(poss[p], poss[p], hr.dtype)
+            ms = pmodel.additive_causal_mask(poss[p], poss[p], hr.dtype,
+                                             window=mc.window)
+            kw = dict(config=tc, inputs_embeds=hr, attention_mask=None,
+                      past_key_values=None,
+                      position_ids=poss[p].unsqueeze(0))
+            nf = create_causal_mask(**kw)
+            ns = create_sliding_window_causal_mask(**kw)
+            if not (torch.equal(mf, nf) and torch.equal(ms, ns)):
+                raise SystemExit(f"[t_b2 logits] prompt {p}: masks != "
+                                 f"native builders")
+            if create_recurrent_attention_mask(**kw) is not None:
+                raise SystemExit(f"[t_b2 logits] prompt {p}: conv_mask not "
+                                 f"None for unpadded input")
+            h_ref.append(hr)
+            h_ours.append(ho)
+            m_ours.append((mf, ms))
+            m_nat.append((nf, ns))
+
+    def deint3(t):
+        #5. Interleave(dim=1) on a 3D expert stack (proven bit-equal to
+        #   HF's own Interleave op in B2.1; same de-interleave as vLLM
+        #   inkling nvidia/moe.py:583-595)
+        E, r, c = t.shape
+        return t.reshape(E, r // 2, 2, c).transpose(1, 2).reshape(E, r, c)
+
+    def load_layer(L):
+        #6. disk -> module-layout tensors for one whole decoder layer;
+        #   every conversion is one proven by an earlier item (B2.5-B2.10)
+        is_g = L in mc.global_layers
+        kvd = (mc.g_kv_heads if is_g else mc.s_kv_heads) * mc.head_dim
+        ext = mc.rel_extent if is_g else mc.window
+        qd = mc.g_q_heads * mc.head_dim
+        base = f"model.llm.layers.{L}."
+        names = {"wq": "attn.wq_du.weight", "wk": "attn.wk_dv.weight",
+                 "wv": "attn.wv_dv.weight", "wr": "attn.wr_du.weight",
+                 "wo": "attn.wo_ud.weight", "ksc": "attn.k_sconv.weight",
+                 "vsc": "attn.v_sconv.weight", "qn": "attn.q_norm.weight",
+                 "kn": "attn.k_norm.weight",
+                 "proj": "attn.rel_logits_proj.proj",
+                 "attn_norm": "attn_norm.weight",
+                 "mlp_norm": "mlp_norm.weight",
+                 "attn_sconv": "attn_sconv.weight",
+                 "mlp_sconv": "mlp_sconv.weight"}
+        w = {key: _disk(idx, base + suf).to(DEV)
+             for key, suf in names.items()}
+        shapes = {"wq": (qd, mc.hidden), "wk": (kvd, mc.hidden),
+                  "wv": (kvd, mc.hidden),
+                  "wr": (mc.g_q_heads * mc.d_rel, mc.hidden),
+                  "wo": (mc.hidden, qd), "ksc": (kvd, 1, mc.sconv_k),
+                  "vsc": (kvd, 1, mc.sconv_k), "qn": (mc.head_dim,),
+                  "kn": (mc.head_dim,), "proj": (mc.d_rel, ext),
+                  "attn_norm": (mc.hidden,), "mlp_norm": (mc.hidden,),
+                  "attn_sconv": (mc.hidden, 1, mc.sconv_k),
+                  "mlp_sconv": (mc.hidden, 1, mc.sconv_k)}
+        for key, s in shapes.items():
+            assert w[key].shape == s and w[key].dtype == torch.bfloat16, (
+                L, key, w[key].shape, w[key].dtype)
+        if L < mc.dense_idx:
+            #6a. dense MLP: w13_dn interleaved rows -> de-interleave ->
+            #    chunk halves (B2.10)
+            w13 = _disk(idx, base + "mlp.w13_dn.weight").to(DEV)
+            assert w13.shape == (2 * mc.dense_ffn, mc.hidden), w13.shape
+            wg, wu = _deinterleave_rows(w13).chunk(2, dim=0)
+            w["mlp_gate"], w["mlp_up"] = wg.contiguous(), wu.contiguous()
+            del w13, wg, wu
+            w["mlp_down"] = _disk(idx, base + "mlp.w2_md.weight").to(DEV)
+            assert w["mlp_down"].shape == (mc.hidden, mc.dense_ffn)
+            w["mlp_gs"] = _disk(idx, base + "mlp.global_scale").to(DEV)
+            assert w["mlp_gs"].shape == (1,)
+            assert w["mlp_gs"].dtype == torch.bfloat16
+        else:
+            #6b. MoE: gate (f32 bias/global_scale -> bf16 like the ref
+            #    load, B2.8), routed experts (bf16 straight on layer 2,
+            #    NVFP4 dequant in 32-expert chunks elsewhere — bounded
+            #    fp32 workspace), shared sink experts (B2.9)
+            gb = base + "mlp.gate."
+            w["gate_w"] = _disk(idx, gb + "weight").to(DEV)
+            assert w["gate_w"].shape == (mc.n_experts + mc.n_shared,
+                                         mc.hidden)
+            w["gate_b"] = _disk(idx, gb + "bias").to(DEV).to(torch.bfloat16)
+            w["gate_gs"] = _disk(idx, gb + "global_scale").to(DEV).to(
+                torch.bfloat16)
+            eb = base + "mlp.experts."
+            gu = torch.empty(mc.n_experts, 2 * mc.expert_ffn, mc.hidden,
+                             dtype=torch.bfloat16, device=DEV)
+            w2 = torch.empty(mc.n_experts, mc.hidden, mc.expert_ffn,
+                             dtype=torch.bfloat16, device=DEV)
+            if hdr[eb + "w13_weight"][0] == "BF16":
+                assert L == 2, L   # census B1.2: the only bf16 MoE layer
+                gu.copy_(deint3(_disk(idx, eb + "w13_weight").to(DEV)))
+                w2.copy_(_disk(idx, eb + "w2_weight").to(DEV))
+            else:
+                for wname, dst, deint in (("w13_weight", gu, True),
+                                          ("w2_weight", w2, False)):
+                    packed = _disk(idx, eb + wname)
+                    scale = _disk(idx, eb + wname + ".scale")
+                    scale2 = _disk(idx, eb + wname + ".scale2").to(DEV)
+                    for e0 in range(0, mc.n_experts, 32):
+                        e1 = e0 + 32
+                        deq = loader.dequant_nvfp4(
+                            packed[e0:e1].to(DEV), scale[e0:e1].to(DEV),
+                            scale2[e0:e1], dm.group_size)
+                        dst[e0:e1] = deint3(deq) if deint else deq
+                    del packed, scale, scale2, deq
+            w["gu"], w["w2"] = gu, w2
+            sb = base + "mlp.shared_experts."
+            w13 = _disk(idx, sb + "shared_w13_weight").to(DEV)
+            assert w13.shape == (mc.n_shared, 2 * mc.expert_ffn, mc.hidden)
+            g, u = deint3(w13).chunk(2, dim=1)
+            w["shg"], w["shu"] = g.contiguous(), u.contiguous()
+            del w13, g, u
+            w["shd"] = _disk(idx, sb + "shared_w2_weight").to(DEV)
+            assert w["shd"].shape == (mc.n_shared, mc.hidden, mc.expert_ffn)
+        return w
+
+    def build_layer(L, w):
+        #7. the reference layer itself: the ACTUAL InklingDecoderLayer,
+        #   constructed under a bf16 default dtype (a fp32 MoE layer would
+        #   waste 54 GiB), eval mode, the four sconv convs back to fp32
+        #   (_keep_in_fp32_modules_strict :610), every parameter copied
+        #   from the same converted tensors our engine consumes
+        old = torch.get_default_dtype()
+        torch.set_default_dtype(torch.bfloat16)
+        try:
+            with torch.device(DEV):
+                lay = InklingDecoderLayer(tc, L)
+        finally:
+            torch.set_default_dtype(old)
+        lay.eval()
+        for sc in (lay.self_attn.k_sconv, lay.self_attn.v_sconv,
+                   lay.attn_sconv, lay.mlp_sconv):
+            sc.conv1d.to(torch.float32)
+            assert sc.conv1d.bias is None
+        src = {"self_attn.q_proj.weight": w["wq"],
+               "self_attn.k_proj.weight": w["wk"],
+               "self_attn.v_proj.weight": w["wv"],
+               "self_attn.r_proj.weight": w["wr"],
+               "self_attn.o_proj.weight": w["wo"],
+               "self_attn.q_norm.weight": w["qn"],
+               "self_attn.k_norm.weight": w["kn"],
+               "self_attn.rel_logits_proj.proj": w["proj"],
+               "self_attn.k_sconv.conv1d.weight": w["ksc"].float(),
+               "self_attn.v_sconv.conv1d.weight": w["vsc"].float(),
+               "input_layernorm.weight": w["attn_norm"],
+               "post_attention_layernorm.weight": w["mlp_norm"],
+               "attn_sconv.conv1d.weight": w["attn_sconv"].float(),
+               "mlp_sconv.conv1d.weight": w["mlp_sconv"].float()}
+        if L < mc.dense_idx:
+            src.update({"mlp.gate_proj.weight": w["mlp_gate"],
+                        "mlp.up_proj.weight": w["mlp_up"],
+                        "mlp.down_proj.weight": w["mlp_down"],
+                        "mlp.global_scale": w["mlp_gs"]})
+        else:
+            src.update({"mlp.gate.weight": w["gate_w"],
+                        "mlp.gate.e_score_correction_bias": w["gate_b"],
+                        "mlp.gate.global_scale": w["gate_gs"],
+                        "mlp.experts.gate_up_proj": w["gu"],
+                        "mlp.experts.down_proj": w["w2"],
+                        "mlp.shared_experts.gate_proj": w["shg"],
+                        "mlp.shared_experts.up_proj": w["shu"],
+                        "mlp.shared_experts.down_proj": w["shd"]})
+        params = dict(lay.named_parameters())
+        assert set(params) == set(src), (L, set(params) ^ set(src))
+        with torch.no_grad():
+            for n, s in src.items():
+                assert params[n].shape == s.shape, (L, n, params[n].shape)
+                assert params[n].dtype == s.dtype, (L, n, params[n].dtype)
+                params[n].copy_(s)
+        return lay
+
+    #8. the 66-layer streamed forward, both engines in lockstep on the same
+    #   converted weights. Prompt 0 carries the frozen-capture pins.
+    ref_pins = 0
+    drift = {}
+    bit01 = 0
+    with torch.no_grad():
+        for L in range(mc.num_layers):
+            w = load_layer(L)
+            lay = build_layer(L, w)
+            mi = 0 if L in mc.global_layers else 1
+            for p in range(5):
+                if p == 0 and L in REF_LAYERS:
+                    if not torch.equal(h_ref[0],
+                                       tens[f"layers.{L}.in"].to(DEV)):
+                        raise SystemExit(f"[t_b2 logits] streaming ref != "
+                                         f"frozen layers.{L}.in")
+                h_ref[p] = lay(h_ref[p], attention_mask=m_nat[p][mi],
+                               conv_mask=None, past_key_values=None)
+                h_ours[p] = pmodel.layer_prefill(
+                    h_ours[p], w, m_ours[p][mi], poss[p], mc, L)
+            if L in REF_LAYERS:
+                want = tens[f"layers.{L}.out"].to(DEV)
+                if not torch.equal(h_ref[0], want):
+                    raise SystemExit(f"[t_b2 logits] streaming ref != "
+                                     f"frozen layers.{L}.out")
+                ref_pins += 2
+                if L < mc.dense_idx:
+                    #8a. dense layers: every component is bit-exact
+                    #    (B2.2-B2.7, B2.10) — so must the composition be
+                    if not torch.equal(h_ours[0], want):
+                        raise SystemExit(f"[t_b2 logits] our layer {L} out "
+                                         f"not bit-exact vs frozen")
+                    bit01 += 1
+                else:
+                    #8b. MoE layers: expert-kernel drift only (B2.9),
+                    #    must stay well inside the B2 budget
+                    drift[L] = _rel_err(h_ours[0], want)
+                    if drift[L] >= 1e-2:
+                        raise SystemExit(f"[t_b2 logits] our layer {L} out "
+                                         f"drift {drift[L]:.3e} >= 1e-2")
+            if L == 6:
+                #8c. final-norm pin: the frozen truncated-model capture is
+                #    norm(layer-6 out) with the FULL model's norm weight
+                if not torch.equal(nat_fn(h_ref[0]),
+                                   tens["final_norm.out"].to(DEV)):
+                    raise SystemExit("[t_b2 logits] final_norm(L6) != "
+                                     "frozen capture")
+                ref_pins += 1
+            if not (torch.isfinite(h_ref[0].float()).all()
+                    and torch.isfinite(h_ours[0].float()).all()):
+                raise SystemExit(f"[t_b2 logits] non-finite hidden after "
+                                 f"layer {L}")
+            del w, lay
+            torch.cuda.empty_cache()
+            if L % 8 == 7 or L == mc.num_layers - 1:
+                print(f"[t_b2 logits] layer {L + 1}/{mc.num_layers} done, "
+                      f"{time.time() - t0:.0f} s", file=sys.stderr,
+                      flush=True)
+
+    #9. logits + greedy top-1, both engines. The ref head transcribes
+    #   modeling_inkling.py:783-789 on the native norm; running OUR head on
+    #   the REF hidden must be bitwise identical (isolates all divergence
+    #   to the layer stack)
+    rows = []
+    with torch.no_grad():
+        for p in range(5):
+            hr = nat_fn(h_ref[p]) / tc.logits_mup_width_multiplier
+            ref_lg = torch.nn.functional.linear(
+                hr, w_un)[..., :tc.unpadded_vocab_size]
+            our_lg = pmodel.final_logits(h_ours[p], w_fn, w_un,
+                                         mc.logits_mult, mc.vocab_unpadded,
+                                         eps=mc.rms_eps)
+            assert ref_lg.shape == our_lg.shape == (1, lens[p],
+                                                    mc.vocab_unpadded)
+            if not torch.equal(
+                    pmodel.final_logits(h_ref[p], w_fn, w_un, mc.logits_mult,
+                                        mc.vocab_unpadded, eps=mc.rms_eps),
+                    ref_lg):
+                raise SystemExit(f"[t_b2 logits] prompt {p}: our logit head "
+                                 f"!= native on the same hidden")
+            rl, ol = ref_lg[0, -1].float(), our_lg[0, -1].float()
+            assert torch.isfinite(rl).all() and torch.isfinite(ol).all()
+            tr, to = int(rl.argmax()), int(ol.argmax())
+            r2 = torch.topk(rl, 2).values
+            o2 = torch.topk(ol, 2).values
+            rows.append({"match": tr == to, "ref": tr, "ours": to,
+                         "tok": tok.decode([tr]),
+                         "m_ref": (r2[0] - r2[1]).item(),
+                         "m_ours": (o2[0] - o2[1]).item(),
+                         "rel": _rel_err(ol, rl)})
+    bad = [(p, r) for p, r in enumerate(rows) if not r["match"]]
+    if bad:
+        detail = "; ".join(
+            f"prompt {p}: ref {r['ref']}({tok.decode([r['ref']])!r}) vs "
+            f"ours {r['ours']}({tok.decode([r['ours']])!r}), ref margin "
+            f"{r['m_ref']:.3f}" for p, r in bad)
+        raise SystemExit(f"[t_b2 logits] top-1 MISMATCH {len(bad)}/5: "
+                         f"{detail}")
+
+    #10. summary line = the test's green evidence
+    toks = ",".join(repr(r["tok"]) for r in rows)
+    mr = ",".join("{:.1f}".format(r["m_ref"]) for r in rows)
+    mo = ",".join("{:.1f}".format(r["m_ours"]) for r in rows)
+    worst_rel = max(r["rel"] for r in rows)
+    print(f"logits ok: full {mc.num_layers}-layer streamed forward, 5 tiny "
+          f"prompts (T {min(lens)}-{max(lens)}) — greedy top-1 MATCH 5/5 "
+          f"vs native transformers ({toks}); streaming ref pinned bit-exact "
+          f"vs frozen captures ({ref_pins + 2} pins: embed+norm, layers "
+          f"{{0,1,2,5,6}} in/out under grouped_mm dispatch, final_norm@L6); "
+          f"our engine bit-exact vs frozen layers 0-1 out ({bit01}/2), "
+          f"MoE-layer drift @2/5/6 {drift[2]:.1e}/{drift[5]:.1e}/"
+          f"{drift[6]:.1e} < 1e-2 (expert-kernel order, B2.9); masks "
+          f"bit-equal native builders x5 prompts, conv_mask None; logit "
+          f"head bit-equal on shared hidden; last-pos logits rel err "
+          f"{worst_rel:.1e} max, top-1 margins ref [{mr}] ours [{mo}]; "
+          f"wall {time.time() - t0:.0f} s")
+
+
 def _todo(item):
     def f():
         raise SystemExit(f"[t_b2] not implemented — that is item {item}'s job")
@@ -2018,7 +2432,7 @@ def main():
             "relbias": t_relbias, "sconv": t_sconv,
             "attn_global": t_attn_global, "attn_swa": t_attn_swa,
             "gate": t_gate, "moe": t_moe,
-            "dense": t_dense, "logits": _todo("B2.11")}
+            "dense": t_dense, "logits": t_logits}
     usage = f"usage: python -m engine.pyengine.tests.t_b2 {{{'|'.join(cmds)}}}"
     if len(sys.argv) != 2 or sys.argv[1] not in cmds:
         raise SystemExit(usage)

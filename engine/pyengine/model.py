@@ -336,3 +336,58 @@ def attn_prefill(x, wq, wk, wv, wr, wo, w_k_sconv, w_v_sconv, w_q_norm,
     #8. weighted values -> [B,T,H*D] -> output projection (:179-181 + :280f)
     out = torch.matmul(attn, v).transpose(1, 2).contiguous()
     return F.linear(out.reshape(B, T, n_heads * head_dim), wo)
+
+
+def layer_prefill(x, w, mask, pos, mc, layer_idx):
+    """One full decoder layer, PREFILL form — exact InklingDecoderLayer
+    op order (transformers models/inkling/modeling_inkling.py:566-591):
+    input_layernorm -> attention (B2.6 global / B2.7 SWA) -> attn_sconv
+    (module adds its OWN input back in fp32, B2.5; outer residual is
+    separate) -> + residual (bf16) -> post_attention_layernorm -> MLP
+    (dense for layer_idx < mc.dense_idx — a COUNT, census B1.2 — else MoE)
+    -> mlp_sconv -> + residual. `w` maps fixed keys to converted-to-module-
+    layout tensors (conversions per B2.5-B2.10; built by t_b2.t_logits):
+    attention wq/wk/wv/wr/wo/ksc/vsc/qn/kn/proj; norms attn_norm/mlp_norm
+    (checkpoint attn_norm/mlp_norm -> input/post_attention_layernorm,
+    conversion_mapping.py); layer sconvs attn_sconv/mlp_sconv; and either
+    mlp_gate/mlp_up/mlp_down/mlp_gs (dense) or gate_w/gate_b/gate_gs/
+    gu/w2/shg/shu/shd (MoE). mc is the verified ModelConfig; the caller's
+    mask must match the layer type (window=mc.window on SWA layers)."""
+    is_global = layer_idx in mc.global_layers
+    #1. attention half: pre-norm, attention, attn_sconv, outer residual
+    #   in the ref's order residual + hidden (:574-583)
+    h = rmsnorm(x, w["attn_norm"], mc.rms_eps)
+    h = attn_prefill(h, w["wq"], w["wk"], w["wv"], w["wr"], w["wo"],
+                     w["ksc"], w["vsc"], w["qn"], w["kn"], w["proj"],
+                     mask, pos, pos, mc.head_dim, is_global,
+                     alpha=mc.log_alpha, n_floor=mc.log_floor,
+                     eps=mc.rms_eps)
+    h = sconv_prefill(h, w["attn_sconv"])
+    x = x + h
+    #2. MLP half: pre-norm, dense MLP or MoE block, mlp_sconv, residual
+    #   (:585-591)
+    h = rmsnorm(x, w["mlp_norm"], mc.rms_eps)
+    if layer_idx < mc.dense_idx:
+        h = dense_mlp(h, w["mlp_gate"], w["mlp_up"], w["mlp_down"],
+                      w["mlp_gs"])
+    else:
+        h = moe(h, w["gate_w"], w["gate_b"], w["gate_gs"], w["gu"],
+                w["w2"], w["shg"], w["shu"], w["shd"], mc.topk,
+                mc.n_shared, mc.route_scale)
+    h = sconv_prefill(h, w["mlp_sconv"])
+    return x + h
+
+
+def final_logits(h, w_norm, w_unembed, mult, n_unpadded, eps=1e-6):
+    """Final norm -> next-token logits, exact InklingForCausalLM semantics
+    (modeling_inkling.py:783-789; the multimodal wrapper is identical,
+    :1280-1286): model.norm rmsnorm, then the hidden state is DIVIDED by
+    logits_mup_width_multiplier (bf16 division, not a reciprocal multiply),
+    then the bias-free lm_head GEMM (checkpoint model.llm.unembed.weight ->
+    lm_head.weight, conversion_mapping.py), then the padded vocab tail is
+    sliced off at unpadded_vocab_size (200058 of 201024) before any
+    sampling/argmax."""
+    #1. final rmsnorm, then the mup width divide in the model dtype (:783)
+    h = rmsnorm(h, w_norm, eps) / mult
+    #2. unembed GEMM, slice the vocab padding (:786-789)
+    return torch.nn.functional.linear(h, w_unembed)[..., :n_unpadded]
