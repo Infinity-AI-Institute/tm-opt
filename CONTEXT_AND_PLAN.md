@@ -34,7 +34,7 @@ NVSwitch full mesh, 2 NUMA domains (GPU0–3 ↔ cores 0–85, GPU4–7 ↔ 86�
 everything else is wiped on pod restart (see `scripts/pod_init.sh`).
 `/workspace/maverick` = prior occupant's data: **never open, grep, or delete.**
 
-**Model:** `/workspace/models/inkling-nvfp4` (551.35 GiB, 34 shards +
+**Model:** `/workspace/models/inkling-nvfp4` (551.35 GiB, 33 shards +
 mtp.safetensors). Config is checkpoint-verified by `./build/verify_config`
 (green). Key shapes (full citations in `engine/include/tmopt/config.h`):
 66 layers; hidden 6144; vocab 201024 (unpadded 200058, eos 200006);
