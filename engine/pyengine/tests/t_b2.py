@@ -44,6 +44,7 @@ from safetensors.torch import load_file, save_file
 
 from engine.pyengine import config as pcfg
 from engine.pyengine import loader
+from engine.pyengine import model as pmodel
 
 MODEL_DIR = "/workspace/models/inkling-nvfp4"
 REF_DIR = pathlib.Path(__file__).resolve().parent / "ref"
@@ -325,11 +326,14 @@ def t_ref():
           f"wall {time.time() - t0:.1f} s (load {t_load:.1f})")
 
 
-def _verify_existing():
+def _load_refs():
+    """Silent core of the ref verifier: every B2.2+ item loads the frozen
+    refs through this, so a tampered/partial ref set fails ALL items."""
     #1. both files must exist together — a half-committed ref set is a bug
     if not (REF_TENSORS.exists() and REF_META.exists()):
         raise SystemExit(f"[t_b2 ref] partial refs: tensors="
-                         f"{REF_TENSORS.exists()} meta={REF_META.exists()}")
+                         f"{REF_TENSORS.exists()} meta={REF_META.exists()}"
+                         f" — run item B2.1 first")
     meta = json.loads(REF_META.read_text())
 
     #2. content hash pins the frozen refs (same convention as goldens)
@@ -352,12 +356,62 @@ def _verify_existing():
                              f"{manifest[n]} vs {want}")
         if t.is_floating_point() and not torch.isfinite(t.float()).all():
             raise SystemExit(f"[t_b2 ref] non-finite ref tensor: {n}")
+    return tens, meta, sha
 
-    #4. summary line = the test's green evidence
+
+def _verify_existing():
+    #1. checks live in _load_refs; this wrapper prints the green evidence
+    tens, meta, sha = _load_refs()
     print(f"ref ok: existing refs verified — {len(tens)} tensors, sha256 "
           f"{sha[:12]}, layers {meta['ref_layers']}, prompt "
           f"{len(meta['token_ids'])} toks (generated with transformers "
           f"{meta['versions']['transformers']}, {meta['wall_s']['total']} s)")
+
+
+def _rel_err(got, want):
+    #1. fp32 global L2 relative error — the B2 items' "rel err" gate
+    g, w = got.float(), want.float()
+    return ((g - w).norm() / w.norm()).item()
+
+
+def t_embed():
+    """B2.2: our embed + embed_norm (model.py) vs the frozen transformers
+    refs, rel err < 1e-2 in bf16 on both module boundaries."""
+    #1. frozen refs (sha-verified) give input_ids + expected outputs
+    tens, meta, _ = _load_refs()
+    ids = tens["input_ids"].to(DEV)
+    want_lookup = tens["embed_tokens.out"].to(DEV)
+    want_norm = tens["embed_norm.out"].to(DEV)
+
+    #2. read the two weights straight from their shards (B1.1 index);
+    #   shapes/dtypes pinned against the verified config
+    idx = loader.build_shard_index(MODEL_DIR)
+    mc = pcfg.load_verified(MODEL_DIR)
+    w_e = _disk(idx, "model.llm.embed.weight").to(DEV)
+    w_n = _disk(idx, "model.llm.embed_norm.weight").to(DEV)
+    assert w_e.shape == (mc.vocab, mc.hidden), w_e.shape
+    assert w_n.shape == (mc.hidden,), w_n.shape
+    assert w_e.dtype == w_n.dtype == torch.bfloat16
+
+    #3. our engine path (pure torch, exact InklingRMSNorm semantics)
+    h, hn = pmodel.embed(ids, w_e, w_n, eps=mc.rms_eps)
+
+    #4. gate: rel err < 1e-2 (item text) on lookup AND normed output;
+    #   bit-equality reported as extra evidence (lookup is a row copy,
+    #   norm replays the same fp32-then-bf16 ops on the same GPU)
+    re_l, re_n = _rel_err(h, want_lookup), _rel_err(hn, want_norm)
+    bit_l = torch.equal(h, want_lookup)
+    bit_n = torch.equal(hn, want_norm)
+    if not (re_l < 1e-2 and re_n < 1e-2):
+        raise SystemExit(f"[t_b2 embed] rel err over 1e-2: "
+                         f"lookup {re_l:.3e}, embed_norm {re_n:.3e}")
+    max_n = (hn.float() - want_norm.float()).abs().max().item()
+
+    #5. summary line = the test's green evidence
+    print(f"embed ok: {ids.shape[1]} toks; lookup rel err {re_l:.1e} "
+          f"(bit-exact {bit_l}), embed_norm rel err {re_n:.1e} < 1e-2 "
+          f"(bit-exact {bit_n}, max|diff| {max_n:.1e}); "
+          f"weights {tuple(w_e.shape)} bf16 from shards, eps {mc.rms_eps}")
 
 
 def _todo(item):
@@ -369,7 +423,7 @@ def _todo(item):
 def main():
     #1. dispatch on subcommand; unimplemented ones fail loud with their item
     cmds = {"ref": t_ref,
-            "embed": _todo("B2.2"), "rmsnorm": _todo("B2.3"),
+            "embed": t_embed, "rmsnorm": _todo("B2.3"),
             "relbias": _todo("B2.4"), "sconv": _todo("B2.5"),
             "attn_global": _todo("B2.6"), "attn_swa": _todo("B2.7"),
             "gate": _todo("B2.8"), "moe": _todo("B2.9"),

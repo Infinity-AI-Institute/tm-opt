@@ -22,6 +22,7 @@ class ModelConfig:
                                     #layers (ids < 2), NOT an index (vllm
                                     #inkling nvidia/model.py:164; census B1.2)
     route_scale: float = 8.0
+    rms_eps: float = 1e-6           #cfg: rms_norm_eps
     mtp_layers: int = 8
     global_layers: tuple = tuple(range(5, 66, 6))  #derived: cfg local_layer_ids complement
 
@@ -37,6 +38,7 @@ def load_verified(model_dir: str) -> ModelConfig:
         "swa_num_key_value_heads": mc.s_kv_heads, "head_dim": mc.head_dim,
         "n_routed_experts": mc.n_experts, "num_experts_per_tok": mc.topk,
         "intermediate_size": mc.expert_ffn, "dense_mlp_idx": mc.dense_idx,
+        "rms_norm_eps": mc.rms_eps,
     }
     bad = {k: (txt.get(k), v) for k, v in checks.items() if txt.get(k) != v}
     if bad:
