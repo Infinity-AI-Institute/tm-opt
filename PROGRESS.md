@@ -128,9 +128,13 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
       dense layers 0-1, MoE drift <= 2.9e-03; wall 130 s (commit 7b63ab6)
 
 ## B3 — KV + decode + scheduler + server (parity milestone)
-- [ ] B3.1 KV structs: paged global (page 16) + ring-512 SWA + sconv ring;
+- [x] B3.1 KV structs: paged global (page 16) + ring-512 SWA + sconv ring;
       decode of token N+1 equals recompute-from-scratch on a 600-token prompt
       (crosses the 512 window).  test: `python -m engine.pyengine.tests.t_b3 kv`
+      — green: decode 601/602 vs T=602 recompute per layer (teacher-forced):
+      attn half <= 7.9e-05, dense out <= 9.7e-05, MoE out <= 5.4e-03 (expert
+      choice identical); cache K/V + 4 sconv-ring tails bit-equal replay 5/5
+      layers; ring/page positional pins exact; wall 13 s (commit f3b1fbd)
 - [ ] B3.2 greedy decode loop (batch 1) reproduces B2.11 prompts to 32 tokens
       vs transformers.  test: `python -m engine.pyengine.tests.t_b3 decode`
 - [ ] B3.3 continuous batching scheduler: 8 concurrent greedy requests give
@@ -711,3 +715,57 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
   attn_global + attn_swa + gate + moe + dense; t_b1 index + census +
   dtypes + plan. Code committed first (7b63ab6) per convention; this tick
   is its own commit. B2 track complete; next is B3.1 (KV structs).
+- 2026-07-26 B3.1: implemented kv.py (SconvRing — last sconv_k-1=3 RAW
+  pre-conv inputs, zero-init == conv's implicit left pad; RingKV capacity
+  512 == the SWA window predicate's allowed set exactly, so decode needs no
+  mask, kv_pos > q_pos - 512 per B2.7; PagedKV — PAGE_SIZE 16, per-seq page
+  table over a caller-ordered free list so gather is real indirection;
+  LayerKV = cache + 4 sconv rings; caches hold POST-q/k-norm K and
+  POST-sconv V, per B2.5-B2.7 the values that never change once written),
+  model.py decode forms (sconv_decode — same F.conv1d op on the exact
+  4-token window, padding=0, fp32 + own-input residual, causal_conv1d_update
+  semantics modeling_inkling.py:441-457; attn_decode — Q=1 over gathered
+  cache, rel_bias reused at distances pos-kv_pos, tau round-trip on global,
+  GQA expand, NO additive mask by construction; layer_decode — layer_prefill
+  op order, MoE/dense reused at T=1 per B2.9 note, optional trace for
+  tests), attn_prefill/layer_prefill grew state=None population hooks
+  (numerics untouched — same ops, verified by full B2 rerun), and
+  t_b2.load_layer_weights lifted from t_logits' closure to module level
+  (unchanged body) for reuse. Ran test verbatim from /workspace/tm-opt (venv
+  active, CUDA_VISIBLE_DEVICES=4,5,6,7). Real output (after 5 per-layer
+  stderr progress lines):
+  ```
+  kv ok: layers [0, 1, 2, 3, 5] (dense/bf16-MoE/nvfp4-MoE x SWA/global), 600-token prompt + 2 decode steps (crosses window 512), teacher-forced per layer (see docstring) — decode vs recompute-from-scratch: attention half (KV-fed) 2.1e-05/1.6e-05/7.9e-05/1.2e-05/7.9e-06 < 0.001, full layer out 8.1e-05/9.7e-05/6.5e-04/4.0e-04/5.4e-03 < 0.001(dense)/0.01(moe, bf16 routing-weight granularity, expert CHOICE pinned identical 3/3 moe layers x 2 steps); prefill-written cache K/V + all 4 sconv-ring tails BIT-equal same-shape replay 5/5 layers (replay itself bit-equal layer_prefill); SWA ring holds exactly positions 90..601, paged global 0..601 in 38 shuffled pages (page 16); prefix drift <= 3.0e-04; struct pins (ring wrap order+positions, oversized-append drop, shuffled-table paged gather + partial page, sconv-ring windows + short-prefill zeros) all bit-exact; wall 13 s
+  ```
+  GATE DESIGN (documented in t_b3.py's docstring; two dead ends hit
+  honestly): bitwise decode==recompute is unattainable in principle — T=1
+  GEMV vs T=602 GEMM rows pick shape-dependent accumulation orders. First
+  attempt (three propagating streams) showed the drift COMPOUNDS with depth
+  (600- vs 602-row streams diverge to 7e-04 by layer 1 with NO cache
+  involved), so the test teacher-forces each layer with the recompute
+  stream's own input — one layer of shape effects per comparison;
+  end-to-end composition is B3.2's job vs the EXTERNAL transformers oracle.
+  Second: MoE layer outputs sit ~5e-03 apart even teacher-forced —
+  diagnosed to the routing WEIGHTS' all-bf16 chain (sigmoid -> logsigmoid
+  -> softmax on a ~2^-8 grid, B2.8): 1-ulp logit shifts move weights ~1e-2
+  rel while expert CHOICE is stable (verified identical). So the gates
+  decompose: attention half (everything the KV state feeds: paged/ring
+  cache, k/v/attn sconv rings, decode rel-bias, GQA gather) < 1e-3
+  (measured ~1e-5); expert top-6 set EQUAL; full MoE out < 1e-2 (the
+  B2.9/B2.11 expert-numerics budget); dense out < 1e-3; and the mechanics
+  arms carry the bitwise burden — cache content + all four ring tails
+  torch.equal vs a same-shape replay (itself pinned bit-equal to
+  layer_prefill's output), synthetic wraparound/oversized-append/partial-
+  page/shuffled-table pins, and exact positional pins (SWA ring == positions
+  90..601 = the window set for query 601; paged == 0..601 over 38
+  non-contiguous pages). NOTE for B3.2: layer_decode(trace=) exposes
+  x1/mlpin for tests; decode reuses moe/dense at T=1; expect the same
+  bf16-routing-weight noise vs transformers, with top-1 agreement as the
+  gate (B2.11 note). NOTE for B3.3: kv.py is single-sequence by design;
+  multi-seq ownership lands in scheduler.py (PagedKV free_order hook is the
+  allocator seam). Regressions all green after the model.py/t_b2.py
+  changes: t_b2 ref (verify path, sha eae8f3a95804 unchanged) + embed +
+  rmsnorm + relbias + sconv + attn_global + attn_swa + gate + moe + dense +
+  logits (identical evidence lines incl. top-1 5/5, wall 129 s); t_b1 index
+  + census + dtypes + plan. Code committed first (f3b1fbd) per convention;
+  this tick is its own commit.
