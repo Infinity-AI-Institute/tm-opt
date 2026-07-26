@@ -87,8 +87,12 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
       — green: all 4 layer-0 sconvs (k/v/attn/mlp) bit-exact vs frozen
       anchors; native-module cross-check bit-exact 4 real + 5 random cases;
       window-4 causality + tap orientation + no-bias pinned (commit 506c98f)
-- [ ] B2.6 global-attention layer (idx 5) forward matches ref slice.
+- [x] B2.6 global-attention layer (idx 5) forward matches ref slice.
       test: `python -m engine.pyengine.tests.t_b2 attn_global`
+      — green: full path + all 8 internal anchors bit-exact vs frozen refs;
+      mask bit-equal native create_causal_mask; 6/6 native-module
+      cross-checks bit-exact (real+random weights, T 1-600, batch 2);
+      causality bit-checked (commit 3196ecd)
 - [ ] B2.7 SWA layer (idx 0, window 512, 16 KV heads) matches ref slice.
       test: `python -m engine.pyengine.tests.t_b2 attn_swa`
 - [ ] B2.8 MoE gate: sigmoid+bias → top-6 → norm_after_topk → route_scale 8
@@ -452,3 +456,39 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
   modeling_inkling.py:229-230); attn items must thread it there, and
   sconv_prefill also covers the attn-out + moe-out positions. Code
   committed first (506c98f) per convention; this tick is its own commit.
+- 2026-07-26 B2.6: implemented model.py attn_prefill (pure torch, exact
+  InklingAttention prefill semantics per modeling_inkling.py:217-282 +
+  eager_attention_forward :157-182 — q/k/v/r projections with k/v through
+  their window-4 sconvs (:229-230), per-head q/k rmsnorm on head_dim then
+  [B,H,T,D] transpose (:233-235), rel_bias from r_proj states (:248-251),
+  tau fp32 round-trip on global layers unconditionally like the ref
+  (:254-261; ==1.0 below floor 128000), GQA repeat_kv expand+reshape
+  (:145-154), bf16 scores * 1/head_dim + bias + mask in the ref's
+  association order (:171-175; 1/d scaling because q/k are RMS-normalized,
+  :197-198), fp32 softmax downcast (:177), o_proj) + additive_causal_mask
+  (eager 0/finfo.min form, masking_utils eager_mask semantics; window arm
+  for B2.7 carries sliding_window_overlay's kv > q - window) + t_b2
+  attn_global. Test: (a) frozen layer-5 anchors — full path from
+  self_attn.in vs self_attn.out AND all 8 captured internals (k/v_proj,
+  k/v_sconv, r_proj, q/k_norm, rel_logits_proj) recomputed as a chain,
+  1e-2 gate; (b) our mask vs transformers create_causal_mask on the exact
+  ref-run call, torch.equal; (c) native InklingAttention in-process (bf16
+  module, fp32 sconvs per _keep_in_fp32_modules_strict :610), torch.equal
+  REQUIRED, real + random weights x T {1,4,13,29,600} incl. batch 2;
+  (d) perturb-token-t causality bit-checked both sides. Ran test verbatim
+  from /workspace/tm-opt (venv active, CUDA_VISIBLE_DEVICES=4,5,6,7).
+  Real output:
+  ```
+  attn_global ok: layer-5 frozen anchors — full path rel err 0.0e+00 < 1e-2 (bit-exact True), 8 internals (k/v_proj+sconv, r_proj, q/k_norm, rel_bias) < 1e-2, bit-exact 8/8; mask bit-equal native create_causal_mask (eager 0/finfo.min); native-module cross-check bit-exact 6/6 cases (4079616 els; real+random weights, T {1,4,13,29,600}, batch 2); causality bit-checked through full path; tau==1.0 at all tested positions (scaling armed, floor 128000)
+  ```
+  Everything bit-exact, not just <1e-2: our function transcribes the exact
+  op order/dtypes/layouts on the same GPU. Facts pinned: conv_mask was None
+  in the ref run (create_recurrent_attention_mask returns None for unpadded
+  input — confirms B2.5's setup); eager mask dtype = inputs_embeds dtype
+  (bf16), values exactly {0, finfo.min}, [B,1,Q,K]. NOTE for B2.7: same
+  attn_prefill covers SWA — pass the 16-kv-head weights, window=512 mask
+  (untested arm this iteration), is_global=False; L0 internals are already
+  captured. Regressions green: t_b2 ref (sha eae8f3a95804 unchanged) +
+  embed + rmsnorm + relbias + sconv; t_b1 index + census + dtypes + plan.
+  Code committed first (3196ecd) per convention; this tick is its own
+  commit.
