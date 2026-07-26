@@ -46,12 +46,15 @@ Env for all items: `cd /workspace/tm-opt && source /workspace/venv/bin/activate
       — green: per-GPU 142.04 GiB ≤ 150 (sharded 136.38 + replicated 5.67;
       16q+2/4kv heads/rank, 64 experts/rank, embed+unembed replicated by
       choice) (commit 5c3a636)
-- [ ] B1.6 full load onto GPUs 4-7 under budget, wall time printed.
+- [x] B1.6 full load onto GPUs 4-7 under budget, wall time printed.
       test: `python -m engine.pyengine.tests.t_b1 load`
       HINT: a substantially-complete load_replica() sits UNCOMMITTED in
       loader.py + t_b1.py from a prior session (killed by its own
       backgrounding — see rules). Review it, finish it, run the test in the
       FOREGROUND (expect ~5-15 min; page cache is warm), commit.
+      — green: per-GPU 142.04 GiB resident (== B1.5 plan) ≤ 150, wall 110.2 s
+      foreground, spot checks bitwise-exact (implementation pre-committed in
+      f347f5c; no code change needed)
 
 ## B2 — model graph (single token correctness, vs transformers reference slices)
 Reference: generate per-layer reference activations ONCE with
@@ -260,3 +263,23 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
   census + dtypes + dequant all still green. vLLM measured 137.46 GiB/GPU
   weights (BASELINE_NOTES) — our +4.6 GiB delta is exactly the replicated
   embed/unembed, headroom for it verified by this budget.
+- 2026-07-26 B1.6: NO code change — the hint's "uncommitted" load_replica()
+  + t_load() were already committed by the human in f347f5c (alongside the
+  hint itself); reviewed both end-to-end before running: streams each shard
+  once, REPLICATE full-copy / SHARD r-th-of-4 slice per the B1.5 plan, SKIP
+  multimodal never read, pre-flight free-VRAM check per rank, post-load
+  name-set + exact-byte reconciliation vs plan prediction. Pre-flight: GPUs
+  4-7 idle (4 MiB used each), t_b1 index green as env sanity. Ran test
+  verbatim from /workspace/tm-opt (venv active, CUDA_VISIBLE_DEVICES=4,5,6,7)
+  in the FOREGROUND, single run, no retries. Real output (stdout; 34
+  per-shard progress lines went to stderr, steady ~3-4 s/shard):
+  ```
+  load ok: tp=4 replica on GPUs 4-7 (visible cuda:0-3), 2046 tensors/rank; per-GPU 142.04 GiB resident (allocator max 142.05) <= 150 GiB budget; wall 110.2 s (551.18 source GiB, 5.00 GiB/s); spot checks bitwise-exact: replicate + dim0/1/2 shards + nvfp4 pack (u8/f8-scale/f32-scale2/amax)
+  ```
+  Wall 110 s (page cache fully warm — hint's 5-15 min was the cold-ish
+  estimate). Resident bytes == B1.5 plan prediction exactly on all 4 ranks;
+  allocator overhead 0.01 GiB. Spot checks compare rank pieces bitwise vs a
+  fresh disk read on ranks 0+3: replicate (embed), dim-0 shard (wq bf16 +
+  full nvfp4 pack u8/scale/scale2), dim-1 (wo), dim-2 (shared_w2), replicated
+  pack metadata (input_amax). B1 loader track complete; next is B2.1
+  (transformers reference activations).
