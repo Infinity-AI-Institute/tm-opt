@@ -1008,6 +1008,246 @@ def t_attn_global():
           f"all tested positions (scaling armed, floor {mc.log_floor})")
 
 
+def t_attn_swa():
+    """B2.7: SWA-attention layer (idx 0: window 512, 64Q/16KV heads, rel
+    extent = window 512, NO log scaling — modeling_inkling.py:190-196,:254)
+    forward, prefill/no-cache form, vs the frozen ref slice. Same
+    model.attn_prefill as B2.6 — the SWA arm differs only in weights, the
+    window mask, and is_global=False. Gates:
+      (a) frozen anchors — replay from the captured layer-0 self_attn.in
+          with the real checkpoint weights: full path vs self_attn.out plus
+          every captured internal boundary, rel err < 1e-2, bit-exactness
+          reported;
+      (b) mask — our additive_causal_mask(window=512) must equal
+          transformers' create_sliding_window_causal_mask output bit-for-bit
+          on the exact call the ref run made (InklingTextModel.forward
+          :694-703; layer 0 reads the "sliding_attention" entry, :709);
+      (c) native-module cross-check — the ACTUAL transformers
+          InklingAttention(layer_idx 0) in-process, ref dtype policy,
+          torch.equal REQUIRED, real + random weights, T {1, 13, 600} +
+          batch 2 — T 600 CROSSES the 512 window on both weight sets;
+      (d) causality — perturbing token t leaves outputs before t
+          bit-identical;
+      (e) window cutoff — at T 600, a perturbation at token t must be
+          INVISIBLE to queries >= t + window + sconv_k - 1 (the k/v sconv
+          smears token t into keys/values t..t+3; the last query seeing
+          key t+3 is t+3+511) and visible at the direct window edge
+          t + window - 1 — both sides bit-checked."""
+    from transformers import AutoConfig
+    from transformers.masking_utils import create_sliding_window_causal_mask
+    from transformers.models.inkling.modeling_inkling import InklingAttention
+    torch.manual_seed(0)
+    F = torch.nn.functional
+    tens, meta, _ = _load_refs()
+    mc = pcfg.load_verified(MODEL_DIR)
+    idx = loader.build_shard_index(MODEL_DIR)
+    L = 0
+
+    #1. layer-0 attention weights from shards, shapes pinned vs config —
+    #   16 KV heads and the (d_rel, window) rel bank are the SWA signature
+    base = f"model.llm.layers.{L}.attn."
+    names = {"wq": "wq_du.weight", "wk": "wk_dv.weight", "wv": "wv_dv.weight",
+             "wr": "wr_du.weight", "wo": "wo_ud.weight",
+             "ksc": "k_sconv.weight", "vsc": "v_sconv.weight",
+             "qn": "q_norm.weight", "kn": "k_norm.weight",
+             "proj": "rel_logits_proj.proj"}
+    w = {key: _disk(idx, base + suffix).to(DEV)
+         for key, suffix in names.items()}
+    qd, kvd = mc.s_q_heads * mc.head_dim, mc.s_kv_heads * mc.head_dim
+    shapes = {"wq": (qd, mc.hidden), "wk": (kvd, mc.hidden),
+              "wv": (kvd, mc.hidden), "wr": (mc.s_q_heads * mc.d_rel,
+                                             mc.hidden),
+              "wo": (mc.hidden, qd), "ksc": (kvd, 1, mc.sconv_k),
+              "vsc": (kvd, 1, mc.sconv_k), "qn": (mc.head_dim,),
+              "kn": (mc.head_dim,), "proj": (mc.d_rel, mc.window)}
+    for key, s in shapes.items():
+        assert w[key].shape == s and w[key].dtype == torch.bfloat16, (
+            key, w[key].shape, w[key].dtype)
+
+    #2. real text config for the native module + mask builder, eager like
+    #   the ref run; layer 0 must be a sliding ("hybrid_sliding") layer
+    tc = AutoConfig.from_pretrained(MODEL_DIR,
+                                    trust_remote_code=True).text_config
+    tc._attn_implementation = "eager"
+    assert tc.layer_types[L] == "hybrid_sliding", tc.layer_types[L]
+    assert tc.sliding_window_size == mc.window
+
+    #3. gate (b): our window mask vs the native builder, bitwise, on the
+    #   exact ref-run call; eager form = {0, finfo.min} only
+    x = tens[f"layers.{L}.self_attn.in"].to(DEV)
+    B, Q = x.shape[0], x.shape[1]
+    pos = torch.arange(Q, device=DEV)
+    mask = pmodel.additive_causal_mask(pos, pos, x.dtype, window=mc.window)
+    nat_mask = create_sliding_window_causal_mask(
+        config=tc, inputs_embeds=x, attention_mask=None,
+        past_key_values=None, position_ids=pos.unsqueeze(0))
+    if not (isinstance(nat_mask, torch.Tensor)
+            and torch.equal(mask, nat_mask)):
+        raise SystemExit("[t_b2 attn_swa] additive_causal_mask(window) != "
+                         "native create_sliding_window_causal_mask (eager)")
+    fmin = torch.finfo(x.dtype).min
+    assert mask.shape == (1, 1, Q, Q) and ((mask == 0) | (mask == fmin)).all()
+
+    def ours(wd, xx, msk, p):
+        #4. our full path (model.attn_prefill), SWA arm: no log scaling
+        return pmodel.attn_prefill(
+            xx, wd["wq"], wd["wk"], wd["wv"], wd["wr"], wd["wo"], wd["ksc"],
+            wd["vsc"], wd["qn"], wd["kn"], wd["proj"], msk, p, p,
+            mc.head_dim, is_global=False, eps=mc.rms_eps)
+
+    #5. gate (a): frozen anchors — every captured internal boundary,
+    #   recomputed as a chain from self_attn.in, then the full path
+    kin, vin = F.linear(x, w["wk"]), F.linear(x, w["wv"])
+    ksc_out = pmodel.sconv_prefill(kin, w["ksc"])
+    vsc_out = pmodel.sconv_prefill(vin, w["vsc"])
+    r_out = F.linear(x, w["wr"])
+    pfx = f"layers.{L}.self_attn."
+    inter = {
+        "k_sconv.in": kin, "v_sconv.in": vin,
+        "k_sconv.out": ksc_out, "v_sconv.out": vsc_out,
+        "r_proj.out": r_out,
+        "q_norm.out": pmodel.rmsnorm(
+            F.linear(x, w["wq"]).view(B, Q, mc.s_q_heads, mc.head_dim),
+            w["qn"], mc.rms_eps),
+        "k_norm.out": pmodel.rmsnorm(
+            ksc_out.view(B, Q, mc.s_kv_heads, mc.head_dim),
+            w["kn"], mc.rms_eps),
+        "rel_logits_proj.out": pmodel.rel_bias(
+            r_out.view(B, Q, mc.s_q_heads, mc.d_rel), w["proj"], pos, pos),
+    }
+    n_bit_inter = 0
+    for name, got_i in inter.items():
+        want_i = tens[pfx + name].to(DEV)
+        assert got_i.shape == want_i.shape, (name, got_i.shape)
+        re_i = _rel_err(got_i, want_i)
+        if re_i >= 1e-2:
+            raise SystemExit(f"[t_b2 attn_swa] internal anchor {name} "
+                             f"rel err {re_i:.3e} >= 1e-2")
+        n_bit_inter += torch.equal(got_i, want_i)
+    got = ours(w, x, mask, pos)
+    want = tens[pfx + "out"].to(DEV)
+    assert got.shape == want.shape == (B, Q, mc.hidden), got.shape
+    assert got.dtype == torch.bfloat16
+    re_full = _rel_err(got, want)
+    if re_full >= 1e-2:
+        raise SystemExit(f"[t_b2 attn_swa] full-path anchor rel err "
+                         f"{re_full:.3e} >= 1e-2")
+    bit_full = torch.equal(got, want)
+
+    def build_native(wd):
+        #6. the reference module itself: construct on GPU, eval mode, ref
+        #   dtype policy (bf16 module, fp32 sconv convs), real/random weights
+        with torch.device(DEV):
+            mod = InklingAttention(tc, L)
+        mod.eval()
+        pnames = {n for n, _ in mod.named_parameters()}
+        assert pnames == {"q_proj.weight", "k_proj.weight", "v_proj.weight",
+                          "r_proj.weight", "o_proj.weight", "q_norm.weight",
+                          "k_norm.weight", "rel_logits_proj.proj",
+                          "k_sconv.conv1d.weight",
+                          "v_sconv.conv1d.weight"}, pnames
+        for sub in (mod.q_proj, mod.k_proj, mod.v_proj, mod.r_proj,
+                    mod.o_proj, mod.q_norm, mod.k_norm, mod.rel_logits_proj):
+            sub.to(torch.bfloat16)
+        assert mod.k_sconv.conv1d.weight.dtype == torch.float32
+        assert mod.k_sconv.conv1d.bias is None
+        with torch.no_grad():
+            mod.q_proj.weight.copy_(wd["wq"])
+            mod.k_proj.weight.copy_(wd["wk"])
+            mod.v_proj.weight.copy_(wd["wv"])
+            mod.r_proj.weight.copy_(wd["wr"])
+            mod.o_proj.weight.copy_(wd["wo"])
+            mod.q_norm.weight.copy_(wd["qn"])
+            mod.k_norm.weight.copy_(wd["kn"])
+            mod.rel_logits_proj.proj.copy_(wd["proj"])
+            mod.k_sconv.conv1d.weight.copy_(wd["ksc"].float())
+            mod.v_sconv.conv1d.weight.copy_(wd["vsc"].float())
+        assert mod.is_sliding and mod.sliding_window == mc.window
+        assert mod.scaling == 1.0 / mc.head_dim
+        assert mod.rel_extent == mc.window
+        assert mod.num_key_value_heads == mc.s_kv_heads
+        return mod
+
+    #7. gate (c): torch.equal vs the native module, real + random weights;
+    #   T 600 > 512 exercises the beyond-window arm on both weight sets
+    w_rand = {key: torch.randn(shapes[key], device=DEV).to(torch.bfloat16)
+              for key in shapes}
+    mods = {"real": build_native(w), "rand": build_native(w_rand)}
+
+    def rnd(b, t):
+        return torch.randn(b, t, mc.hidden, device=DEV).to(torch.bfloat16)
+
+    x600 = rnd(1, 600)
+    cases = (("real", x, "ref-x"), ("real", rnd(1, 1), "T1"),
+             ("real", x600, "T600"), ("rand", rnd(2, 4), "B2T4"),
+             ("rand", rnd(1, 13), "T13"), ("rand", rnd(1, 600), "T600"))
+    n_cross = el_cross = 0
+    for wkey, xx, tag in cases:
+        T = xx.shape[1]
+        p = torch.arange(T, device=DEV)
+        m = pmodel.additive_causal_mask(p, p, xx.dtype, window=mc.window)
+        got_c = ours(w if wkey == "real" else w_rand, xx, m, p)
+        with torch.no_grad():
+            nat, _ = mods[wkey](hidden_states=xx, attention_mask=m,
+                                conv_mask=None, past_key_values=None)
+        if not torch.equal(got_c, nat):
+            raise SystemExit(f"[t_b2 attn_swa] not bit-exact vs native "
+                             f"module: {wkey}/{tag}")
+        n_cross += 1
+        el_cross += got_c.numel()
+
+    #8. gate (d): causality on the frozen input — perturb one token
+    t = 7
+    x2 = x.clone()
+    x2[0, t] += 1.0
+    o2 = ours(w, x2, mask, pos)
+    if not torch.equal(got[:, :t], o2[:, :t]):
+        raise SystemExit("[t_b2 attn_swa] non-causal: perturbing token "
+                         f"{t} changed earlier outputs")
+    if torch.equal(got[:, t:], o2[:, t:]):
+        raise SystemExit(f"[t_b2 attn_swa] perturbing token {t} had no "
+                         f"effect from {t} on")
+
+    #9. gate (e): window cutoff at T 600 through the full path. Perturbing
+    #   x[tw] changes keys/values tw..tw+sconv_k-1 (window-4 sconv smear,
+    #   B2.5); the last query that can see key tw+3 sits at distance
+    #   window-1 past it, so queries >= tw + window + sconv_k - 1 must be
+    #   BIT-identical, while the direct window edge tw + window - 1 (its
+    #   key tw changed in-window) must move
+    tw = 37
+    cut = tw + mc.window + mc.sconv_k - 1   # 37 + 512 + 3 = 552 < 600
+    p600 = torch.arange(600, device=DEV)
+    m600 = pmodel.additive_causal_mask(p600, p600, x600.dtype,
+                                       window=mc.window)
+    base_o = ours(w, x600, m600, p600)
+    xp = x600.clone()
+    xp[0, tw] += 1.0
+    pert_o = ours(w, xp, m600, p600)
+    col_diff = (base_o != pert_o).any(-1)[0]   # per query position
+    if col_diff[:tw].any():
+        raise SystemExit("[t_b2 attn_swa] non-causal at T600: queries "
+                         f"before {tw} changed")
+    if not (col_diff[tw] and col_diff[tw + mc.window - 1]):
+        raise SystemExit("[t_b2 attn_swa] perturbation invisible at token "
+                         f"{tw} or window edge {tw + mc.window - 1}")
+    if col_diff[cut:].any():
+        raise SystemExit(f"[t_b2 attn_swa] window leak: queries >= {cut} "
+                         f"(= {tw} + window + sconv_k - 1) saw token {tw}")
+
+    #10. summary line = the test's green evidence
+    print(f"attn_swa ok: layer-0 frozen anchors — full path rel err "
+          f"{re_full:.1e} < 1e-2 (bit-exact {bit_full}), {len(inter)} "
+          f"internals (k/v_proj+sconv, r_proj, q/k_norm, rel_bias ext512) "
+          f"< 1e-2, bit-exact {n_bit_inter}/{len(inter)}; window mask "
+          f"bit-equal native create_sliding_window_causal_mask (eager "
+          f"0/finfo.min); native-module cross-check bit-exact "
+          f"{n_cross}/{len(cases)} cases ({el_cross} els; real+random "
+          f"weights, T {{1,4,13,600}} incl. 600>window, batch 2); "
+          f"causality bit-checked; window cutoff exact at T600 (edge "
+          f"{tw}+{mc.window - 1} moves, queries >= {tw}+{mc.window}+"
+          f"{mc.sconv_k}-1 bit-identical, k/v sconv smear accounted)")
+
+
 def _todo(item):
     def f():
         raise SystemExit(f"[t_b2] not implemented — that is item {item}'s job")
@@ -1019,7 +1259,7 @@ def main():
     cmds = {"ref": t_ref,
             "embed": t_embed, "rmsnorm": t_rmsnorm,
             "relbias": t_relbias, "sconv": t_sconv,
-            "attn_global": t_attn_global, "attn_swa": _todo("B2.7"),
+            "attn_global": t_attn_global, "attn_swa": t_attn_swa,
             "gate": _todo("B2.8"), "moe": _todo("B2.9"),
             "dense": _todo("B2.10"), "logits": _todo("B2.11")}
     usage = f"usage: python -m engine.pyengine.tests.t_b2 {{{'|'.join(cmds)}}}"

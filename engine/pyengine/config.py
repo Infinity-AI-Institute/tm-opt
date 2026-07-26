@@ -36,6 +36,7 @@ def load_verified(model_dir: str) -> ModelConfig:
         "vocab_size": mc.vocab, "sliding_window_size": mc.window,
         "num_attention_heads": mc.g_q_heads, "num_key_value_heads": mc.g_kv_heads,
         "swa_num_key_value_heads": mc.s_kv_heads, "head_dim": mc.head_dim,
+        "swa_num_attention_heads": mc.s_q_heads, "swa_head_dim": mc.head_dim,
         "n_routed_experts": mc.n_experts, "num_experts_per_tok": mc.topk,
         "intermediate_size": mc.expert_ffn, "dense_mlp_idx": mc.dense_idx,
         "rms_norm_eps": mc.rms_eps,
