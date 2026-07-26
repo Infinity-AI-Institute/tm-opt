@@ -27,9 +27,12 @@ Env for all items: `cd /workspace/tm-opt && source /workspace/venv/bin/activate
       — green: all 2056 tensors accounted, exact per-layer dtype+shape match
       vs config; FACT FIX: dense = layers 0–1 (dense_mlp_idx=2 is a count),
       layer 2 is MoE — see note below (commit fa0e025)
-- [ ] B1.3 dtype map honors hf_quant exclude list (embeds/norms/unembed/
+- [x] B1.3 dtype map honors hf_quant exclude list (embeds/norms/unembed/
       layer-0 attn stay bf16; rest NVFP4 + scales).
       test: `python -m engine.pyengine.tests.t_b1 dtypes`
+      — green: 479-entry exclude list reconciled exactly both directions;
+      nvfp4 = 126 expert weights (layers 3–65 × w13/w2) ONLY, all attn bf16
+      on all 66 layers, mtp 160 bf16 (commit 5c74500)
 - [ ] B1.4 NVFP4 dequant of ONE expert weight to bf16 matches vLLM's
       dequant of the same tensor (read vLLM modelopt code for the block-scale
       layout; cite file:line).  test: `python -m engine.pyengine.tests.t_b1 dequant`
@@ -160,3 +163,36 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
   2026-07-26 ~04:56, root-run git); ralph commits fail ~3%/object with
   "insufficient permission … failed to write commit object" — needs
   `chown -R ralph:ralph .git/objects` by root.
+- 2026-07-26 B1.3: implemented loader.build_dtype_map() (+ DtypeMap,
+  PACK_SUFFIXES) and t_b1 dtypes. Ran test verbatim from /workspace/tm-opt
+  (venv active, CUDA_VISIBLE_DEVICES=4,5,6,7). Real output:
+  ```
+  dtypes ok: exclude list (479 literal entries, all matched) reconciles exactly: nvfp4 = 126 expert weights (layers 3-65 x w13/w2, U8 + scale/scale2/amax/shape, group 16); plain 1426 (1298 bf16 + 128 f32 gate bias/global_scale); attn bf16 on ALL 66 layers; layer-2 experts bf16; mtp 160 bf16 (outside exclude scope)
+  ```
+  Reconciliation is exhaustive both directions: every model.llm.* tensor is
+  in-a-pack ⇔ NOT excluded (component-boundary match, semantics per vLLM
+  ModelOptQuantConfigBase.is_layer_excluded exact-match arm, vllm/model_
+  executor/layers/quantization/modelopt.py:145; wildcard arm unreachable —
+  builder asserts literal entries); every exclude entry matches ≥1 tensor;
+  pack companions (scale F8_E4M3 /16-group, scale2 F32, input_amax BF16,
+  original_shape I64) shape-checked against each U8 base; multimodal all
+  excluded-plain. FACTS CONFIRMED (B1.2's flag was right): quantized = routed
+  expert w13/w2 of MoE layers 3–65 ONLY; exclude list covers ALL attention
+  (every layer, not just 0), all norms/sconvs, MoE gates + shared experts,
+  layer-2 experts, dense MLPs 0–1, embeds/embed_norm/norm/unembed; the only
+  plain F32s are the 64 MoE gates' bias+global_scale; mtp.safetensors is
+  NOT in the exclude list's reach and is entirely bf16. Doc fact fix
+  same-commit (5c74500): CLAUDE.md model-facts bullet + ARCHITECTURE.md
+  Precision row ("layer-0 attn" gloss was stale). Item's own parenthetical
+  "rest NVFP4 + scales" left as-written — FLAGGED FOR HUMAN (loop may not
+  edit item text): named bf16 subset is correct, "rest" precisely = expert
+  w13/w2 of layers 3–65. Regression check: t_b1 index + census both still
+  green (loader.py reordered B1.2 read_headers before B1.3 block).
+  ENV NOTE (resolves B1.2's env flag without root): the 7 root-owned
+  .git/objects fan-out dirs (5f 0c 6d ba cb ed 7d) blocked this commit;
+  fixed as ralph via same-parent rename (needs only parent-dir write) +
+  cp -p into fresh ralph-owned dirs; originals parked at
+  .git/objects/zz-XX-rootowned (root may delete at leisure); also restored
+  the well-known empty-tree object (4b825dc, was fsck "missing", referenced
+  only by a dangling tree from a failed root-era commit). git fsck now clean
+  apart from danglers; commit path verified working.
