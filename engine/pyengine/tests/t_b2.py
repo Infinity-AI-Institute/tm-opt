@@ -1447,6 +1447,366 @@ def t_gate():
           f"bias/global_scale downcast exact={down_exact})")
 
 
+def t_moe():
+    """B2.9: MoE expert GEMMs + 2 shared (sink) experts (model.moe_experts /
+    moe_shared / moe) match the ref layer out. Gates:
+      (a) frozen anchors — all three sparse ref layers {2,5,6}: replay the
+          captured mlp.experts.in (flat tokens) with the CAPTURED router
+          outputs through moe_experts vs mlp.experts.out; the captured
+          shared_experts.in + shared_gammas through moe_shared vs
+          shared_experts.out; and the whole block from mlp.in (real gate
+          weights, bf16 like the ref load — B2.8) through model.moe vs
+          mlp.out (the item's 'ref layer out'): rel err < 1e-2 each (B2
+          header budget), bit-exactness reported; composition pinned
+          bitwise (moe == routed.view + shared). Layer-2 experts load bf16
+          straight from shards; layers 5/6 are NVFP4 -> loader.dequant_nvfp4
+          (B1.4, bit-exact vs vLLM) + the Interleave(dim=1) de-interleave
+          proven vs HF's own conversion on layer-2 bf16 experts in B2.1 —
+          the same repair the ref run itself used. The routed/full anchors
+          are NOT expected bit-exact: the ref run's from_pretrained
+          dispatched InklingExperts to "grouped_mm" (torch._grouped_mm —
+          modeling_utils.py:2100 defaults it when no kwarg is passed and
+          _grouped_mm_can_dispatch :2113 passes), same math, different
+          accumulation order; provenance is PINNED in (b);
+      (b) native-module cross-check — the ACTUAL transformers InklingMoE
+          (InklingTopkRouter + InklingExperts + InklingSharedExperts)
+          in-process, all bf16 like the ref run (experts are NOT in
+          _keep_in_fp32_modules_strict :610; standalone dispatch falls back
+          to the eager loop, integrations/moe.py:497-509), torch.equal
+          REQUIRED: FIRST the capture-provenance pin — the native experts
+          under forced "grouped_mm" dispatch must reproduce the frozen
+          layer-2 experts.out BIT-exactly (proving the (a) deltas are
+          exactly the kernel difference) — then eager-dispatch cases: real
+          layer-2 weights on the frozen mlp.in + random inputs (T 57,
+          batch 2), and a small random config (hidden 512, 8 experts,
+          ffn 96, same top-6/2-shared) on random weights (T 600, batch 2);
+      (c) structural — crafted one-chooser-per-expert routing reproduces
+          each token's single-expert chain (batch-1 GEMMs) bit-exactly with
+          the routing weight applied AFTER down_proj; zero routing weights /
+          zero gammas give exact zero outputs; perturbing an expert NO
+          token chose leaves routed out bit-identical (sparsity honesty);
+          joint slot permutation is a bitwise no-op; an independent fp64
+          replay (per-token python loop, no index_add/bmm) of routed,
+          shared, and the full block agrees < 1e-2."""
+    import copy
+    from transformers import AutoConfig
+    from transformers.models.inkling.modeling_inkling import InklingMoE
+    torch.manual_seed(0)
+    F = torch.nn.functional
+    tens, meta, _ = _load_refs()
+    mc = pcfg.load_verified(MODEL_DIR)
+    idx = loader.build_shard_index(MODEL_DIR)
+    hdr = loader.read_headers(idx)
+    dm = loader.build_dtype_map(idx, hdr)
+
+    def deint3(t):
+        #1. Interleave(dim=1) on a 3D expert stack == the per-expert row
+        #   de-interleave _deinterleave_rows (proven bitwise vs HF's own
+        #   Interleave on layer-2 experts in B2.1)
+        E, r, c = t.shape
+        return t.reshape(E, r // 2, 2, c).transpose(1, 2).reshape(E, r, c)
+
+    def load_expert_weights(L):
+        #2. full expert stacks on the GPU in the module layout: gate_up
+        #   [256, 2*ffn, hidden] de-interleaved rows, down [256, hidden,
+        #   ffn]. Layer 2 is the bf16-stored MoE layer; layers 5/6 are
+        #   NVFP4 packs -> B1.4 dequant per expert (bounded workspace),
+        #   exactly like the ref run's own repair (t_ref step 7)
+        base = f"model.llm.layers.{L}.mlp.experts."
+        if hdr[base + "w13_weight"][0] == "BF16":
+            w13 = _disk(idx, base + "w13_weight").to(DEV)
+            gu = deint3(w13)
+            assert torch.equal(gu[1], _deinterleave_rows(w13[1]))
+            del w13
+            w2 = _disk(idx, base + "w2_weight").to(DEV)
+        else:
+            gu = torch.empty(mc.n_experts, 2 * mc.expert_ffn, mc.hidden,
+                             dtype=torch.bfloat16, device=DEV)
+            w2 = torch.empty(mc.n_experts, mc.hidden, mc.expert_ffn,
+                             dtype=torch.bfloat16, device=DEV)
+            for wname, dst, deint in (("w13_weight", gu, True),
+                                      ("w2_weight", w2, False)):
+                packed = _disk(idx, base + wname)
+                scale = _disk(idx, base + wname + ".scale")
+                scale2 = _disk(idx, base + wname + ".scale2").to(DEV)
+                for e in range(mc.n_experts):
+                    deq = loader.dequant_nvfp4(
+                        packed[e].to(DEV), scale[e].to(DEV), scale2[e],
+                        dm.group_size)
+                    dst[e] = _deinterleave_rows(deq) if deint else deq
+        assert gu.shape == (mc.n_experts, 2 * mc.expert_ffn, mc.hidden)
+        assert w2.shape == (mc.n_experts, mc.hidden, mc.expert_ffn)
+        assert gu.dtype == w2.dtype == torch.bfloat16
+        return gu, w2
+
+    def load_shared_weights(L):
+        #3. shared sink experts: shared_w13 interleaved rows ->
+        #   Interleave(dim=1) + Chunk(dim=1) -> gate/up [2, ffn, hidden];
+        #   shared_w2 = down [2, hidden, ffn] (conversion_mapping.py
+        #   "inkling_mm_model")
+        base = f"model.llm.layers.{L}.mlp.shared_experts."
+        w13 = _disk(idx, base + "shared_w13_weight").to(DEV)
+        assert w13.shape == (mc.n_shared, 2 * mc.expert_ffn, mc.hidden)
+        g, u = deint3(w13).chunk(2, dim=1)
+        wd = _disk(idx, base + "shared_w2_weight").to(DEV)
+        assert wd.shape == (mc.n_shared, mc.hidden, mc.expert_ffn)
+        return g.contiguous(), u.contiguous(), wd
+
+    #4. gate (a): frozen anchors, layers {2,5,6}; keep layer 2 resident
+    #   for the native cross-check + structural pins, free 5/6 after use
+    layers = (2, 5, 6)
+    anchor_re, n_bit = {}, 0
+    L2W, keep2 = None, None
+    for L in layers:
+        gu, w2 = load_expert_weights(L)
+        shg, shu, shd = load_shared_weights(L)
+        gb = f"model.llm.layers.{L}.mlp.gate."
+        wg = _disk(idx, gb + "weight").to(DEV)
+        b = _disk(idx, gb + "bias").to(DEV).to(torch.bfloat16)
+        gs = _disk(idx, gb + "global_scale").to(DEV).to(torch.bfloat16)
+
+        ti = tens[f"layers.{L}.mlp.gate.topk_indices"].to(DEV)
+        tw = tens[f"layers.{L}.mlp.gate.topk_weights"].to(DEV)
+        sg = tens[f"layers.{L}.mlp.gate.shared_gammas"].to(DEV)
+        xe = tens[f"layers.{L}.mlp.experts.in"].to(DEV)
+        xs = tens[f"layers.{L}.mlp.shared_experts.in"].to(DEV)
+        xm = tens[f"layers.{L}.mlp.in"].to(DEV)
+        #4a. data-flow sanity: experts consume the flattened mlp input,
+        #    shared experts the unflattened residuals (InklingMoE :418-424)
+        assert ti.dtype == torch.int64 and xe.shape == (xm.shape[1], mc.hidden)
+        assert torch.equal(xe, xm.view(-1, mc.hidden))
+        assert torch.equal(xs, xm)
+
+        got_r = pmodel.moe_experts(xe, gu, w2, ti, tw)
+        got_s = pmodel.moe_shared(xs, shg, shu, shd, sg)
+        got_m = pmodel.moe(xm, wg, b, gs, gu, w2, shg, shu, shd,
+                           mc.topk, mc.n_shared, mc.route_scale)
+        assert got_m.dtype == torch.bfloat16 and got_m.shape == xm.shape
+        res = {}
+        for name, g, wkey in (("experts", got_r, f"layers.{L}.mlp.experts.out"),
+                              ("shared", got_s,
+                               f"layers.{L}.mlp.shared_experts.out"),
+                              ("full", got_m, f"layers.{L}.mlp.out")):
+            want = tens[wkey].to(DEV)
+            assert g.shape == want.shape, (L, name, g.shape)
+            res[name] = _rel_err(g, want)
+            if res[name] >= 1e-2:
+                raise SystemExit(f"[t_b2 moe] layer {L} {name} rel err "
+                                 f"{res[name]:.3e} >= 1e-2")
+            n_bit += torch.equal(g, want)
+        anchor_re[L] = res
+        #4b. composition pin: full block == routed.view + shared, bitwise
+        if not torch.equal(got_m, got_r.view(xm.shape) + got_s):
+            raise SystemExit(f"[t_b2 moe] layer {L}: moe() != "
+                             f"routed + shared bitwise")
+        if L == 2:
+            L2W = {"wg": wg, "b": b, "gs": gs, "gu": gu, "w2": w2,
+                   "shg": shg, "shu": shu, "shd": shd}
+            keep2 = (xe, xs, xm, ti, tw, sg, got_r, got_s, got_m)
+        else:
+            del gu, w2, shg, shu, shd, wg, b, gs, got_r, got_s, got_m
+            torch.cuda.empty_cache()
+
+    #5. gate (b): the native InklingMoE in-process, all-bf16 like the ref
+    tc = AutoConfig.from_pretrained(MODEL_DIR,
+                                    trust_remote_code=True).text_config
+    assert tc.hidden_act == "silu"
+    assert tc.moe_intermediate_size == mc.expert_ffn
+    assert tc.n_routed_experts == mc.n_experts
+
+    def build_native(cfg, wd):
+        #5a. construct under a bf16 default dtype (a fp32 InklingMoE at
+        #    full size would waste 54 GiB), eval, copy all 8 params
+        old = torch.get_default_dtype()
+        torch.set_default_dtype(torch.bfloat16)
+        try:
+            with torch.device(DEV):
+                mod = InklingMoE(cfg)
+        finally:
+            torch.set_default_dtype(old)
+        mod.eval()
+        pn = {n for n, _ in mod.named_parameters()}
+        assert pn == {"gate.weight", "gate.global_scale",
+                      "gate.e_score_correction_bias",
+                      "experts.gate_up_proj", "experts.down_proj",
+                      "shared_experts.gate_proj", "shared_experts.up_proj",
+                      "shared_experts.down_proj"}, pn
+        with torch.no_grad():
+            mod.gate.weight.copy_(wd["wg"])
+            mod.gate.e_score_correction_bias.copy_(wd["b"])
+            mod.gate.global_scale.copy_(wd["gs"])
+            mod.experts.gate_up_proj.copy_(wd["gu"])
+            mod.experts.down_proj.copy_(wd["w2"])
+            mod.shared_experts.gate_proj.copy_(wd["shg"])
+            mod.shared_experts.up_proj.copy_(wd["shu"])
+            mod.shared_experts.down_proj.copy_(wd["shd"])
+        for _, p in mod.named_parameters():
+            assert p.dtype == torch.bfloat16
+        return mod
+
+    def ours(xx, wd):
+        return pmodel.moe(xx, wd["wg"], wd["b"], wd["gs"], wd["gu"],
+                          wd["w2"], wd["shg"], wd["shu"], wd["shd"],
+                          mc.topk, mc.n_shared, mc.route_scale)
+
+    def rnd(*shape):
+        return torch.randn(*shape, device=DEV).to(torch.bfloat16)
+
+    #5b. real layer-2 weights. First the capture-provenance pin: the ref
+    #    run's experts ran under "grouped_mm" dispatch (modeling_utils.py
+    #    :2100), so the native module forced onto that path must reproduce
+    #    the frozen experts.out bit-for-bit — proving the routed anchor
+    #    deltas in (a) are exactly the grouped_mm-vs-eager kernel
+    #    difference, not a semantics gap
+    mod_real = build_native(tc, L2W)
+    tc._experts_implementation = "grouped_mm"
+    with torch.no_grad():
+        out_gmm = mod_real.experts(keep2[0], keep2[3], keep2[4])
+    tc._experts_implementation = None
+    if not torch.equal(out_gmm, tens["layers.2.mlp.experts.out"].to(DEV)):
+        raise SystemExit("[t_b2 moe] native grouped_mm dispatch does NOT "
+                         "reproduce the frozen experts capture — provenance "
+                         "assumption broken")
+    #    then the eager-dispatch cross-checks: frozen input + random shapes
+    n_cross = 0
+    for xx, tag in ((keep2[2], "ref-x"), (rnd(1, 57, mc.hidden), "T57"),
+                    (rnd(2, 5, mc.hidden), "B2T5")):
+        got_c = ours(xx, L2W)
+        with torch.no_grad():
+            nat = mod_real(xx)
+        if not torch.equal(got_c, nat):
+            raise SystemExit(f"[t_b2 moe] not bit-exact vs native "
+                             f"InklingMoE: real/{tag}")
+        n_cross += 1
+    del mod_real
+    torch.cuda.empty_cache()
+
+    #5c. small random config: different shapes exercise the same code
+    tcs = copy.deepcopy(tc)
+    tcs.hidden_size, tcs.n_routed_experts = 512, 8
+    tcs.intermediate_size = tcs.moe_intermediate_size = 96
+    ws = {"wg": (torch.randn(8 + mc.n_shared, 512, device=DEV) * 0.05
+                 ).to(torch.bfloat16),
+          "b": (torch.randn(8, device=DEV) * 0.5).to(torch.bfloat16),
+          "gs": torch.tensor([1.625], device=DEV, dtype=torch.bfloat16),
+          "gu": (torch.randn(8, 192, 512, device=DEV) * 0.1
+                 ).to(torch.bfloat16),
+          "w2": (torch.randn(8, 512, 96, device=DEV) * 0.1
+                 ).to(torch.bfloat16),
+          "shg": (torch.randn(mc.n_shared, 96, 512, device=DEV) * 0.1
+                  ).to(torch.bfloat16),
+          "shu": (torch.randn(mc.n_shared, 96, 512, device=DEV) * 0.1
+                  ).to(torch.bfloat16),
+          "shd": (torch.randn(mc.n_shared, 512, 96, device=DEV) * 0.1
+                  ).to(torch.bfloat16)}
+    mod_small = build_native(tcs, ws)
+    for xx, tag in ((torch.randn(1, 600, 512, device=DEV
+                                 ).to(torch.bfloat16), "T600"),
+                    (torch.randn(2, 13, 512, device=DEV
+                                 ).to(torch.bfloat16), "B2T13")):
+        got_c = ours(xx, ws)
+        with torch.no_grad():
+            nat = mod_small(xx)
+        if not torch.equal(got_c, nat):
+            raise SystemExit(f"[t_b2 moe] not bit-exact vs native "
+                             f"InklingMoE: small/{tag}")
+        n_cross += 1
+    del mod_small
+
+    #6. gate (c): structural pins on the layer-2 anchors
+    xe, xs, xm, ti, tw, sg, got_r, got_s, got_m = keep2
+    gu, w2 = L2W["gu"], L2W["w2"]
+    shg, shu, shd = L2W["shg"], L2W["shu"], L2W["shd"]
+    T = xe.shape[0]
+    #6a. zero routing weights / zero gammas -> exact zero outputs
+    if not (pmodel.moe_experts(xe, gu, w2, ti, torch.zeros_like(tw))
+            == 0).all():
+        raise SystemExit("[t_b2 moe] zero routing weights gave nonzero out")
+    if not (pmodel.moe_shared(xs, shg, shu, shd, torch.zeros_like(sg))
+            == 0).all():
+        raise SystemExit("[t_b2 moe] zero gammas gave nonzero shared out")
+    #6b. one-chooser-per-expert routing: expert 6t serves ONLY token t
+    #    (batch-1 GEMM), weight 1.5 on slot 0, 0 elsewhere -> each row must
+    #    equal the manual single-expert chain with the weight applied
+    #    AFTER down_proj, bit-for-bit
+    ti_pin = torch.arange(T * mc.topk, device=DEV,
+                          dtype=torch.int64).view(T, mc.topk)
+    tw_pin = torch.zeros(T, mc.topk, device=DEV, dtype=torch.bfloat16)
+    tw_pin[:, 0] = 1.5
+    got_pin = pmodel.moe_experts(xe, gu, w2, ti_pin, tw_pin)
+    for t in (0, 7, T - 1):
+        e = t * mc.topk
+        g1, u1 = F.linear(xe[t:t + 1], gu[e]).chunk(2, dim=-1)
+        exp = (F.linear(F.silu(g1) * u1, w2[e]) * tw_pin[t, 0]
+               ).to(torch.bfloat16)
+        if not torch.equal(got_pin[t:t + 1], exp):
+            raise SystemExit(f"[t_b2 moe] one-chooser pin: token {t} != "
+                             f"manual expert-{e} chain (weight after down)")
+    #6c. perturbing an expert NO token chose must not move routed out
+    hit = set(ti.flatten().tolist())
+    absent = next(j for j in range(mc.n_experts) if j not in hit)
+    saved = gu[absent].clone()
+    with torch.no_grad():
+        gu[absent] = torch.randn_like(gu[absent].float()).to(torch.bfloat16)
+    if not torch.equal(pmodel.moe_experts(xe, gu, w2, ti, tw), got_r):
+        raise SystemExit(f"[t_b2 moe] perturbing unchosen expert {absent} "
+                         f"moved routed out")
+    with torch.no_grad():
+        gu[absent] = saved
+    assert torch.equal(gu[absent], saved)
+    #6d. joint slot permutation is a no-op (only (expert, weight) pairs
+    #    matter, not slot positions)
+    perm = torch.randperm(mc.topk, device=DEV)
+    if not torch.equal(
+            pmodel.moe_experts(xe, gu, w2, ti[:, perm], tw[:, perm]), got_r):
+        raise SystemExit("[t_b2 moe] slot permutation changed routed out")
+    #6e. independent fp64 replay: per-token loop, explicit weighted sum
+    #    over the 6 chosen experts (weight after down), gammas before down
+    #    on the shared pair, no index_add_/bmm anywhere
+    x64 = xe.double()
+    r64 = torch.zeros(T, mc.hidden, dtype=torch.float64, device=DEV)
+    for t in range(T):
+        for s in range(mc.topk):
+            e = int(ti[t, s])
+            g1 = gu[e, :mc.expert_ffn].double() @ x64[t]
+            u1 = gu[e, mc.expert_ffn:].double() @ x64[t]
+            r64[t] += tw[t, s].double() * (
+                w2[e].double() @ (F.silu(g1) * u1))
+    sh64 = torch.zeros_like(r64)
+    xs64 = xs.double().reshape(-1, mc.hidden)
+    for s in range(mc.n_shared):
+        g1 = xs64 @ shg[s].double().T
+        u1 = xs64 @ shu[s].double().T
+        sh64 += (F.silu(g1) * u1 * sg[:, s].double()[:, None]
+                 ) @ shd[s].double().T
+    re_r64 = _rel_err(got_r, r64)
+    re_s64 = _rel_err(got_s, sh64)
+    re_m64 = _rel_err(got_m.view(-1, mc.hidden), r64 + sh64)
+    if max(re_r64, re_s64, re_m64) >= 1e-2:
+        raise SystemExit(f"[t_b2 moe] fp64 replay disagrees: routed "
+                         f"{re_r64:.3e} shared {re_s64:.3e} full {re_m64:.3e}")
+
+    #7. summary line = the test's green evidence
+    a = anchor_re
+    print(f"moe ok: frozen anchors layers {{2,5,6}} — experts/shared/"
+          f"full-block rel err "
+          f"{a[2]['experts']:.1e}/{a[2]['shared']:.1e}/{a[2]['full']:.1e} | "
+          f"{a[5]['experts']:.1e}/{a[5]['shared']:.1e}/{a[5]['full']:.1e} | "
+          f"{a[6]['experts']:.1e}/{a[6]['shared']:.1e}/{a[6]['full']:.1e} "
+          f"< 1e-2 (bit-exact {n_bit}/9; composition routed+shared bitwise "
+          f"3/3; layers 5/6 via B1.4 nvfp4 dequant + de-interleave); "
+          f"capture provenance PINNED: native grouped_mm dispatch (the ref "
+          f"run's path, modeling_utils.py:2100) reproduces frozen "
+          f"experts.out bit-exactly; native InklingMoE eager cross-check "
+          f"bit-exact {n_cross}/5 cases "
+          f"(real layer-2 weights T {{13,57}} batch 2 + random small-config "
+          f"T {{13,600}}); pins: one-chooser batch-1 chain bit-exact "
+          f"(weight AFTER down_proj), zero-weights/zero-gammas exact zeros, "
+          f"unchosen-expert perturbation invisible, slot-permutation no-op; "
+          f"fp64 replay agrees routed/shared/full "
+          f"{re_r64:.1e}/{re_s64:.1e}/{re_m64:.1e} < 1e-2")
+
+
 def _todo(item):
     def f():
         raise SystemExit(f"[t_b2] not implemented — that is item {item}'s job")
@@ -1459,7 +1819,7 @@ def main():
             "embed": t_embed, "rmsnorm": t_rmsnorm,
             "relbias": t_relbias, "sconv": t_sconv,
             "attn_global": t_attn_global, "attn_swa": t_attn_swa,
-            "gate": t_gate, "moe": _todo("B2.9"),
+            "gate": t_gate, "moe": t_moe,
             "dense": _todo("B2.10"), "logits": _todo("B2.11")}
     usage = f"usage: python -m engine.pyengine.tests.t_b2 {{{'|'.join(cmds)}}}"
     if len(sys.argv) != 2 or sys.argv[1] not in cmds:

@@ -174,6 +174,89 @@ def moe_gate(x, w_gate, bias, global_scale, top_k, n_shared, route_scale):
     return routed_logits, topk_weights, topk_indices, shared_gammas
 
 
+def moe_experts(x, w_gate_up, w_down, topk_indices, topk_weights):
+    """Routed expert GEMMs — exact InklingExperts.forward semantics
+    (transformers models/inkling/modeling_inkling.py:315-339; the
+    use_experts_implementation dispatch falls back to this original loop
+    when no _experts_implementation is configured, integrations/moe.py:497-
+    509 — the ref run's path). x is the FLATTENED token batch [T, hidden]
+    (InklingMoE.forward flattens before the call, :422-423). w_gate_up
+    [E, 2*ffn, hidden] holds DE-INTERLEAVED rows ([gates; ups] halves —
+    the checkpoint's w13 stores interleaved [g0,u0,g1,u1,..] rows;
+    transformers applies Interleave(dim=1) at load, conversion_mapping.py
+    "inkling_mm_model", same de-interleave as vLLM inkling
+    nvidia/moe.py:583-595); w_down [E, hidden, ffn]. Per hit expert in
+    ASCENDING id order (expert_hit = nonzero of the expert-major mask,
+    :323-327): fused gate/up GEMM -> chunk -> silu(gate)*up -> down GEMM
+    -> * that (token, slot)'s routing weight AFTER down_proj (:336) ->
+    index_add_ accumulation in the INPUT dtype (:321, :337). The ascending
+    expert order fixes the bf16 rounding order; a token's slots hold
+    distinct experts (topk positions, B2.8), so within-expert order cannot
+    matter. Grouped-GEMM Triton form is Stage-3 work (D4)."""
+    F = torch.nn.functional
+    #1. accumulator in the input dtype, like the ref (:321)
+    out = torch.zeros_like(x)
+    #2. hit experts in ascending id order (:323-327)
+    for e in torch.unique(topk_indices).tolist():
+        #3. every (token, slot) this expert serves; batch their rows
+        #   (:331-332 — index_add_ makes the within-expert order moot)
+        token_idx, slot = torch.where(topk_indices == e)
+        h = x[token_idx]
+        #4. fused gate/up GEMM, chunk halves, silu * up, down GEMM
+        #   (:333-335; act_fn = silu, config hidden_act)
+        gate, up = F.linear(h, w_gate_up[e]).chunk(2, dim=-1)
+        h = F.linear(F.silu(gate) * up, w_down[e])
+        #5. routing weight AFTER down_proj, accumulate in the input dtype
+        out.index_add_(
+            0, token_idx, (h * topk_weights[token_idx, slot, None]).to(out.dtype))
+    return out
+
+
+def moe_shared(x, w_gate, w_up, w_down, gammas):
+    """The n_shared=2 'sink' experts — exact InklingSharedExperts.forward
+    semantics (modeling_inkling.py:394-405). x keeps its ORIGINAL shape
+    (InklingMoE passes the pre-flatten residuals, :424); gammas
+    [T, n_shared] are the router's shared-slot weights (B2.8). Weights are
+    3D stacks: w_gate/w_up [n_shared, ffn, hidden] (checkpoint
+    shared_w13_weight has interleaved rows -> Interleave(dim=1) +
+    Chunk(dim=1), conversion_mapping.py "inkling_mm_model"), w_down
+    [n_shared, hidden, ffn] (= shared_w2_weight). Unlike the routed path
+    the gamma multiplies act_fn(gate)*up BEFORE down_proj (:401), and the
+    n_shared expert outputs are summed in fp32 then downcast (:404)."""
+    #1. broadcast tokens across the shared experts; gammas to [S, T, 1]
+    shape = x.shape
+    n_shared = w_gate.shape[0]
+    h = x.reshape(1, -1, shape[-1]).expand(n_shared, -1, -1)
+    g = gammas.reshape(-1, n_shared, 1).transpose(0, 1)
+    #2. batched gate/up GEMMs (transpose(1, 2) is a stride view, :399-400);
+    #   gamma scales the activation PRE-down (:401)
+    gate = torch.bmm(h, w_gate.transpose(1, 2))
+    up = torch.bmm(h, w_up.transpose(1, 2))
+    act = torch.nn.functional.silu(gate) * up * g
+    #3. down GEMM, fp32 sum over the shared experts, downcast (:402-405)
+    down = torch.bmm(act, w_down.transpose(1, 2))
+    return down.float().sum(dim=0).to(x.dtype).view(shape)
+
+
+def moe(x, w_gate, bias, global_scale, w_gate_up, w_down, w_sh_gate,
+        w_sh_up, w_sh_down, top_k, n_shared, route_scale):
+    """Full MoE block: router -> routed experts + shared sink experts —
+    exact InklingMoE.forward semantics (modeling_inkling.py:418-425):
+    gate on the unflattened input, routed experts on the flattened tokens,
+    shared experts on the ORIGINAL input, routed + shared added in that
+    order (bf16)."""
+    #1. route (B2.8), flatten tokens for the expert loop (:421-422)
+    _, topk_weights, topk_indices, shared_gammas = moe_gate(
+        x, w_gate, bias, global_scale, top_k, n_shared, route_scale)
+    flat = x.view(-1, x.shape[-1])
+    #2. routed experts on flat tokens, back to the input shape (:423)
+    routed = moe_experts(flat, w_gate_up, w_down, topk_indices,
+                         topk_weights).view(x.shape)
+    #3. + shared experts on the pre-flatten residuals (:424)
+    return routed + moe_shared(x, w_sh_gate, w_sh_up, w_sh_down,
+                               shared_gammas)
+
+
 def attn_prefill(x, wq, wk, wv, wr, wo, w_k_sconv, w_v_sconv, w_q_norm,
                  w_k_norm, rel_proj, attn_mask, q_positions, kv_positions,
                  head_dim, is_global, alpha=None, n_floor=None, eps=1e-6):
