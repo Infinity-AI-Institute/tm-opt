@@ -35,17 +35,25 @@ def plot_workload(rows, lock, workload):
                       key=lambda r: r["iteration"])
     baselines = {r["baseline_id"]: r for r in rows
                  if r.get("workload") == workload and r.get("engine") == "vllm"}
-    if not accepted:
-        print(f"[plot] {workload}: no accepted engine rows yet"); return
+    if not accepted and not baselines:
+        print(f"[plot] {workload}: no rows at all yet"); return
 
     fig, ax = plt.subplots(figsize=(11, 6))
-    xs = [r["iteration"] for r in accepted]
-    ys = [r["tok_per_s"] for r in accepted]
-    ax.plot(xs, ys, "-o", color="#b8860b", lw=2, ms=4, label=f"{workload} — pyengine")
-    #2. milestone dots: annotate every k-th + the last, like the case study
-    for r in accepted[:: max(len(accepted) // 8, 1)] + [accepted[-1]]:
-        ax.annotate(r.get("label", ""), (r["iteration"], r["tok_per_s"]),
-                    textcoords="offset points", xytext=(0, 9), fontsize=7, ha="center")
+    if accepted:
+        xs = [r["iteration"] for r in accepted]
+        ys = [r["tok_per_s"] for r in accepted]
+        ax.plot(xs, ys, "-o", color="#b8860b", lw=2, ms=4, label=f"{workload} — pyengine")
+        #2. milestone dots: annotate every k-th + the last, like the case study
+        for r in accepted[:: max(len(accepted) // 8, 1)] + [accepted[-1]]:
+            ax.annotate(r.get("label", ""), (r["iteration"], r["tok_per_s"]),
+                        textcoords="offset points", xytext=(0, 9), fontsize=7, ha="center")
+    else:
+        #2b. walls-only render: baselines exist, engine not yet — evidence of
+        #    "target painted before the engine took a swing"
+        xs = [0, 1]
+        ax.set_xlim(0, 10)
+        ax.text(0.5, 0.5, "engine iterations pending", transform=ax.transAxes,
+                ha="center", fontsize=10, color="#999")
     #3. dashed baseline lines from vllm iteration-0 rows (MTP off/on)
     for spec in lock["report"]["baseline_lines"]:
         b = baselines.get(spec["id"])
@@ -64,9 +72,20 @@ def plot_workload(rows, lock, workload):
 
 
 def write_iteration_log(rows, lock):
-    lines = ["# ITERATION_LOG.md — generated from experiments/ledger.jsonl. Do not hand-edit.",
-             "", "| iter | workload | label | mechanism | tok/s | vs vLLM | commit | log |",
-             "|---|---|---|---|---|---|---|---|"]
+    lines = ["# ITERATION_LOG.md — generated from experiments/ledger.jsonl. Do not hand-edit.", ""]
+    base = [r for r in rows if r.get("engine") == "vllm"]
+    if base:
+        lines += ["## Baselines (dashed lines)", "",
+                  "| workload | baseline_id | tok/s | noise | measured commit |",
+                  "|---|---|---|---|---|"]
+        for r in sorted(base, key=lambda r: r.get("workload", "")):
+            lines.append(f'| {r.get("workload","")} | {r.get("baseline_id","")} | '
+                         f'{r.get("tok_per_s",0):,.1f} | {r.get("noise_floor_pct","?")}% | '
+                         f'{r.get("commit","")[:7]} |')
+        lines.append("")
+    lines += ["## Iterations", "",
+              "| iter | workload | label | mechanism | tok/s | vs vLLM | commit | log |",
+              "|---|---|---|---|---|---|---|---|"]
     for r in sorted([r for r in rows if r.get("engine", "pyengine") != "vllm"],
                     key=lambda r: (r["iteration"], r.get("workload", ""))):
         mark = "" if r.get("accepted") else " (rejected)"

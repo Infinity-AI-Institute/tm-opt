@@ -113,7 +113,7 @@ peak at conc 512 both workloads, collapse past 512 = KV-capacity edge)
 - Emit cache-key hash (SHA of canonical.json) — every ledger row carries it.
 - **Accept:** two frozen JSON configs + hash committed; sweep data in docs/logs/.
 
-### P2. Goldens + gate validation
+### P2. Goldens + gate validation ✅ 2026-07-26 (Path C goldens sha 74d9776; gate green vs goldens-mode server, delta 0.0; Path B hardening pending)
 - Try NVFP4-in-transformers on GPUs 4–7 first (vLLM may stay up but idle —
   correctness work, not measurement). If transformers can't load NVFP4:
   tear vLLM down, all-8-GPU bf16 reference from /dev/shm staging.
@@ -122,7 +122,7 @@ peak at conc 512 both workloads, collapse past 512 = KV-capacity edge)
 - **Accept:** `python harness/correctness.py --endpoint http://localhost:8106`
   green against goldens.
 
-### P3. Committed baseline
+### P3. Committed baseline ✅ 2026-07-26 (decode 13,409.5 / prefill 4,999.3; iteration-0 ledger rows)
 - benchmark.py full protocol (warmups 2×conc, prompts 5×conc) both workloads
   → `experiments/baseline_vllm.json` committed. This is the wall target.
 - **Accept:** baseline numbers in repo + BASELINE_NOTES updated.
