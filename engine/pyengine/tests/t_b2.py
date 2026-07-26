@@ -799,6 +799,215 @@ def t_sconv():
           f"(no bias), fp32 module math (modeling_inkling.py:500-542)")
 
 
+def t_attn_global():
+    """B2.6: global-attention layer (idx 5) forward, prefill/no-cache form
+    (model.attn_prefill + model.additive_causal_mask) vs the frozen ref
+    slice. Gates:
+      (a) frozen anchors — replay from the captured self_attn.in with the
+          real layer-5 checkpoint weights: full path vs self_attn.out (the
+          o_proj output; attn_sconv sits OUTSIDE the module, decoder forward
+          modeling_inkling.py:584) plus every captured internal boundary
+          (k/v_proj -> k/v_sconv, r_proj, q/k_norm, rel_logits_proj):
+          rel err < 1e-2 (B2 header budget), bit-exactness reported;
+      (b) mask — our additive_causal_mask must equal transformers'
+          create_causal_mask output bit-for-bit on the exact call the ref
+          run made (eager form 0/finfo.min, attention_mask=None,
+          position_ids=arange — InklingTextModel.forward :693-705);
+      (c) native-module cross-check — the ACTUAL transformers
+          InklingAttention (layer_idx 5: global, 64Q/8KV heads, extent 1024,
+          log scaling armed with floor 128000 — tau==1.0 at every tested
+          position per B2.4, but the fp32 round-trip runs) instantiated
+          in-process in eval mode with the ref dtype policy (bf16 module,
+          fp32 sconv convs per _keep_in_fp32_modules_strict :610),
+          torch.equal REQUIRED, on the real frozen input + random inputs
+          T {1,29,600} with real weights and T {4,13} (incl. batch 2) with
+          random weights;
+      (d) structural — causality through the full path: perturbing token t
+          leaves outputs before t bit-identical and changes t onward."""
+    from transformers import AutoConfig
+    from transformers.masking_utils import create_causal_mask
+    from transformers.models.inkling.modeling_inkling import InklingAttention
+    torch.manual_seed(0)
+    F = torch.nn.functional
+    tens, meta, _ = _load_refs()
+    mc = pcfg.load_verified(MODEL_DIR)
+    idx = loader.build_shard_index(MODEL_DIR)
+    L = 5
+
+    #1. layer-5 attention weights from shards, shapes pinned vs config
+    base = f"model.llm.layers.{L}.attn."
+    names = {"wq": "wq_du.weight", "wk": "wk_dv.weight", "wv": "wv_dv.weight",
+             "wr": "wr_du.weight", "wo": "wo_ud.weight",
+             "ksc": "k_sconv.weight", "vsc": "v_sconv.weight",
+             "qn": "q_norm.weight", "kn": "k_norm.weight",
+             "proj": "rel_logits_proj.proj"}
+    w = {key: _disk(idx, base + suffix).to(DEV)
+         for key, suffix in names.items()}
+    qd, kvd = mc.g_q_heads * mc.head_dim, mc.g_kv_heads * mc.head_dim
+    shapes = {"wq": (qd, mc.hidden), "wk": (kvd, mc.hidden),
+              "wv": (kvd, mc.hidden), "wr": (mc.g_q_heads * mc.d_rel,
+                                             mc.hidden),
+              "wo": (mc.hidden, qd), "ksc": (kvd, 1, mc.sconv_k),
+              "vsc": (kvd, 1, mc.sconv_k), "qn": (mc.head_dim,),
+              "kn": (mc.head_dim,), "proj": (mc.d_rel, mc.rel_extent)}
+    for key, s in shapes.items():
+        assert w[key].shape == s and w[key].dtype == torch.bfloat16, (
+            key, w[key].shape, w[key].dtype)
+
+    #2. real text config for the native module + mask builder, eager like
+    #   the ref run; layer 5 must be a global ("hybrid") layer
+    tc = AutoConfig.from_pretrained(MODEL_DIR,
+                                    trust_remote_code=True).text_config
+    tc._attn_implementation = "eager"
+    assert tc.layer_types[L] == "hybrid", tc.layer_types[L]
+    assert tc.log_scaling_n_floor == mc.log_floor
+
+    #3. gate (b): our mask vs the native builder, bitwise, on the exact
+    #   ref-run call; eager form = {0, finfo.min} only
+    x = tens[f"layers.{L}.self_attn.in"].to(DEV)
+    B, Q = x.shape[0], x.shape[1]
+    pos = torch.arange(Q, device=DEV)
+    mask = pmodel.additive_causal_mask(pos, pos, x.dtype)
+    nat_mask = create_causal_mask(config=tc, inputs_embeds=x,
+                                  attention_mask=None, past_key_values=None,
+                                  position_ids=pos.unsqueeze(0))
+    if not (isinstance(nat_mask, torch.Tensor)
+            and torch.equal(mask, nat_mask)):
+        raise SystemExit("[t_b2 attn_global] additive_causal_mask != native "
+                         "create_causal_mask (eager)")
+    fmin = torch.finfo(x.dtype).min
+    assert mask.shape == (1, 1, Q, Q) and ((mask == 0) | (mask == fmin)).all()
+
+    def ours(wd, xx, msk, p):
+        #4. our full path (model.attn_prefill), global-layer arm
+        return pmodel.attn_prefill(
+            xx, wd["wq"], wd["wk"], wd["wv"], wd["wr"], wd["wo"], wd["ksc"],
+            wd["vsc"], wd["qn"], wd["kn"], wd["proj"], msk, p, p,
+            mc.head_dim, is_global=True, alpha=mc.log_alpha,
+            n_floor=mc.log_floor, eps=mc.rms_eps)
+
+    #5. gate (a): frozen anchors — every captured internal boundary,
+    #   recomputed as a chain from self_attn.in, then the full path
+    kin, vin = F.linear(x, w["wk"]), F.linear(x, w["wv"])
+    ksc_out = pmodel.sconv_prefill(kin, w["ksc"])
+    vsc_out = pmodel.sconv_prefill(vin, w["vsc"])
+    r_out = F.linear(x, w["wr"])
+    pfx = f"layers.{L}.self_attn."
+    inter = {
+        "k_sconv.in": kin, "v_sconv.in": vin,
+        "k_sconv.out": ksc_out, "v_sconv.out": vsc_out,
+        "r_proj.out": r_out,
+        "q_norm.out": pmodel.rmsnorm(
+            F.linear(x, w["wq"]).view(B, Q, mc.g_q_heads, mc.head_dim),
+            w["qn"], mc.rms_eps),
+        "k_norm.out": pmodel.rmsnorm(
+            ksc_out.view(B, Q, mc.g_kv_heads, mc.head_dim),
+            w["kn"], mc.rms_eps),
+        "rel_logits_proj.out": pmodel.rel_bias(
+            r_out.view(B, Q, mc.g_q_heads, mc.d_rel), w["proj"], pos, pos),
+    }
+    n_bit_inter = 0
+    for name, got_i in inter.items():
+        want_i = tens[pfx + name].to(DEV)
+        assert got_i.shape == want_i.shape, (name, got_i.shape)
+        re_i = _rel_err(got_i, want_i)
+        if re_i >= 1e-2:
+            raise SystemExit(f"[t_b2 attn_global] internal anchor {name} "
+                             f"rel err {re_i:.3e} >= 1e-2")
+        n_bit_inter += torch.equal(got_i, want_i)
+    got = ours(w, x, mask, pos)
+    want = tens[pfx + "out"].to(DEV)
+    assert got.shape == want.shape == (B, Q, mc.hidden), got.shape
+    assert got.dtype == torch.bfloat16
+    re_full = _rel_err(got, want)
+    if re_full >= 1e-2:
+        raise SystemExit(f"[t_b2 attn_global] full-path anchor rel err "
+                         f"{re_full:.3e} >= 1e-2")
+    bit_full = torch.equal(got, want)
+
+    def build_native(wd):
+        #6. the reference module itself: construct on GPU, eval mode, ref
+        #   dtype policy (bf16 module, fp32 sconv convs), real/random weights
+        with torch.device(DEV):
+            mod = InklingAttention(tc, L)
+        mod.eval()
+        pnames = {n for n, _ in mod.named_parameters()}
+        assert pnames == {"q_proj.weight", "k_proj.weight", "v_proj.weight",
+                          "r_proj.weight", "o_proj.weight", "q_norm.weight",
+                          "k_norm.weight", "rel_logits_proj.proj",
+                          "k_sconv.conv1d.weight",
+                          "v_sconv.conv1d.weight"}, pnames
+        for sub in (mod.q_proj, mod.k_proj, mod.v_proj, mod.r_proj,
+                    mod.o_proj, mod.q_norm, mod.k_norm, mod.rel_logits_proj):
+            sub.to(torch.bfloat16)
+        assert mod.k_sconv.conv1d.weight.dtype == torch.float32
+        assert mod.k_sconv.conv1d.bias is None
+        with torch.no_grad():
+            mod.q_proj.weight.copy_(wd["wq"])
+            mod.k_proj.weight.copy_(wd["wk"])
+            mod.v_proj.weight.copy_(wd["wv"])
+            mod.r_proj.weight.copy_(wd["wr"])
+            mod.o_proj.weight.copy_(wd["wo"])
+            mod.q_norm.weight.copy_(wd["qn"])
+            mod.k_norm.weight.copy_(wd["kn"])
+            mod.rel_logits_proj.proj.copy_(wd["proj"])
+            mod.k_sconv.conv1d.weight.copy_(wd["ksc"].float())
+            mod.v_sconv.conv1d.weight.copy_(wd["vsc"].float())
+        assert not mod.is_sliding and mod.sliding_window is None
+        assert mod.scaling == 1.0 / mc.head_dim
+        assert mod.rel_extent == mc.rel_extent
+        return mod
+
+    #7. gate (c): torch.equal vs the native module, real + random weights
+    w_rand = {key: torch.randn(shapes[key], device=DEV).to(torch.bfloat16)
+              for key in shapes}
+    mods = {"real": build_native(w), "rand": build_native(w_rand)}
+
+    def rnd(b, t):
+        return torch.randn(b, t, mc.hidden, device=DEV).to(torch.bfloat16)
+
+    cases = (("real", x, "ref-x"), ("real", rnd(1, 1), "T1"),
+             ("real", rnd(1, 29), "T29"), ("real", rnd(1, 600), "T600"),
+             ("rand", rnd(2, 4), "B2T4"), ("rand", rnd(1, 13), "T13"))
+    n_cross = el_cross = 0
+    for wkey, xx, tag in cases:
+        T = xx.shape[1]
+        p = torch.arange(T, device=DEV)
+        m = pmodel.additive_causal_mask(p, p, xx.dtype)
+        got_c = ours(w if wkey == "real" else w_rand, xx, m, p)
+        with torch.no_grad():
+            nat, _ = mods[wkey](hidden_states=xx, attention_mask=m,
+                                conv_mask=None, past_key_values=None)
+        if not torch.equal(got_c, nat):
+            raise SystemExit(f"[t_b2 attn_global] not bit-exact vs native "
+                             f"module: {wkey}/{tag}")
+        n_cross += 1
+        el_cross += got_c.numel()
+
+    #8. gate (d): causality through the full path — perturb one token
+    t = 7
+    x2 = x.clone()
+    x2[0, t] += 1.0
+    o2 = ours(w, x2, mask, pos)
+    if not torch.equal(got[:, :t], o2[:, :t]):
+        raise SystemExit("[t_b2 attn_global] non-causal: perturbing token "
+                         f"{t} changed earlier outputs")
+    if torch.equal(got[:, t:], o2[:, t:]):
+        raise SystemExit(f"[t_b2 attn_global] perturbing token {t} had no "
+                         f"effect from {t} on")
+
+    #9. summary line = the test's green evidence
+    print(f"attn_global ok: layer-5 frozen anchors — full path rel err "
+          f"{re_full:.1e} < 1e-2 (bit-exact {bit_full}), {len(inter)} "
+          f"internals (k/v_proj+sconv, r_proj, q/k_norm, rel_bias) < 1e-2, "
+          f"bit-exact {n_bit_inter}/{len(inter)}; mask bit-equal native "
+          f"create_causal_mask (eager 0/finfo.min); native-module "
+          f"cross-check bit-exact {n_cross}/{len(cases)} cases "
+          f"({el_cross} els; real+random weights, T {{1,4,13,29,600}}, "
+          f"batch 2); causality bit-checked through full path; tau==1.0 at "
+          f"all tested positions (scaling armed, floor {mc.log_floor})")
+
+
 def _todo(item):
     def f():
         raise SystemExit(f"[t_b2] not implemented — that is item {item}'s job")
@@ -810,7 +1019,7 @@ def main():
     cmds = {"ref": t_ref,
             "embed": t_embed, "rmsnorm": t_rmsnorm,
             "relbias": t_relbias, "sconv": t_sconv,
-            "attn_global": _todo("B2.6"), "attn_swa": _todo("B2.7"),
+            "attn_global": t_attn_global, "attn_swa": _todo("B2.7"),
             "gate": _todo("B2.8"), "moe": _todo("B2.9"),
             "dense": _todo("B2.10"), "logits": _todo("B2.11")}
     usage = f"usage: python -m engine.pyengine.tests.t_b2 {{{'|'.join(cmds)}}}"

@@ -105,3 +105,79 @@ def apply_log_scaling(query_states, position_bias, q_positions, alpha,
     q = (query_states.float() * tau).to(query_states.dtype)
     b = (position_bias.float() * tau).to(position_bias.dtype)
     return q, b
+
+
+def additive_causal_mask(q_positions, kv_positions, dtype, window=None):
+    """Additive attention mask in transformers' eager form
+    (masking_utils.py eager_mask: 0.0 where the (q, k) pair takes part,
+    torch.finfo(dtype).min where it does not; shape [1, 1, Q, K] — the
+    batch axis broadcasts; no padding in text-only v1 scope). Allowed =
+    causal (causal_mask_function: kv_pos <= q_pos) AND, when `window` is
+    given, inside the sliding window (sliding_window_overlay:
+    kv_pos > q_pos - window, i.e. distance < window). Pure selection
+    between the two eager constants — no arithmetic — so the tensor is
+    bitwise identical to the native builder's."""
+    #1. backward distance per (q, k) pair
+    d = q_positions[:, None] - kv_positions[None, :]
+    #2. in-window causal predicate
+    allowed = d >= 0
+    if window is not None:
+        allowed &= d < window
+    #3. select the two eager constants, add leading [1, 1] broadcast axes
+    zero = torch.zeros((), dtype=dtype, device=allowed.device)
+    return torch.where(allowed, zero, torch.finfo(dtype).min)[None, None]
+
+
+def attn_prefill(x, wq, wk, wv, wr, wo, w_k_sconv, w_v_sconv, w_q_norm,
+                 w_k_norm, rel_proj, attn_mask, q_positions, kv_positions,
+                 head_dim, is_global, alpha=None, n_floor=None, eps=1e-6):
+    """One attention layer, PREFILL (no-cache) form — exact InklingAttention
+    semantics (transformers models/inkling/modeling_inkling.py:217-282 with
+    eager_attention_forward :157-182). Both layer shapes run through here:
+    global (64Q/8KV heads, rel extent 1024, log scaling) and SWA (64Q/16KV,
+    extent = window 512, no scaling) differ only in weights, mask and
+    `is_global`. x [B, T, C] is the POST-input_layernorm hidden state;
+    attn_mask is the additive eager mask (additive_causal_mask). Scaling is
+    1/head_dim, not 1/sqrt, because q/k are per-head RMS-normalized
+    (:197-198). No biases anywhere. The decode form (cached KV + sconv ring
+    state) is B3's job; fused kernels are Stage-3 work (D4)."""
+    F = torch.nn.functional
+    B, T = x.shape[0], x.shape[1]
+    n_heads, n_kv = wq.shape[0] // head_dim, wk.shape[0] // head_dim
+    #1. projections (:228-231); K and V pass their window-4 sconv first
+    q = F.linear(x, wq)
+    k = sconv_prefill(F.linear(x, wk), w_k_sconv)
+    v = sconv_prefill(F.linear(x, wv), w_v_sconv)
+    r = F.linear(x, wr)
+    #2. per-head q/k rmsnorm over head_dim, then [B,T,H,D] -> [B,H,T,D]
+    #   (:233-235; v is not normalized)
+    q = rmsnorm(q.view(B, T, n_heads, head_dim), w_q_norm, eps).transpose(1, 2)
+    k = rmsnorm(k.view(B, T, n_kv, head_dim), w_k_norm, eps).transpose(1, 2)
+    v = v.view(B, T, n_kv, head_dim).transpose(1, 2)
+    #3. rel-pos bias from the relative states (:248-251)
+    bias = rel_bias(r.view(B, T, n_heads, -1), rel_proj, q_positions,
+                    kv_positions)
+    #4. log length scaling on global layers only (:254-261). tau == 1.0
+    #   below the 128000 floor, but the ref runs the fp32 round-trip
+    #   unconditionally on global layers — so do we, for bit parity
+    if is_global and n_floor is not None:
+        q, bias = apply_log_scaling(q, bias, q_positions, alpha, n_floor)
+    #5. GQA: repeat each KV head n_heads/n_kv times (repeat_kv :145-154 —
+    #   expand + reshape materializes contiguous copies, like the ref)
+    rep = n_heads // n_kv
+    k = k[:, :, None].expand(B, n_kv, rep, T, head_dim).reshape(
+        B, n_heads, T, head_dim)
+    v = v[:, :, None].expand(B, n_kv, rep, T, head_dim).reshape(
+        B, n_heads, T, head_dim)
+    #6. bf16 scores * 1/head_dim, + bias, + additive mask (:171-175 — same
+    #   association order)
+    attn = torch.matmul(q, k.transpose(2, 3)) * (1.0 / head_dim)
+    attn = attn + bias
+    if attn_mask is not None:
+        attn = attn + attn_mask
+    #7. fp32 softmax, downcast to the input dtype (:177; dropout is p=0 at
+    #   eval — identity, skipped)
+    attn = F.softmax(attn, dim=-1, dtype=torch.float32).to(q.dtype)
+    #8. weighted values -> [B,T,H*D] -> output projection (:179-181 + :280f)
+    out = torch.matmul(attn, v).transpose(1, 2).contiguous()
+    return F.linear(out.reshape(B, T, n_heads * head_dim), wo)
