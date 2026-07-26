@@ -5,6 +5,7 @@ MoE expert-parallel (64 experts/GPU), embeddings replicated."""
 import json
 import pathlib
 import re
+import struct
 from dataclasses import dataclass
 
 N_MODEL_SHARDS = 33            # model-XXXXX-of-00033.safetensors (CLAUDE.md model facts)
@@ -59,3 +60,27 @@ def build_shard_index(model_dir: str) -> ShardIndex:
     #4. hand back the immutable map
     return ShardIndex(model_dir=root, tensor_to_shard=dict(weight_map),
                       shard_files=shard_files)
+
+
+def read_headers(idx: ShardIndex) -> dict:
+    """B1.2: tensor name -> (dtype str, shape tuple) for the whole checkpoint,
+    from safetensors headers only (no tensor data is read)."""
+    #1. safetensors format: 8-byte LE header length, then JSON header
+    meta = {}
+    for fname in idx.shard_files:
+        with open(idx.model_dir / fname, "rb") as f:
+            (hdr_len,) = struct.unpack("<Q", f.read(8))
+            hdr = json.loads(f.read(hdr_len))
+        hdr.pop("__metadata__", None)
+        for name, ent in hdr.items():
+            if name in meta:
+                raise SystemExit(f"[loader] tensor in two shards: {name}")
+            meta[name] = (ent["dtype"], tuple(ent["shape"]))
+
+    #2. headers must cover exactly the tensors the index maps (B1.1 invariant)
+    if set(meta) != set(idx.tensor_to_shard):
+        only_hdr = sorted(set(meta) - set(idx.tensor_to_shard))[:5]
+        only_idx = sorted(set(idx.tensor_to_shard) - set(meta))[:5]
+        raise SystemExit(
+            f"[loader] header/index mismatch; header-only={only_hdr} index-only={only_idx}")
+    return meta

@@ -22,14 +22,14 @@ declared in README.
 
 | Component | Value |
 |---|---|
-| Layers | 66 (layer 2 = dense MLP, others MoE) |
+| Layers | 66 (layers 0–1 = dense MLP, others MoE; dense_mlp_idx=2 is a count — census B1.2) |
 | Hidden / vocab / ctx | 6144 / 201024 (200058 unpadded) / 1M |
 | Global attn layers | 11: {5,11,17,23,29,35,41,47,53,59,65}; 64Q/8KV/128d |
 | SWA layers | 55; window 512; 64Q/**16KV**/128d |
 | Position encoding | none (no RoPE): relative bias d_rel=16, extent 1024 + log scaling (floor 128000, α 0.1), pre-softmax |
 | sconv | window-4 conv on attn K, V, output, and MoE output, every layer |
 | MoE | 256 experts, top-6, sigmoid gate + bias, norm_after_topk, route_scale 8, 2 shared experts (sink), expert FFN 3072 |
-| Dense layer 2 | FFN 24576 |
+| Dense layers 0–1 | FFN 24576 |
 | MTP | 8 chained draft layers, separate mtp.safetensors |
 | Precision | NVFP4 weights (exclude: embeds, norms, unembed, layer-0 attn); bf16 activations & KV |
 
@@ -51,7 +51,7 @@ declared in README.
 | attention_prefill / decode | two KV layouts (paged global 8KV-head, ring-512 SWA 16KV-head); relative bias + log scaling fused pre-softmax; deterministic reduction order (parity gate is batch-sensitive) |
 | sconv | window-4 depthwise conv on K/V/attn-out/MoE-out; fuse into adjacent ops; per-layer ring state cached like a virtual window-4 KV |
 | fused_rmsnorm | rms_norm_eps 1e-6, embed_norm variant; (RoPE kernel from rev 1 deleted — model has no RoPE) |
-| dense_mlp | layer 2 only, FFN 24576, standard fused GEMM path |
+| dense_mlp | layers 0–1 only, FFN 24576, standard fused GEMM path |
 | mtp | 8 chained draft layers with own local/global ids; verify pass batched with main model |
 
 ## Scheduler & KV at canonical scale (rev 4 — binding requirements)

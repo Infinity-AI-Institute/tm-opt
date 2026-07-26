@@ -43,7 +43,9 @@ window 512** (64Q/**16KV**/hd128); **no RoPE** — relative attention (d_rel 16,
 extent 1024, log scaling α=0.1 floor 128000); **sconv** window-4 convs on
 attn K/V/out + MoE out every layer; MoE 256 experts top-6, **sigmoid gate +
 bias, norm_after_topk, route_scale 8.0**, 2 shared experts (sink), expert FFN
-**3072** (skinny); layer 2 = dense MLP (24576); **MTP: 8 chained draft
+**3072** (skinny); layers 0–1 = dense MLP (24576; dense_mlp_idx=2 is a COUNT
+of leading dense layers, not an index — census B1.2, vLLM inkling
+nvidia/model.py:164; layer 2 is MoE, bf16-unquantized); **MTP: 8 chained draft
 layers**; ctx 1,048,576 (we serve at 16,384). NVFP4 weights, **bf16 KV**
 (kv_cache_quant_algo "none"), exclude list stays bf16.
 
@@ -131,7 +133,7 @@ peak at conc 512 both workloads, collapse past 512 = KV-capacity edge)
 Target layout `engine/pyengine/`:
 - `loader.py` (safetensors → NVFP4 tensors on 4 GPUs, expert-major),
 - `model.py` (66-layer graph: rel-attn two shapes, sconv, MoE sigmoid-top6,
-  dense layer 2, embed-norm, unembed),
+  dense layers 0–1, embed-norm, unembed),
 - `kernels/` (Triton: rmsnorm, sconv, moe_gather_gemm, decode_attn_global,
   decode_attn_swa, rel_bias),
 - `kv.py` (paged global + ring-512 SWA + sconv state — parity semantics),

@@ -89,7 +89,7 @@
 - [ ] B1 loader (shard index → census → dtype map → NVFP4 dequant → TP=4 plan
       → full load ≤150 GiB/GPU)
 - [ ] B2 model graph (embed → rmsnorm → rel-bias → sconv → both attention
-      shapes → MoE gate/experts → dense layer 2 → full-forward logits match
+      shapes → MoE gate/experts → dense layers 0–1 → full-forward logits match
       transformers greedy)
 - [ ] B3 KV + decode + scheduler + server (ring-512 oracle, batch invariance,
       OpenAI endpoint with return_token_ids)

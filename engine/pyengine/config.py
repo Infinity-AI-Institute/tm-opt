@@ -17,7 +17,10 @@ class ModelConfig:
     log_alpha: float = 0.1; log_floor: int = 128000
     sconv_k: int = 4                #cfg: sconv_kernel_size
     n_experts: int = 256; topk: int = 6; n_shared: int = 2
-    expert_ffn: int = 3072; dense_idx: int = 2; dense_ffn: int = 24576
+    expert_ffn: int = 3072; dense_ffn: int = 24576
+    dense_idx: int = 2              #cfg: dense_mlp_idx — COUNT of leading dense
+                                    #layers (ids < 2), NOT an index (vllm
+                                    #inkling nvidia/model.py:164; census B1.2)
     route_scale: float = 8.0
     mtp_layers: int = 8
     global_layers: tuple = tuple(range(5, 66, 6))  #derived: cfg local_layer_ids complement

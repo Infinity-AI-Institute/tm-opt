@@ -100,8 +100,11 @@ by `./build/verify_config /workspace/models/inkling-nvfp4`)
   virtual window-4 KV layer.
 - MoE: 256 routed experts, top-6, **sigmoid gate with bias**, norm_after_topk,
   route_scale 8.0, use_global_scale; **2 shared experts, shared_expert_sink**;
-  expert intermediate 3072 (skinny GEMMs); **layer 2 is dense MLP**
-  (intermediate 24576), not MoE.
+  expert intermediate 3072 (skinny GEMMs); **layers 0–1 are dense MLP**
+  (intermediate 24576), not MoE — `dense_mlp_idx: 2` is a COUNT of leading
+  dense layers (vLLM inkling `nvidia/model.py:164`: `layer_id <
+  dense_mlp_idx`; checkpoint census B1.2 confirms). Layer 2 IS MoE (its
+  experts stored bf16-unquantized, unlike layers 3–65).
 - MTP: 8 chained draft layers (`num_nextn_predict_layers: 8`, own local/global
   ids), separate `mtp.safetensors`. vLLM reports ~2.7× from MTP — engine must
   implement it for the MTP-ON config pair; canonical headline is MTP-OFF (D7).
