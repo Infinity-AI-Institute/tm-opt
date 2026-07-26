@@ -113,8 +113,12 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
       dispatch, native grouped_mm reproduces frozen experts.out BIT-exactly;
       native eager cross-checks 5/5 bit-exact; structural + fp64 pins all
       pass (commit e14e430)
-- [ ] B2.10 dense layer 2 MLP matches ref.
+- [x] B2.10 dense layer 2 MLP matches ref.
       test: `python -m engine.pyengine.tests.t_b2 dense`
+      — green: dense layers 0+1 (item wording stale — dense_mlp_idx=2 is a
+      COUNT, layer 2 is MoE; flagged B1.2) frozen anchors bit-exact 2/2;
+      conversion pinned vs HF's own Interleave/Chunk; 6/6 native InklingMLP
+      cross-checks bit-exact; live global_scale + fp64 pins (commit f763e28)
 - [ ] B2.11 full 66-layer forward, next-token logits: top-1 matches
       transformers greedy for 5 tiny prompts.
       test: `python -m engine.pyengine.tests.t_b2 logits`
@@ -616,3 +620,44 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
   eae8f3a95804 unchanged) + embed + rmsnorm + relbias + sconv + attn_global
   + attn_swa + gate; t_b1 index + census + dtypes + plan. Code committed
   first (e14e430) per convention; this tick is its own commit.
+- 2026-07-26 B2.10: implemented model.dense_mlp (pure torch, exact
+  InklingMLP semantics per modeling_inkling.py:285-299 — three SEPARATE
+  bias-free linears (:291-293, kept unfused so cuBLAS sees the module's
+  exact GEMM shapes), silu, then a LIVE trailing global_scale multiply
+  (:295,:299 — bf16 scalar, 0.0082 layer 0 / 0.0261 layer 1, NOT an inert
+  1.0); whole module bf16 (not in _keep_in_fp32_modules_strict :610)) +
+  t_b2 dense; config.py load_verified now also checks
+  dense_intermediate_size=24576 vs the raw checkpoint json (the field
+  configuration_inkling.py:125-126 maps onto config.intermediate_size —
+  raw intermediate_size 3072 is the EXPERT ffn; B2.4 convention for
+  newly-relied-on fields). ITEM WORDING vs FACT (B1.2 flag stands): the
+  item says "dense layer 2 MLP" but dense_mlp_idx=2 is a COUNT — the dense
+  layers are 0 and 1, layer 2 is MoE (its MLP was gated by B2.8/B2.9).
+  The test therefore anchors BOTH real dense layers, strictly more than
+  the item's literal ask; item text left untouched (loop may not edit).
+  Weights: disk w13_dn [49152,6144] interleaved [g0,u0,g1,u1,..] rows ->
+  de-interleave -> chunk halves [gate;up] (conversion_mapping.py:196-201),
+  w2_md -> down, and the conversion is pinned torch.equal vs transformers'
+  OWN Interleave(dim=0)+Chunk(dim=0) ops run in-process on both layers.
+  Ran test verbatim from /workspace/tm-opt (venv active,
+  CUDA_VISIBLE_DEVICES=4,5,6,7). Real output:
+  ```
+  dense ok: frozen anchors layers {0,1} (the dense layers — dense_mlp_idx=2 is a COUNT, census B1.2; layer 2 is MoE, covered by B2.8/B2.9) — mlp.out rel err 0.0e+00/0.0e+00 < 1e-2 (bit-exact 2/2); weight conversion pinned vs HF's own Interleave(0)+Chunk(0) ops both layers; native InklingMLP cross-check bit-exact 6/6 (real L0 T{13,57} + batch 2, real L1 T13, random hidden512/ffn768 T{600,13}); global_scale LIVE (0.0082/0.0261) applied last (bitwise), gate/up swap breaks anchor, zero-in exact zero-out; fp64 replay agrees 2.5e-03/3.3e-03 < 1e-2
+  ```
+  Everything bit-exact (InklingMLP is three plain nn.Linears — no dispatch
+  decorator, so unlike B2.9's experts the anchors ARE bitwise): both frozen
+  mlp.out anchors, all 6 native-module cross-checks (real L0 weights on
+  frozen input + T57 + batch-2 T5, real L1 weights on frozen input, random
+  hidden-512/ffn-768 config at T600 + batch-2 T13). Structural pins:
+  scale-is-last-op bitwise (unit-scale run * gs == output), gate/up swap
+  breaks the anchor (orientation discriminates, silu asymmetric), zero-in
+  -> exact zero-out (no biases), independent fp64 replay 2.5e-03/3.3e-03.
+  Anchor-point sanity: mlp.in == post_attention_layernorm.out bitwise both
+  layers (capture convention pinned). NOTE for B2.11: all five ref layers'
+  MLP paths are now individually gated (dense 0-1 bitwise, MoE 2/5/6 to
+  grouped_mm numerics per B2.9) — the full-forward item composes them with
+  attention/sconv/norm blocks that are all already bit-exact. Regressions
+  all green after the config.py addition: t_b2 ref (verify path, sha
+  eae8f3a95804 unchanged) + embed + rmsnorm + relbias + sconv + attn_global
+  + attn_swa + gate + moe; t_b1 index + census + dtypes + plan. Code
+  committed first (f763e28) per convention; this tick is its own commit.
