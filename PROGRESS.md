@@ -66,8 +66,10 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
       prompt); native transformers 5.14.1 eager on a 7-layer slice; layers
       3-6 experts repaired via B1.4 dequant, proven bit-exact vs HF's own
       Interleave on layer-2 bf16 experts (commit ef157f6)
-- [ ] B2.2 embed + embed_norm matches ref (rel err < 1e-2 bf16).
+- [x] B2.2 embed + embed_norm matches ref (rel err < 1e-2 bf16).
       test: `python -m engine.pyengine.tests.t_b2 embed`
+      — green: rel err 0.0 (bit-exact, both lookup and embed_norm) vs frozen
+      refs; torch-ref rmsnorm + embed in model.py (commit 7a37c70)
 - [ ] B2.3 rmsnorm Triton kernel matches torch reference on random tensors.
       test: `python -m engine.pyengine.tests.t_b2 rmsnorm`
 - [ ] B2.4 relative-attention bias table + log scaling matches ref math
@@ -330,3 +332,21 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
   post-input_layernorm, mlp.in is post-post_attention_layernorm,
   attn_sconv/mlp_sconv outs are PRE-residual-add (sconv module includes its
   own +residual of its input, in fp32, per modeling_inkling.py:512-542).
+- 2026-07-26 B2.2: implemented model.py rmsnorm (torch reference, exact
+  InklingRMSNorm semantics per modeling_inkling.py:99-113 — fp32 variance,
+  downcast to input dtype BEFORE the bf16 weight multiply, eps 1e-6) +
+  embed (plain lookup, no multiplier, modeling_inkling.py:654,659,682);
+  config.py gained rms_eps checked against checkpoint rms_norm_eps; t_b2
+  refactor: _verify_existing split into silent _load_refs (sha256 + manifest
+  + finiteness) reused by every B2.2+ item, plus _rel_err (fp32 global L2)
+  and t_embed (weights read straight from shards via B1.1 index, shapes
+  pinned vs verified config). Ran test verbatim from /workspace/tm-opt (venv
+  active, CUDA_VISIBLE_DEVICES=4,5,6,7). Real output:
+  ```
+  embed ok: 13 toks; lookup rel err 0.0e+00 (bit-exact True), embed_norm rel err 0.0e+00 < 1e-2 (bit-exact True, max|diff| 0.0e+00); weights (201024, 6144) bf16 from shards, eps 1e-06
+  ```
+  Bit-exact (not just <1e-2): lookup is a row copy and our rmsnorm replays
+  transformers' exact op order/dtypes on the same GPU. Regressions all
+  green after the config.py + t_b2 refactor: t_b2 ref (verify path, sha
+  eae8f3a95804 unchanged), t_b1 index + census + dtypes. Code committed
+  first (7a37c70) per B1.1 convention; this tick is its own commit.
