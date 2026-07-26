@@ -336,11 +336,122 @@ def t_dequant():
           f"nonzero {nz:.1%}")
 
 
+def t_plan():
+    #1. inputs: index/headers/config/dtype map, then the plan (builder's own
+    #   fail-loud checks — total classification, divisibility, whole-head
+    #   slices, pack coherence — run inside build_shard_plan)
+    idx = loader.build_shard_index(MODEL_DIR)
+    meta = loader.read_headers(idx)
+    mc = pcfg.load_verified(MODEL_DIR)
+    dm = loader.build_dtype_map(idx, meta)
+    plan = loader.build_shard_plan(meta, dm, mc, tp=4)
+
+    #2. total partition: every checkpoint tensor is placed; the skipped set
+    #   is EXACTLY the multimodal family (text-only v1 scope), nothing else
+    assert set(plan.placement) == set(meta)
+    skipped = {n for n, (k, _) in plan.placement.items() if k == loader.SKIP}
+    assert skipped == {n for n in meta
+                       if n.startswith(("model.audio.", "model.visual."))}
+
+    #3. head-parallel attention, re-derived from config independently of the
+    #   builder: 16 Q heads/rank; 2 KV heads/rank global, 4 SWA; GQA groups
+    #   rank-local; wo row-parallel on the same 16-head extent; per-channel
+    #   K/V sconvs follow their KV heads
+    HD = mc.head_dim
+    assert mc.g_q_heads % plan.tp == 0 and mc.g_kv_heads % plan.tp == 0
+    assert mc.s_q_heads % plan.tp == 0 and mc.s_kv_heads % plan.tp == 0
+    q_pr = mc.g_q_heads // plan.tp
+    kv_pr = {True: mc.s_kv_heads // plan.tp, False: mc.g_kv_heads // plan.tp}
+    local = set(range(mc.num_layers)) - set(mc.global_layers)
+    for i in range(mc.num_layers):
+        p = f"model.llm.layers.{i}.attn."
+        assert plan.placement[p + "wq_du.weight"] == (loader.SHARD, 0)
+        assert meta[p + "wq_du.weight"][1][0] // plan.tp == q_pr * HD
+        assert plan.placement[p + "wo_ud.weight"] == (loader.SHARD, 1)
+        assert meta[p + "wo_ud.weight"][1][1] // plan.tp == q_pr * HD
+        kpr = kv_pr[i in local]
+        assert q_pr % kpr == 0, (i, q_pr, kpr)
+        for w in ("wk_dv.weight", "wv_dv.weight",
+                  "k_sconv.weight", "v_sconv.weight"):
+            assert plan.placement[p + w] == (loader.SHARD, 0)
+            assert meta[p + w][1][0] // plan.tp == kpr * HD, (p + w, kpr)
+        for w in ("q_norm.weight", "k_norm.weight", "wr_du.weight",
+                  "rel_logits_proj.proj"):
+            assert plan.placement[p + w] == (loader.REPLICATE, -1)
+
+    #4. expert-parallel MoE: routed experts (and, where packed, their scales
+    #   — spot check; full coherence is builder-enforced) split 64/rank on
+    #   the expert dim; gate replicated (every rank routes every token);
+    #   shared experts + dense MLPs split on the FFN dim instead
+    assert mc.n_experts % plan.tp == 0
+    e_pr = mc.n_experts // plan.tp
+    for i in range(mc.dense_idx, mc.num_layers):
+        p = f"model.llm.layers.{i}.mlp."
+        for w in ("experts.w13_weight", "experts.w2_weight"):
+            assert plan.placement[p + w] == (loader.SHARD, 0)
+            assert meta[p + w][1][0] == mc.n_experts
+        for g in ("gate.weight", "gate.bias", "gate.global_scale"):
+            assert plan.placement[p + g] == (loader.REPLICATE, -1)
+        assert plan.placement[p + "shared_experts.shared_w13_weight"] == \
+            (loader.SHARD, 1)
+        assert plan.placement[p + "shared_experts.shared_w2_weight"] == \
+            (loader.SHARD, 2)
+    b = f"model.llm.layers.{mc.dense_idx + 1}.mlp.experts.w13_weight"
+    assert plan.placement[b + ".scale"] == (loader.SHARD, 0)
+    assert plan.placement[b + ".scale2"] == (loader.SHARD, 0)
+    for i in range(mc.dense_idx):
+        p = f"model.llm.layers.{i}.mlp."
+        assert plan.placement[p + "w13_dn.weight"] == (loader.SHARD, 0)
+        assert plan.placement[p + "w2_md.weight"] == (loader.SHARD, 1)
+
+    #5. embed/unembed + final norms replicated (deliberate bring-up choice —
+    #   local lookup + full-logits argmax, no vocab-parallel gather; the
+    #   budget below proves it fits)
+    for n in ("model.llm.embed.weight", "model.llm.embed_norm.weight",
+              "model.llm.norm.weight", "model.llm.unembed.weight"):
+        assert plan.placement[n] == (loader.REPLICATE, -1)
+
+    #6. mtp placed by the same rules, so the budget already covers the
+    #   MTP-ON config pair (D7): head-parallel attention, FFN-split dense
+    #   MLP, row-parallel input_proj on its concat(embed,hidden) input dim
+    for i in range(mc.mtp_layers):
+        p = f"model.mtp.layers.{i}."
+        assert plan.placement[p + "input_proj.weight"] == (loader.SHARD, 1)
+        t = p + "transformer_block."
+        assert plan.placement[t + "attn.wq_du.weight"] == (loader.SHARD, 0)
+        assert plan.placement[t + "mlp.w13_dn.weight"] == (loader.SHARD, 0)
+        assert plan.placement[t + "mlp.w2_md.weight"] == (loader.SHARD, 1)
+
+    #7. byte budget from headers: partition reconciles to the checkpoint
+    #   total (551.35 GiB, CLAUDE.md fact); per-GPU = replicated + sharded/4
+    #   and MUST be <= 150 GiB (the item's bar)
+    GiB = 2 ** 30
+    rb = plan.rank_bytes(meta)
+    total = sum(loader.nbytes(*meta[n]) for n in meta)
+    assert rb[loader.SHARD] + rb[loader.REPLICATE] + rb[loader.SKIP] == total
+    assert abs(total / GiB - 551.35) < 0.01, total / GiB
+    per_gpu = rb["per_rank"]
+    assert per_gpu == rb[loader.REPLICATE] + rb[loader.SHARD] // plan.tp
+    assert per_gpu <= 150 * GiB, f"budget blown: {per_gpu / GiB:.2f} GiB"
+
+    #8. summary line = the test's green evidence (per-GPU budget printed)
+    emb = sum(loader.nbytes(*meta[n]) for n in
+              ("model.llm.embed.weight", "model.llm.unembed.weight"))
+    print(f"plan ok: tp={plan.tp}, head-parallel attn ({q_pr}q + "
+          f"{kv_pr[False]}kv-global/{kv_pr[True]}kv-swa heads/rank) + "
+          f"expert-parallel moe ({e_pr} experts/rank), ffn-split shared/dense/"
+          f"mtp mlp; per-GPU {per_gpu / GiB:.2f} GiB <= 150 GiB budget "
+          f"(sharded {rb[loader.SHARD] / plan.tp / GiB:.2f} + replicated "
+          f"{rb[loader.REPLICATE] / GiB:.2f}, of which embed+unembed "
+          f"{emb / GiB:.2f}); skipped multimodal {rb[loader.SKIP] / GiB:.2f} "
+          f"GiB; checkpoint total {total / GiB:.2f} GiB")
+
+
 def main():
     #1. dispatch on subcommand; unimplemented ones fail loud with their item id
     done = {"index": t_index, "census": t_census, "dtypes": t_dtypes,
-            "dequant": t_dequant}
-    todo = {"plan": "B1.5", "load": "B1.6"}
+            "dequant": t_dequant, "plan": t_plan}
+    todo = {"load": "B1.6"}
     usage = f"usage: python -m engine.pyengine.tests.t_b1 {{{'|'.join([*done, *todo])}}}"
     if len(sys.argv) != 2 or sys.argv[1] not in {*done, *todo}:
         raise SystemExit(usage)

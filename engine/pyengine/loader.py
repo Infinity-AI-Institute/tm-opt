@@ -1,7 +1,7 @@
 """B1: checkpoint -> GPU tensors. NVFP4 block-scale layout per vLLM modelopt
 (see dequant_nvfp4 for the cited layout facts). TP=4 plan: attention
 head-parallel, MoE expert-parallel (64 experts/GPU), embeddings replicated."""
-#TODO(B1.5..B1.6): implemented item-by-item by the build loop.
+#TODO(B1.6): implemented item-by-item by the build loop.
 import json
 import pathlib
 import re
@@ -252,3 +252,157 @@ def dequant_nvfp4(packed, scale, scale2, group_size, out_dtype=torch.bfloat16):
     val = val.reshape(*lead, rows, k // group_size, group_size)
     out = (val * s.unsqueeze(-1)).reshape(*lead, rows, k)
     return out.to(out_dtype)
+
+
+#B1.5: TP=4 sharding plan. Placement kinds: SHARD along one dim into tp equal
+#slices, REPLICATE full copy on every rank, SKIP not loaded at all.
+SHARD, REPLICATE, SKIP = "shard", "replicate", "skip"
+
+#B1.5: stored bytes per element for every dtype present in the checkpoint
+#(B1.3 dtype map proved this set is exhaustive)
+DTYPE_BYTES = {"BF16": 2, "F32": 4, "U8": 1, "F8_E4M3": 1, "I64": 8}
+
+
+def nbytes(dtype: str, shape) -> int:
+    #1. stored size of one tensor from its safetensors header entry
+    n = DTYPE_BYTES[dtype]
+    for d in shape:
+        n *= d
+    return n
+
+
+#B1.5: split dim per layer-tensor suffix (llm and mtp layers share suffixes;
+#mtp's transformer_block. prefix is stripped before lookup). Rationale:
+#- attn head-parallel: wq/wk/wv + their per-channel K/V sconvs split whole
+#  heads on the output dim (dim 0, rows = heads*head_dim); wo consumes the
+#  head-sharded context -> row-parallel on its input dim 1 (partial sums,
+#  all-reduce after). 64Q/8KV global and 64Q/16KV SWA both divide by 4 with
+#  rank-local GQA groups (16Q+2KV / 16Q+4KV per rank).
+#- MoE expert-parallel: routed experts + their NVFP4 scales split on the
+#  expert dim 0 (256/4 = 64 experts per rank); works for layer 2's bf16
+#  experts identically (no scales present).
+#- shared experts / dense MLP / mtp MLP: every token runs them, so split
+#  work megatron-style on the FFN dim: fused gate+up w13 on its output dim,
+#  w2 on its input dim. Checkpoint w13 rows are interleaved [g0,u0,g1,u1,..]
+#  (vLLM nvidia/moe.py:583-595), so a contiguous 1/4 slice holds whole
+#  gate+up channel pairs — clean per-rank FFN slices.
+#- mtp input_proj (hidden, 2*hidden) consumes concat(embed, hidden) ->
+#  row-parallel on its input dim 1.
+_LAYER_SHARD_DIM = {
+    "attn.wq_du.weight": 0,
+    "attn.wk_dv.weight": 0,
+    "attn.wv_dv.weight": 0,
+    "attn.k_sconv.weight": 0,
+    "attn.v_sconv.weight": 0,
+    "attn.wo_ud.weight": 1,
+    "mlp.experts.w13_weight": 0,
+    "mlp.experts.w13_weight.scale": 0,
+    "mlp.experts.w13_weight.scale2": 0,
+    "mlp.experts.w2_weight": 0,
+    "mlp.experts.w2_weight.scale": 0,
+    "mlp.experts.w2_weight.scale2": 0,
+    "mlp.shared_experts.shared_w13_weight": 1,
+    "mlp.shared_experts.shared_w2_weight": 2,
+    "mlp.w13_dn.weight": 0,
+    "mlp.w2_md.weight": 1,
+    "input_proj.weight": 1,
+}
+
+#B1.5: replicated layer-tensor suffixes — small, or needed in full on every
+#rank: norms; hidden-dim sconvs (run on the post-all-reduce full hidden);
+#rel-position machinery (wr_du + rel_logits_proj; exact math is B2.4's item,
+#and at <13 MB/layer replication is safe regardless); the MoE gate (every
+#rank routes every token to find which of its local experts fire); NVFP4
+#pack metadata; mtp's extra norms.
+_LAYER_REPLICATE = frozenset({
+    "attn_norm.weight", "mlp_norm.weight",
+    "attn_sconv.weight", "mlp_sconv.weight",
+    "attn.q_norm.weight", "attn.k_norm.weight",
+    "attn.wr_du.weight", "attn.rel_logits_proj.proj",
+    "mlp.gate.weight", "mlp.gate.bias", "mlp.gate.global_scale",
+    "mlp.experts.w13_weight.input_amax", "mlp.experts.w13_weight.original_shape",
+    "mlp.experts.w2_weight.input_amax", "mlp.experts.w2_weight.original_shape",
+    "mlp.global_scale",
+    "embed_norm.weight", "hidden_norm.weight",
+})
+
+#B1.5: non-layer llm tensors are all replicated. embed + unembed replicated
+#is a DELIBERATE bring-up choice (vLLM shards vocab instead): costs ~4.6 GiB
+#extra per rank — the budget test proves it fits under 150 GiB — and buys
+#local embedding lookup + full-logits argmax with no vocab-parallel gather.
+#Revisiting as a Stage-3 experiment is allowed; the plan is the baseline.
+_NONLAYER_LLM = ("model.llm.embed.weight", "model.llm.embed_norm.weight",
+                 "model.llm.norm.weight", "model.llm.unembed.weight")
+
+_LAYER_RE = re.compile(
+    r"model\.(llm|mtp)\.layers\.\d+\.(?:transformer_block\.)?(.+)")
+
+
+@dataclass(frozen=True)
+class ShardPlan:
+    """B1.5: placement of every checkpoint tensor across one tp-wide replica.
+    `placement` maps tensor name -> (SHARD, split_dim) | (REPLICATE, -1) |
+    (SKIP, -1). Multimodal is SKIP (text-only v1 scope); mtp is placed by the
+    same rules as main layers so the budget covers the MTP-ON pair (D7)."""
+    tp: int
+    placement: dict
+
+    def rank_bytes(self, meta: dict) -> dict:
+        #1. exact byte budget from headers: replicated costs full size on
+        #   every rank, sharded costs 1/tp (builder enforced divisibility),
+        #   skipped costs nothing; ranks are identical by construction
+        tot = {SHARD: 0, REPLICATE: 0, SKIP: 0}
+        for name, (kind, _) in self.placement.items():
+            tot[kind] += nbytes(*meta[name])
+        return {"per_rank": tot[REPLICATE] + tot[SHARD] // self.tp, **tot}
+
+
+def build_shard_plan(meta: dict, dm: DtypeMap, mc, tp: int = 4) -> ShardPlan:
+    """B1.5: classify every tensor via the suffix tables above; fail loud on
+    anything unknown (no silent replication of a misspelled weight)."""
+    #1. total classification: family prefix, then exact layer suffix
+    placement = {}
+    for name in meta:
+        if name.startswith(("model.audio.", "model.visual.")):
+            placement[name] = (SKIP, -1)
+        elif name in _NONLAYER_LLM:
+            placement[name] = (REPLICATE, -1)
+        else:
+            m = _LAYER_RE.fullmatch(name)
+            if not m:
+                raise SystemExit(f"[loader] plan: unclassified tensor {name}")
+            suffix = m.group(2)
+            if suffix in _LAYER_SHARD_DIM:
+                placement[name] = (SHARD, _LAYER_SHARD_DIM[suffix])
+            elif suffix in _LAYER_REPLICATE:
+                placement[name] = (REPLICATE, -1)
+            else:
+                raise SystemExit(
+                    f"[loader] plan: unknown layer suffix {suffix} ({name})")
+
+    #2. every sharded dim must split into tp equal slices (no padding), and
+    #   attention shards must slice whole heads (split extent per rank a
+    #   multiple of head_dim) — holds for llm AND mtp attention
+    for name, (kind, dim) in placement.items():
+        if kind != SHARD:
+            continue
+        extent = meta[name][1][dim]
+        if extent % tp:
+            raise SystemExit(f"[loader] plan: {name} dim{dim}={extent} "
+                             f"not divisible by tp={tp}")
+        if ".attn." in name and (extent // tp) % mc.head_dim:
+            raise SystemExit(f"[loader] plan: {name} per-rank extent "
+                             f"{extent // tp} splits a head (hd {mc.head_dim})")
+
+    #3. pack coherence: an expert slice and its scales must land on the same
+    #   rank -> base/.scale/.scale2 all shard the expert dim; tiny metadata
+    #   replicated
+    for b in dm.packed:
+        want = {b: (SHARD, 0), b + ".scale": (SHARD, 0),
+                b + ".scale2": (SHARD, 0), b + ".input_amax": (REPLICATE, -1),
+                b + ".original_shape": (REPLICATE, -1)}
+        got = {n: placement[n] for n in want}
+        if got != want:
+            raise SystemExit(f"[loader] plan: pack {b} split incoherently:\n"
+                             f"  want {want}\n  got {got}")
+    return ShardPlan(tp=tp, placement=placement)
