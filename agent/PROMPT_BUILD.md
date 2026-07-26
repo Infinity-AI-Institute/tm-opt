@@ -42,6 +42,11 @@ iterations; the repo is your memory. Work inside /workspace/tm-opt.
   commands in the FOREGROUND and wait for them within this session (the
   loop allots you a full hour). If a single test cannot finish inside one
   session, mark the item BLOCKED with a proposed split instead.
-- If you end an iteration without committing, you MUST leave a BLOCKED or
-  IN-PROGRESS note in PROGRESS.md explaining why — a silent no-commit
-  iteration is a rule violation.
+- BUDGET CHECK before starting any test or long command: estimate its wall
+  time first. If your estimate exceeds ~40 minutes, do NOT start it — mark
+  the item BLOCKED with the estimate and a proposed cheaper test or split
+  instead. (Your session has a hard 1-hour timeout; a command that outlives
+  the session produces a silent no-commit iteration, the worst outcome.)
+- If you end an iteration without committing FOR ANY REASON, you MUST first
+  write a BLOCKED or IN-PROGRESS note under the item in PROGRESS.md and
+  commit that note alone — a silent no-commit iteration is a rule violation.

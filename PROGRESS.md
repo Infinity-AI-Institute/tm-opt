@@ -135,8 +135,24 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
       attn half <= 7.9e-05, dense out <= 9.7e-05, MoE out <= 5.4e-03 (expert
       choice identical); cache K/V + 4 sconv-ring tails bit-equal replay 5/5
       layers; ring/page positional pins exact; wall 13 s (commit f3b1fbd)
-- [ ] B3.2 greedy decode loop (batch 1) reproduces B2.11 prompts to 32 tokens
-      vs transformers.  test: `python -m engine.pyengine.tests.t_b3 decode`
+- [ ] B3.2 greedy decode loop (batch 1): SELF-CONSISTENCY, not transformers.
+      Decode 32 tokens for the 5 tiny prompts; verify (a) per-step decode
+      logits vs full-prefill-of-prefix logits at every step, using B3.1's
+      decomposed gates (attention half < 1e-3, dense < 1e-3, MoE < 1e-2
+      with expert top-6 set EQUAL at every step; greedy top-1 token EQUAL
+      at every step — if a near-tie flip occurs, report the margin and
+      FLAG rather than fail if |logit gap| < 1e-2), (b) two identical
+      runs produce IDENTICAL token_ids bitwise (engine determinism — this
+      arm has no tolerance). Transformers cross-check NOT required:
+      accumulated eager-vs-grouped_mm drift is non-probative (9.2e-02 @
+      B2.11); the binding external referee is B3.5 vs vLLM goldens.
+      HINT: substantially-complete decode-loop work sits UNCOMMITTED in
+      loader.py/model.py/t_b2.py/t_b3.py from sessions killed waiting on
+      full-model loads. Review and adapt it. BUDGET: a full-model load is
+      ~110 s (B1.6) — fine in the foreground; the KILLER was streaming the
+      transformers reference per step, which this restructured test no
+      longer requires. Delete stray t_b3_decode.stderr.log.
+      test: `python -m engine.pyengine.tests.t_b3 decode`
 - [ ] B3.3 continuous batching scheduler: 8 concurrent greedy requests give
       IDENTICAL tokens to batch-1 runs (batch invariance).
       test: `python -m engine.pyengine.tests.t_b3 batch`
