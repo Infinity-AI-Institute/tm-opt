@@ -31,7 +31,7 @@ declared in README.
 | MoE | 256 experts, top-6, sigmoid gate + bias, norm_after_topk, route_scale 8, 2 shared experts (sink), expert FFN 3072 |
 | Dense layers 0–1 | FFN 24576 |
 | MTP | 8 chained draft layers, separate mtp.safetensors |
-| Precision | NVFP4 weights (exclude: embeds, norms, unembed, layer-0 attn); bf16 activations & KV |
+| Precision | NVFP4 = routed-expert w13/w2 of layers 3–65 ONLY (exclude list keeps ALL attn, norms/sconvs, gates, shared experts, layer-2 experts, dense 0–1, embeds/unembed, multimodal bf16; mtp all bf16 — B1.3 dtype map); bf16 activations & KV |
 
 ## Memory plan (per 4-GPU replica, 269 GB/GPU real)
 

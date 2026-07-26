@@ -108,9 +108,13 @@ by `./build/verify_config /workspace/models/inkling-nvfp4`)
 - MTP: 8 chained draft layers (`num_nextn_predict_layers: 8`, own local/global
   ids), separate `mtp.safetensors`. vLLM reports ~2.7× from MTP — engine must
   implement it for the MTP-ON config pair; canonical headline is MTP-OFF (D7).
-- NVFP4 weights except exclude list: embeddings/embed_norm/final norm/unembed,
-  layer-0 attention, multimodal encoders (see hf_quant_config.json). Loader
-  honors per-module precision.
+- NVFP4 applies ONLY to routed-expert w13/w2 of MoE layers 3–65; the
+  hf_quant_config.json exclude list keeps everything else bf16 — ALL
+  attention (every layer, not just 0), all norms/sconvs, MoE gates + shared
+  experts, layer-2 experts, dense MLPs 0–1, embeddings/embed_norm/final
+  norm/unembed, multimodal — and mtp.safetensors is entirely bf16 (outside
+  the export's scope). Verified by B1.3 dtype map (loader.build_dtype_map);
+  loader honors per-module precision.
 - **API contract for the parity gate (verified live):** greedy via
   /v1/completions with `temperature:0, logprobs:1, "return_token_ids": true`
   → token IDs at CHOICE level (`choice["token_ids"]`). Our engine's server

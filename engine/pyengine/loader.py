@@ -84,3 +84,109 @@ def read_headers(idx: ShardIndex) -> dict:
         raise SystemExit(
             f"[loader] header/index mismatch; header-only={only_hdr} index-only={only_idx}")
     return meta
+
+
+#B1.3: one NVFP4-packed weight = base U8 tensor (2 fp4/byte on the input dim)
+#plus exactly these four companion tensors (modelopt export layout)
+PACK_SUFFIXES = (".scale", ".scale2", ".input_amax", ".original_shape")
+
+
+@dataclass(frozen=True)
+class DtypeMap:
+    """B1.3: per-tensor load precision for the whole checkpoint. `packed`
+    holds NVFP4 base names (load U8 + 4 companions, dequant group
+    `group_size`); `plain` maps every other tensor to its stored dtype."""
+    group_size: int          # inputs per F8_E4M3 block scale (16)
+    exclude_modules: tuple   # hf_quant_config.json exclude list, verbatim
+    packed: frozenset        # NVFP4 base tensor names (companions implied)
+    plain: dict              # every non-pack tensor name -> stored dtype str
+
+    def is_excluded(self, name: str) -> bool:
+        #1. a modelopt exclude entry covers the named module and everything
+        #   under it — match at component boundary, not raw prefix (else
+        #   "...5.attn" would swallow "...5.attn_norm"). Same verdict as the
+        #   exact-match arm of vLLM ModelOptQuantConfigBase.is_layer_excluded
+        #   (vllm/model_executor/layers/quantization/modelopt.py:145); its
+        #   wildcard arm is unreachable here (builder rejects '*' entries).
+        return any(name == e or name.startswith(e + ".")
+                   for e in self.exclude_modules)
+
+    def companions(self, base: str) -> tuple:
+        #1. the four side tensors carried by one NVFP4-packed base weight
+        return tuple(base + s for s in PACK_SUFFIXES)
+
+
+def build_dtype_map(idx: ShardIndex, meta: dict) -> DtypeMap:
+    """B1.3: classify every tensor as NVFP4-packed vs plain from the headers,
+    then verify the split is EXACTLY what hf_quant_config.json's exclude list
+    predicts. Checkpoint reality (proved here, not assumed): quantized =
+    routed-expert w13/w2 of MoE layers 3-65 only; ALL attention is bf16
+    (every layer, not just 0); mtp.safetensors is entirely bf16."""
+    #1. quant recipe must be the one we build for: NVFP4, 16-input block
+    #   scales, bf16 KV, literal (wildcard-free) exclude entries
+    q = json.loads(
+        (idx.model_dir / "hf_quant_config.json").read_text())["quantization"]
+    recipe = (q.get("quant_algo"), q.get("group_size"),
+              q.get("kv_cache_quant_algo"))
+    if recipe != ("NVFP4", 16, "none"):
+        raise SystemExit(f"[loader] unexpected quant recipe: {recipe}")
+    wild = [e for e in q["exclude_modules"] if "*" in e]
+    if wild:
+        raise SystemExit(f"[loader] wildcard exclude entries: {wild[:3]}")
+
+    #2. packs from headers: every U8 tensor is an NVFP4 base and must carry
+    #   exactly the four companions, dtype + shape derived from the base
+    #   (scale: one F8_E4M3 per group_size inputs; input dim = 2 * packed)
+    packed = frozenset(n for n, (dt, _) in meta.items() if dt == "U8")
+    in_pack = set()
+    for b in packed:
+        bs = meta[b][1]
+        want = {
+            b + ".scale": ("F8_E4M3", bs[:-1] + (bs[-1] * 2 // q["group_size"],)),
+            b + ".scale2": ("F32", (bs[0],)),
+            b + ".input_amax": ("BF16", (1,)),
+            b + ".original_shape": ("I64", (len(bs),)),
+        }
+        got = {c: meta.get(c) for c in want}
+        if got != want:
+            raise SystemExit(f"[loader] bad NVFP4 pack {b}:\n"
+                             f"  want {want}\n  got {got}")
+        in_pack |= {b, *want}
+
+    #3. companion suffixes may not appear outside a pack (an orphan scale
+    #   would mean a quantized base this map failed to classify)
+    orphans = [n for n in meta if n.endswith(PACK_SUFFIXES) and n not in in_pack]
+    if orphans:
+        raise SystemExit(f"[loader] orphan pack companions: {orphans[:5]}")
+
+    #4. everything else loads at its stored dtype
+    plain = {n: meta[n][0] for n in meta if n not in in_pack}
+    dm = DtypeMap(group_size=q["group_size"],
+                  exclude_modules=tuple(q["exclude_modules"]),
+                  packed=packed, plain=plain)
+
+    #5. reconcile vs the exclude list, both directions, whole checkpoint:
+    #   (a) every exclude entry matches >=1 tensor (config/checkpoint drift);
+    #   (b) model.llm.*: in-a-pack <=> NOT excluded, tensor by tensor;
+    #   (c) multimodal: all excluded, all plain;
+    #   (d) model.mtp.*: no exclude entry reaches mtp.safetensors — the
+    #       modelopt export covered the main model only; all mtp is BF16.
+    dead = [e for e in dm.exclude_modules
+            if not any(n == e or n.startswith(e + ".") for n in meta)]
+    if dead:
+        raise SystemExit(f"[loader] exclude entries matching nothing: {dead[:5]}")
+    for n in meta:
+        if n.startswith("model.llm."):
+            if (n in in_pack) == dm.is_excluded(n):
+                raise SystemExit(
+                    f"[loader] exclude-list mismatch on {n}: in_pack="
+                    f"{n in in_pack} excluded={dm.is_excluded(n)}")
+        elif n.startswith(("model.audio.", "model.visual.")):
+            if n in in_pack or not dm.is_excluded(n):
+                raise SystemExit(f"[loader] multimodal not excluded-plain: {n}")
+        elif n.startswith("model.mtp."):
+            if dm.is_excluded(n) or plain.get(n) != "BF16":
+                raise SystemExit(f"[loader] mtp expectation broken: {n}")
+        else:
+            raise SystemExit(f"[loader] unclassified tensor family: {n}")
+    return dm

@@ -184,10 +184,76 @@ def t_census():
           f"({mc.mtp_layers}x20) = {len(meta)}")
 
 
+def t_dtypes():
+    #1. inputs: index, headers, verified config; build_dtype_map's own
+    #   exclude-list reconciliation (both directions, whole checkpoint,
+    #   every exclude entry matched) runs fail-loud inside the builder
+    idx = loader.build_shard_index(MODEL_DIR)
+    meta = loader.read_headers(idx)
+    mc = pcfg.load_verified(MODEL_DIR)
+    dm = loader.build_dtype_map(idx, meta)
+
+    #2. the item's named bf16 set, re-asserted independently of the builder:
+    #   embeds / embed_norm / final norm / unembed + layer-0 attention
+    for n in ("model.llm.embed.weight", "model.llm.embed_norm.weight",
+              "model.llm.norm.weight", "model.llm.unembed.weight"):
+        assert dm.plain.get(n) == "BF16" and dm.is_excluded(n), n
+    l0_attn = [n for n in meta if n.startswith("model.llm.layers.0.attn")]
+    assert l0_attn and all(dm.plain[n] == "BF16" for n in l0_attn)
+
+    #3. stronger checkpoint fact (flagged in B1.2, grounded here by the
+    #   exclude list): attention is bf16 on ALL 66 layers, not just layer 0
+    attn = [n for n in meta
+            if n.startswith("model.llm.layers.") and ".attn" in n]
+    attn_layers = {int(n.split("layers.")[1].split(".")[0]) for n in attn}
+    assert attn_layers == set(range(mc.num_layers))
+    assert all(dm.plain[n] == "BF16" for n in attn)
+
+    #4. NVFP4 set is EXACTLY routed-expert w13/w2 of MoE layers 3..65; the
+    #   first MoE layer (id 2 = dense_idx) is the exclude list's one MoE
+    #   exception and stays plain bf16
+    expect_packed = {f"model.llm.layers.{i}.mlp.experts.{w}"
+                     for i in range(mc.dense_idx + 1, mc.num_layers)
+                     for w in ("w13_weight", "w2_weight")}
+    assert dm.packed == expect_packed, (
+        sorted(dm.packed ^ expect_packed)[:5])
+    for w in ("w13_weight", "w2_weight"):
+        n = f"model.llm.layers.{mc.dense_idx}.mlp.experts.{w}"
+        assert dm.plain.get(n) == "BF16" and dm.is_excluded(n), n
+
+    #5. plain dtype budget pins the whole partition: the only plain F32s are
+    #   the 64 MoE gates' bias + global_scale, the rest is bf16; plain +
+    #   5-tensor packs (base + 4 companions) must cover the checkpoint
+    f32 = sorted(n for n, d in dm.plain.items() if d == "F32")
+    n_moe = mc.num_layers - mc.dense_idx
+    assert len(f32) == 2 * n_moe and all(
+        n.endswith((".mlp.gate.bias", ".mlp.gate.global_scale"))
+        for n in f32), f32[:5]
+    assert set(dm.plain.values()) == {"BF16", "F32"}
+    assert len(dm.plain) + 5 * len(dm.packed) == len(meta)
+
+    #6. mtp.safetensors: outside the exclude list's reach (builder enforces),
+    #   all 8x20 draft tensors load bf16
+    mtp = [n for n in dm.plain if n.startswith("model.mtp.")]
+    assert len(mtp) == mc.mtp_layers * 20
+    assert all(dm.plain[n] == "BF16" for n in mtp)
+
+    #7. summary line = the test's green evidence
+    n_bf16 = sum(1 for d in dm.plain.values() if d == "BF16")
+    print(f"dtypes ok: exclude list ({len(dm.exclude_modules)} literal entries, "
+          f"all matched) reconciles exactly: nvfp4 = {len(dm.packed)} expert "
+          f"weights (layers {mc.dense_idx + 1}-{mc.num_layers - 1} x w13/w2, "
+          f"U8 + scale/scale2/amax/shape, group {dm.group_size}); plain "
+          f"{len(dm.plain)} ({n_bf16} bf16 + {len(f32)} f32 gate bias/"
+          f"global_scale); attn bf16 on ALL {mc.num_layers} layers; "
+          f"layer-{mc.dense_idx} experts bf16; mtp {len(mtp)} bf16 "
+          f"(outside exclude scope)")
+
+
 def main():
     #1. dispatch on subcommand; unimplemented ones fail loud with their item id
-    done = {"index": t_index, "census": t_census}
-    todo = {"dtypes": "B1.3", "dequant": "B1.4",
+    done = {"index": t_index, "census": t_census, "dtypes": t_dtypes}
+    todo = {"dequant": "B1.4",
             "plan": "B1.5", "load": "B1.6"}
     usage = f"usage: python -m engine.pyengine.tests.t_b1 {{{'|'.join([*done, *todo])}}}"
     if len(sys.argv) != 2 or sys.argv[1] not in {*done, *todo}:
