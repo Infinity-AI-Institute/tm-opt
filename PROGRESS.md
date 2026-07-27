@@ -1086,3 +1086,21 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
   .git/objects/zz-{a2,79,84}-rootowned (root may delete), fsck clean.
   Code committed first (5e00fc9) per convention; this tick is its own
   commit.
+- 2026-07-27 B3.5 IN-PROGRESS (hedge note, committed BEFORE the gate run so
+  a session-cap kill cannot produce a silent no-commit iteration): B3.2
+  remains BLOCKED (human ruling pending), so B3.5 is the first non-BLOCKED
+  unchecked item. No code change needed — server committed at B3.4. State:
+  GPUs 4-7 idle-verified, vLLM resident on 0-3 (idle, not measuring — P2
+  precedent; D8 covers measurement only); goldens integrity pre-checked
+  (50 items, sha 74d977632c936736, cache_key 8451a604a8849296, all
+  finish_reason length, >= 64 ids each; prompts 17-71 chars). Server
+  started in tmux `pyserve` (`python -m engine.pyengine.server --port
+  8200`, log teed to /workspace/logs/pyengine_server_b35_*.log), load
+  ~105 s; gate to run FOREGROUND immediately after /health, verbatim:
+  `python harness/correctness.py --endpoint http://localhost:8200`.
+  ETA ~36 min (50 prompts x 64 sequential greedy tokens at ~0.66 s/tok,
+  B3.4 note); per-request timeout 300 s is safe (~45 s/prompt). If this
+  note is the session's last word: the gate outlived the cap — next
+  iteration should `tmux kill-session -t pyserve`, then rerun the gate
+  the same way. Outcome note + adjudication follow below when the run
+  completes.
