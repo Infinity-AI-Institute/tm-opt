@@ -310,6 +310,7 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
       differ by design), cache_key 8451a604a8849296, run stamped commit
       8c29167; log docs/logs/2026-07-27_pyengine_iter0_decode_heavy.log
       (no code change; run against the prior session's persistent server)
+- [ ] B4.2 same for prefill_heavy.
       WAS-BLOCKED 2026-07-27 (budget rule — test NOT started; no command run, no
       server started, GPUs 4-7 untouched. B4.1's forecast held, but every
       number below was RE-VERIFIED first-hand this session against
