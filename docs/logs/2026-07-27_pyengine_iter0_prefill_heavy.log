@@ -1,0 +1,22 @@
+[bench] prefill_heavy: ISL~8192 OSL=1024 conc=512 cache_key=8451a604a8849296 TIMEBOXED 1800s
+[bench] TIMEBOXED warmup 8 reqs @ conc 8 osl 128
+[bench] timeboxed: 1.5 tok/s (3072 tok, 24 reqs, 2081s incl. drain)
+{
+ "tok_per_s": 1.5,
+ "noise_floor_pct": 0.0,
+ "blocks": [
+  {
+   "tok_per_s": 1.5,
+   "gen_tokens": 3072,
+   "wall_s": 2081.3,
+   "requests": 24
+  }
+ ],
+ "concurrency": 8,
+ "protocol": "timeboxed(1800s, conc=8, osl_cap=128)",
+ "workload": "prefill_heavy",
+ "cache_key": "8451a604a8849296",
+ "gpu_mem": "0, 259934 MiB; 1, 259934 MiB; 2, 259934 MiB; 3, 259934 MiB; 4, 243240 MiB; 5, 244066 MiB; 6, 235776 MiB; 7, 246422 MiB",
+ "measured_at": "2026-07-27 16:14:51"
+}
+[bench] ledger row appended: iter=0 engine=pyengine workload=prefill_heavy tok_per_s=1.5

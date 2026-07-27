@@ -310,7 +310,7 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
       differ by design), cache_key 8451a604a8849296, run stamped commit
       8c29167; log docs/logs/2026-07-27_pyengine_iter0_decode_heavy.log
       (no code change; run against the prior session's persistent server)
-- [ ] B4.2 same for prefill_heavy.
+- [x] B4.2 same for prefill_heavy.
       WAS-BLOCKED 2026-07-27 (budget rule — test NOT started; no command run, no
       server started, GPUs 4-7 untouched. B4.1's forecast held, but every
       number below was RE-VERIFIED first-hand this session against
@@ -344,6 +344,15 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
       HUMAN RULING 2026-07-27: same ruling as B4.1 applies (time-boxed
       protocol + amended flags). Proceed.
       test: `python harness/benchmark.py --endpoint http://localhost:8200 --config configs/canonical_prefill_heavy.json --ledger-iteration 0 --engine pyengine --label "iteration 0" --mechanism "per-sequence eager engine, Triton pending" --max-seconds 1800`
+      — green (per ruling: same timeboxed protocol + amended flags as
+      B4.1): `[bench] timeboxed: 1.5 tok/s (3072 tok, 24 reqs, 2081s
+      incl. drain)`; ledger row 4 appended — engine=pyengine iter=0
+      workload=prefill_heavy tok_per_s=1.5 protocol=timeboxed(1800s,
+      conc=8, osl_cap=128) pct_vs_baseline=0.0 (orientation vs canonical
+      4,999.3; protocols differ by design), cache_key 8451a604a8849296,
+      run stamped commit 759c5ac; log
+      docs/logs/2026-07-27_pyengine_iter0_prefill_heavy.log (no code
+      change; run against the persistent tmux server)
 
 <!-- Loop notes append below this line -->
 - 2026-07-26 B0.1: ran test verbatim from /workspace/tm-opt (venv active,
@@ -1637,3 +1646,45 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
   SESSION LEDGER: staged ledger.jsonl (harness-appended row, append-only
   mechanism) + docs/logs/ copy + PROGRESS.md; harness/ diffs remain
   unstaged.
+- 2026-07-27 B4.2 (TICK): ran the verbatim test FIRST-THING in a fresh
+  session, no code change — the ruling ("same ruling as B4.1 applies:
+  time-boxed protocol + amended flags") was already in the item. Pre-flight:
+  tmux `serve` /health 200 on :8200 (replica resident GPUs 4-7), git clean
+  (the prior sessions' uncommitted harness/ diffs are GONE — absorbed by the
+  human in 759c5ac; nothing to tiptoe around), ledger tail = B4.1's pyengine
+  decode row on top of the 2 vLLM baselines. BUDGET CHECK first (hard rule):
+  a 2-request orientation probe against the idle server (batch 1, "word"-loop
+  prompt, NOT a benchmark) measured prefill 6145 tok = 8.9 s and decode
+  ~0.61 s/tok at that context, so per-request compute ~= 8.9 + 128x0.61
+  ~= 87 s; x8 serialization at the batch-8 admission width ~= 700 s/request
+  wall -> warmup ~700-760 s + 1800 s box + drain 300-700 s ~= 47-54 min
+  total, the same ruled shape B4.1 ran first-thing ("fits a fresh hour") ->
+  start. Ran verbatim from /workspace/tm-opt (venv active,
+  CUDA_VISIBLE_DEVICES=4,5,6,7), FOREGROUND, single run, teed to
+  docs/logs/2026-07-27_pyengine_iter0_prefill_heavy.log. Real output
+  (stdout, complete):
+  ```
+  [bench] prefill_heavy: ISL~8192 OSL=1024 conc=512 cache_key=8451a604a8849296 TIMEBOXED 1800s
+  [bench] TIMEBOXED warmup 8 reqs @ conc 8 osl 128
+  [bench] timeboxed: 1.5 tok/s (3072 tok, 24 reqs, 2081s incl. drain)
+  [bench] ledger row appended: iter=0 engine=pyengine workload=prefill_heavy tok_per_s=1.5
+  ```
+  (full JSON record in the log; gpu_mem snapshot embedded in the row.)
+  Reading: EXACTLY the decode_heavy shape — 24 reqs x 128 tok, zero
+  failures — at 1.5 vs 1.6 tok/s, and the probe says why: prefill is NOT
+  this engine's bottleneck (8.9 s for 6145 tokens in one forward), decode
+  serialization is (8 co-residents pay 8 sequential forwards per token
+  wave, B3.6's ~5.2 s step), so ~6x longer prompts cost only ~7% aggregate
+  plus a longer drain tail (2081 vs 1920 s box wall). pct_vs_baseline 0.0
+  (1.5/4,999.3 = 0.03%, ORIENTATION only — protocol field labels it
+  timeboxed vs canonical, D12 bars don't apply). gpu_mem on 4-7 read ~243
+  GiB at snapshot (torch caching-allocator reserve after 6K-ctx KV churn;
+  B3.6's leak gates measured allocator-allocated drift, which is the
+  binding signal — not re-judged here). P4's accept condition (B3 green +
+  B4 row) is now met for BOTH workloads; B4 track complete. Next
+  loop-actionable item: NONE — the only unchecked item is B3.5, BLOCKED on
+  its human adjudication (numeric-alignment direction). Server LEFT UP in
+  tmux `serve` (a B3.5 ruling rerun or Stage-3 work both want it; relaunch
+  recipe in B4.1's session-3 note). SESSION LEDGER: staged ledger.jsonl
+  (harness-appended row, append-only mechanism) + the docs/logs/ evidence
+  log + PROGRESS.md; nothing else dirty.
