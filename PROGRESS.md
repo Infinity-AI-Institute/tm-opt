@@ -156,6 +156,8 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
       arm (b) determinism verified green live 3x; arm (a) needs one clean
       ~15-20 min run — see the 2026-07-27 loop note (incl. one
       interpretation FLAGGED FOR HUMAN).
+      HUMAN RULING 2026-07-27: near-tie provision APPROVED as specified in 
+      1ec0c82; proceed — run arm (a) to completion and tick.
       test: `python -m engine.pyengine.tests.t_b3 decode`
 - [ ] B3.3 continuous batching scheduler: 8 concurrent greedy requests give
       IDENTICAL tokens to batch-1 runs (batch invariance).
