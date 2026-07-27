@@ -248,7 +248,7 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
       threads (commit c4b9c69)
 
 ## B4 — first honest number
-- [ ] B4.1 benchmark.py runs against pyengine on GPUs 4-7 (vLLM idle),
+- [x] B4.1 benchmark.py runs against pyengine on GPUs 4-7 (vLLM idle),
       decode_heavy canonical config; result written as ledger iteration-0
       row for engine=pyengine with cache_key. LOSING IS EXPECTED
       (case-study iteration 0 was 13.6% of vLLM).
@@ -302,7 +302,14 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
       --port 8200 2>&1 | tee /workspace/logs/serve_pyengine_8200_<date>.log`
       — ready (/health 200) in ~2 min.
       test: `python harness/benchmark.py --endpoint http://localhost:8200 --config configs/canonical_decode_heavy.json --ledger-iteration 0 --engine pyengine --label "iteration 0" --mechanism "per-sequence eager engine, Triton pending" --max-seconds 1800`
-- [ ] B4.2 same for prefill_heavy.
+      — green (per rulings 6a4d40b: timeboxed protocol + amended flags):
+      `[bench] timeboxed: 1.6 tok/s (3072 tok, 24 reqs, 1920s incl. drain)`;
+      ledger row 3 appended — engine=pyengine iter=0 workload=decode_heavy
+      tok_per_s=1.6 protocol=timeboxed(1800s, conc=8, osl_cap=128)
+      pct_vs_baseline=0.0 (orientation vs canonical 13,409.5; protocols
+      differ by design), cache_key 8451a604a8849296, run stamped commit
+      8c29167; log docs/logs/2026-07-27_pyengine_iter0_decode_heavy.log
+      (no code change; run against the prior session's persistent server)
       WAS-BLOCKED 2026-07-27 (budget rule — test NOT started; no command run, no
       server started, GPUs 4-7 untouched. B4.1's forecast held, but every
       number below was RE-VERIFIED first-hand this session against
@@ -1594,3 +1601,38 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
   recipe in the item's IN-PROGRESS note; expect ~45 min; evidence = the
   [bench] timeboxed line + the appended ledger row). PROGRESS.md staged
   alone.
+- 2026-07-27 B4.1 (session 4, TICK): ran the verbatim test FIRST-THING per
+  the session-3 plan, no code change. Pre-flight (all as forecast): tmux
+  `serve` server /health 200 on :8200, replica resident GPUs 4-7; `git diff
+  harness/` re-checked — benchmark.py still whitespace-only vs HEAD (the
+  --max-seconds protocol is committed, 6a4d40b), correctness.py's
+  uncommitted D13 rewrite left unstaged (B3.5's business, B0.1 convention);
+  ledger tail = exactly the 2 vLLM baseline rows (decode 13,409.5 = the
+  orientation denominator). Ran verbatim from /workspace/tm-opt (venv
+  active, CUDA_VISIBLE_DEVICES=4,5,6,7), FOREGROUND, single run, ~40 min
+  total wall (box 1919.9 s incl. drain + warmup ~7 min). Real output
+  (stdout, complete):
+  ```
+  [bench] decode_heavy: ISL~1024 OSL=8192 conc=512 cache_key=8451a604a8849296 TIMEBOXED 1800s
+  [bench] TIMEBOXED warmup 8 reqs @ conc 8 osl 128
+  [bench] timeboxed: 1.6 tok/s (3072 tok, 24 reqs, 1920s incl. drain)
+  [bench] ledger row appended: iter=0 engine=pyengine workload=decode_heavy tok_per_s=1.6
+  ```
+  (full JSON record in the log; gpu_mem snapshot embedded in the row).
+  Reading: 1.6 tok/s aggregate == the B3.5/B3.6 ~1.5 tok/s forecast — the
+  per-sequence eager engine at batch 8, one ~5.2 s engine step per token
+  wave; 24 completed requests x 128 tok exactly (ignore_eos, zero failures,
+  drain overshoot 120 s). pct_vs_baseline 0.0 (1.6/13,409.5 = 0.012%,
+  rounds to 0.0 at the ledger's 1-decimal precision) — an ORIENTATION
+  number only, protocol field labels it timeboxed vs canonical. Case-study
+  iteration 0 was 13.6%; ours is honest and far lower — the D4 attack
+  surface (batched decode above all: 8 sequences currently pay 8
+  sequential forwards per step) is Stage-3's job, which this row now
+  baselines. Evidence log curated to
+  docs/logs/2026-07-27_pyengine_iter0_decode_heavy.log (raw at
+  /workspace/logs/bench_pyengine_decode_heavy_2026-07-27.log). Server LEFT
+  UP in tmux `serve` for B4.2 (same persistent-server plan applies; its
+  ruling is already in place — same timeboxed protocol + amended flags).
+  SESSION LEDGER: staged ledger.jsonl (harness-appended row, append-only
+  mechanism) + docs/logs/ copy + PROGRESS.md; harness/ diffs remain
+  unstaged.
