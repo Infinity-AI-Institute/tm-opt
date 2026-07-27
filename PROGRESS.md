@@ -135,7 +135,7 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
       attn half <= 7.9e-05, dense out <= 9.7e-05, MoE out <= 5.4e-03 (expert
       choice identical); cache K/V + 4 sconv-ring tails bit-equal replay 5/5
       layers; ring/page positional pins exact; wall 13 s (commit f3b1fbd)
-- [ ] B3.2 greedy decode loop (batch 1): SELF-CONSISTENCY, not transformers.
+- [x] B3.2 greedy decode loop (batch 1): SELF-CONSISTENCY, not transformers.
       Decode 32 tokens for the 5 tiny prompts; verify (a) per-step decode
       logits vs full-prefill-of-prefix logits at every step, using B3.1's
       decomposed gates (attention half < 1e-3, dense < 1e-3, MoE < 1e-2
@@ -180,6 +180,21 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
       Tie ceiling raised to 2e-2 (== gate logprob tolerance) for this arm.
       Tick B3.2 with the existing evidence; no rerun required.      
       test: `python -m engine.pyengine.tests.t_b3 decode`
+      — green per HUMAN RULING (2), existing evidence (no rerun, per
+      ruling): arm (b) determinism token_ids bitwise-identical 5/5 prompts
+      x2 runs, reproduced across 2 sessions; arm (a) sweep L0-L4 all 155
+      teacher-forced streams green (attn half <= 4.6e-05 at the event,
+      dense/MoE gates + expert-choice checks incl. the approved p0 s19 L2
+      FLAG) + L5 green through p2 s7; the single p2 s8 L5 event (expert
+      pair 21<->25, decode-side score gap 0.0 exact bf16 tie, recompute-
+      side 1.562e-02 < ruled 2e-2 ceiling; forced-routing replay collapses
+      MoE-out 2.6e-01 -> 3.0e-03) adjudicated PASS via
+      /workspace/logs/diag_b32_p2s8L5.py decomposition. Pre-tick
+      regressions green this session (t_b2 ref/embed/logits — b5b651d
+      code-motion covered). NOTE: t_b3.py still encodes the pre-ruling
+      gates (GATE_TIE 1e-2 at t_b3.py:363, layer-out check ordered before
+      the 6c' provision at :626) — see 2026-07-27 tick note.
+      (implementation b5b651d + 1ec0c82; ruling 6a4d40b; no code change)
 - [x] B3.3 continuous batching scheduler: 8 concurrent greedy requests give
       IDENTICAL tokens to batch-1 runs (batch invariance).
       test: `python -m engine.pyengine.tests.t_b3 batch`
@@ -1445,3 +1460,40 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
   before the loop can do further work.
   SESSION LEDGER: this PROGRESS.md edit is the only change, committed
   alone per the BLOCKED rule.
+- 2026-07-27 B3.2 tick (per HUMAN RULING (2) in 6a4d40b: PASS, tick with
+  existing evidence, no rerun). Scope this session: the ruling waives the
+  t_b3 decode rerun, so it was NOT run; the one open precondition from the
+  first IN-PROGRESS note — regressions on the b5b651d code motion
+  (t_b2.load_layer_weights/build_native_layer lift, t_logits rewire),
+  never rerun in the BLOCKED session — was discharged first. GPUs 4-7
+  idle pre-flight (4 MiB each). Real outputs (venv active,
+  CUDA_VISIBLE_DEVICES=4,5,6,7, foreground):
+  ```
+  ref ok: existing refs verified — 94 tensors, sha256 eae8f3a95804, layers [0, 1, 2, 5, 6], prompt 13 toks (generated with transformers 5.14.1, 63.5 s)
+  embed ok: 13 toks; lookup rel err 0.0e+00 (bit-exact True), embed_norm rel err 0.0e+00 < 1e-2 (bit-exact True, max|diff| 0.0e+00); weights (201024, 6144) bf16 from shards, eps 1e-06
+  logits ok: full 66-layer streamed forward, 5 tiny prompts (T 4-13) — greedy top-1 MATCH 5/5 vs native transformers (' Berlin',' Au',' oxygen',' cold',' four'); streaming ref pinned bit-exact vs frozen captures (13 pins: embed+norm, layers {0,1,2,5,6} in/out under grouped_mm dispatch, final_norm@L6); our engine bit-exact vs frozen layers 0-1 out (2/2), MoE-layer drift @2/5/6 4.8e-04/2.1e-03/2.9e-03 < 1e-2 (expert-kernel order, B2.9); masks bit-equal native builders x5 prompts, conv_mask None; logit head bit-equal on shared hidden; last-pos logits rel err 9.2e-02 max, top-1 margins ref [6.0,0.8,4.5,1.0,1.8] ours [6.1,0.9,4.5,0.8,1.5]; wall 128 s
+  ```
+  All three match their original tick evidence (ref sha unchanged; logits
+  identical numbers to B2.11 at wall 128 s vs 130 s). CODE/SPEC DIVERGENCE
+  FLAGGED FOR HUMAN (no gate edit made — the ruling specifies the ceiling
+  but not its encoding): t_b3.py still encodes the pre-ruling spec, so a
+  future verbatim `t_b3 decode` rerun will deterministically stop at the
+  adjudicated p2 s8 L5 comparison — the layer-out gate (t_b3.py:626,
+  GATE_MOE 1e-2 vs the event's 1.012e-02) fires BEFORE the 6c' tie
+  provision is reached, and GATE_TIE (t_b3.py:363) is still 1e-2 (shared
+  by the token arm, whose 1e-2 was separately APPROVED in ruling (1)) vs
+  the ruled 2e-2 for the choice arm. Making the test rerunnable-green per
+  the ruling needs two human-specified encodings: (i) choice-arm tie
+  ceiling 2e-2 (direct from the ruling; suggest a separate GATE_TIE_CHOICE
+  so the token arm keeps its approved 1e-2), and (ii) the layer-out gate's
+  behavior at a qualifying flagged-flip step (the ruling's PASS logic
+  implies scoping it to the forced-routing replay < 1e-2, option (a) of
+  the BLOCKED note, measured 3.0e-03 — but that gate re-scope was not
+  explicitly ruled, so the loop did not touch it). Until then B3.2's
+  green stands on the adjudicated evidence, not on a rerunnable test.
+  SESSION LEDGER: uncommitted root edits to harness/benchmark.py +
+  harness/correctness.py (the B4.1/B4.2 ruling's --max-seconds work) were
+  left UNSTAGED — harness/ is off-limits to the loop and those edits are
+  the human's; staged PROGRESS.md only (B0.1 convention). No code change;
+  next loop-actionable item is B3.4b (B3.5 remains BLOCKED on its own
+  ruling).
