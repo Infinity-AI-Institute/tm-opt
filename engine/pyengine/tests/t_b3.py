@@ -954,6 +954,13 @@ def t_server():
       (c) requests were genuinely co-resident (scheduler peak_running
           >= 2; expected 8) — continuous batching through the HTTP path,
           arrivals mapped onto step boundaries;
+      (c2) B3.4b ids-prompt arm: the SAME 8 parity-shaped requests sent
+          as token-id arrays (this test's own AutoTokenizer encodings —
+          the OpenAI-spec list[int] prompt form the D13 teacher-forced
+          gate sends) return BYTE-IDENTICAL response bodies to their
+          string-prompt forms, modulo the two per-request envelope
+          nonces (id = request counter, created = wall clock), which are
+          masked before the byte compare;
       (d) ignore_eos semantics: default (absent) arms eos — expected
           tokens = the batch-1 baseline truncated at the first eos
           (dynamic: no assumption eos appears in tiny continuations);
@@ -962,9 +969,12 @@ def t_server():
       (e) contract violations fail LOUD, never silently mis-serve:
           400 for temperature != 0 / temperature absent / missing prompt /
           logprobs > 1 / stream / echo / max_tokens over KV capacity /
-          max_tokens < 1, 404 for unknown paths; /health 200 before,
+          max_tokens < 1 / malformed id-list prompts (empty, mixed str,
+          bool, float, nested batch, out-of-range id, negative id — the
+          B3.4b fail-loud note), 404 for unknown paths; /health 200 before,
           DURING the concurrent batch, and after; clean shutdown (engine
           thread joins, queues empty, no engine error)."""
+    import json
     import requests as rq
     from concurrent.futures import ThreadPoolExecutor
     from transformers import AutoTokenizer
@@ -1084,7 +1094,47 @@ def t_server():
                          f"were never co-resident; not continuous "
                          f"batching through HTTP")
 
-    #6. default-eos + minimal-fields arm: no logprobs / return_token_ids /
+    #6. B3.4b ids-prompt arm: the SAME 8 parity-shaped requests as
+    #   token-id arrays (this test's own AutoTokenizer encodings from #1
+    #   — identical to what the server's tokenizer produces, so the
+    #   engine sees identical input ids). Gate: response bodies
+    #   byte-identical to the string-prompt responses after masking the
+    #   two per-request envelope nonces (id counter, created timestamp);
+    #   both sides re-dump through the same json.dumps, so byte equality
+    #   pins every other field — token_ids, float64 logprobs, text,
+    #   usage, finish_reason — at once (engine determinism is B3.2 arm
+    #   (b); this arm additionally pins the tokenize-skip path).
+    def _post_ids(i):
+        return rq.post(f"{url}/v1/completions",
+                       json={"model": MODEL_DIR, "prompt": ids[i].tolist(),
+                             "max_tokens": MAX_NEW8[i], "temperature": 0,
+                             "logprobs": 1, "seed": 0,
+                             "return_token_ids": True, "ignore_eos": True},
+                       timeout=600)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        resps_ids = list(pool.map(_post_ids, range(8)))
+
+    def _masked(resp):
+        j = json.loads(resp.content)
+        if not str(j.pop("id", "")).startswith("cmpl-") or \
+                not isinstance(j.pop("created", None), int):
+            raise SystemExit("[t_b3 server] ids-arm: envelope nonce "
+                             "fields (id/created) missing or malformed")
+        return json.dumps(j).encode()
+
+    for i, r in enumerate(resps_ids):
+        if r.status_code != 200:
+            raise SystemExit(f"[t_b3 server] ids req {i} HTTP "
+                             f"{r.status_code}: {r.text[:400]}")
+        s_body, i_body = _masked(resps[i]), _masked(r)
+        if s_body != i_body:
+            raise SystemExit(f"[t_b3 server] ids req {i} response NOT "
+                             f"byte-identical to string-prompt form:\n"
+                             f"str: {s_body[:300]}\nids: {i_body[:300]}")
+    t_ids = time.time() - t0 - t_load - t_base - t_conc
+
+    #7. default-eos + minimal-fields arm: no logprobs / return_token_ids /
     #   ignore_eos -> logprobs null, NO token_ids key, eos armed (expected
     #   = baseline truncated at first eos — dynamic, works either way)
     r = rq.post(f"{url}/v1/completions",
@@ -1113,7 +1163,7 @@ def t_server():
                          f"{ch['finish_reason']} {j['usage']}")
     n_eos_base = sum(mc.eos in b for b in base)
 
-    #7. Request-level eos unit pin (no GPU): armed eos stops early;
+    #8. Request-level eos unit pin (no GPU): armed eos stops early;
     #   eos=None (ignore_eos) runs past eos to max_new
     r_eos = psched.Request(99, ids[0].cpu(), 8, eos=7)
     r_eos.tokens.extend([3, 5])
@@ -1126,8 +1176,10 @@ def t_server():
     r_ign.tokens.append(1)
     assert r_ign.done, "eos pin: length cap did not stop the request"
 
-    #8. loud-failure arms: each of these MUST 400 (silently serving any
-    #   of them would corrupt a gate or a benchmark), unknown paths 404
+    #9. loud-failure arms: each of these MUST 400 (silently serving any
+    #   of them would corrupt a gate or a benchmark), unknown paths 404;
+    #   the id-list arms pin the B3.4b fail-loud note (malformed lists
+    #   and embed-table range both 400, never guess / never device-assert)
     bad = [({"prompt": "x", "max_tokens": 4, "temperature": 0.7},
             "temperature 0.7"),
            ({"prompt": "x", "max_tokens": 4}, "temperature absent"),
@@ -1141,7 +1193,21 @@ def t_server():
            ({"prompt": "x", "max_tokens": NUM_PAGES * pkv.PAGE_SIZE,
              "temperature": 0}, "over capacity"),
            ({"prompt": "x", "max_tokens": 0, "temperature": 0},
-            "max_tokens 0")]
+            "max_tokens 0"),
+           ({"prompt": [], "max_tokens": 4, "temperature": 0},
+            "empty id list"),
+           ({"prompt": [1, "x"], "max_tokens": 4, "temperature": 0},
+            "mixed id list"),
+           ({"prompt": [True, 2], "max_tokens": 4, "temperature": 0},
+            "bool in id list"),
+           ({"prompt": [1.5, 2], "max_tokens": 4, "temperature": 0},
+            "float in id list"),
+           ({"prompt": [[1, 2]], "max_tokens": 4, "temperature": 0},
+            "nested id list"),
+           ({"prompt": [mc.vocab], "max_tokens": 4, "temperature": 0},
+            "id out of embed range"),
+           ({"prompt": [-1], "max_tokens": 4, "temperature": 0},
+            "negative id")]
     for body, tag in bad:
         rb = rq.post(f"{url}/v1/completions", json=body, timeout=30)
         if rb.status_code != 400 or "error" not in rb.json():
@@ -1153,7 +1219,7 @@ def t_server():
         raise SystemExit(f"[t_b3 server] unknown paths: "
                          f"{r404p.status_code}/{r404g.status_code} != 404")
 
-    #9. /health after + clean shutdown; nothing stranded, no engine error
+    #10. /health after + clean shutdown; nothing stranded, no engine error
     ha = rq.get(f"{url}/health", timeout=10)
     if ha.status_code != 200:
         raise SystemExit(f"[t_b3 server] /health after: {ha.status_code}")
@@ -1167,12 +1233,12 @@ def t_server():
         raise SystemExit("[t_b3 server] scheduler queues not empty at "
                          "shutdown")
     n_fin = len(loop.sched.finished)
-    if n_fin != 9:
-        raise SystemExit(f"[t_b3 server] finished {n_fin} != 9 (8 "
-                         f"concurrent + 1 eos-arm; 400s must never reach "
-                         f"the scheduler)")
+    if n_fin != 17:
+        raise SystemExit(f"[t_b3 server] finished {n_fin} != 17 (8 "
+                         f"concurrent string + 8 ids-prompt + 1 eos-arm; "
+                         f"400s must never reach the scheduler)")
 
-    #10. summary = the green evidence
+    #11. summary = the green evidence
     print(f"server ok: /v1/completions x 8 CONCURRENT parity-shaped "
           f"requests (temperature 0, logprobs 1, seed, return_token_ids, "
           f"ignore_eos; T {min(lens)}-{max(lens)}, max_new {min(MAX_NEW8)}"
@@ -1181,16 +1247,21 @@ def t_server():
           f"token_logprobs == fp32 log-softmax of batch-1 captured logits "
           f"8/8 (exact float64 via JSON), tokens/top_logprobs/text_offset "
           f"aligned, text == detok, finish 'length', usage exact 8/8, "
-          f"peak_running {peak}; default-eos arm: logprobs null + NO "
+          f"peak_running {peak}; B3.4b ids-prompt arm: same 8 requests "
+          f"as token-id arrays -> responses byte-identical to string "
+          f"forms 8/8 (id/created nonces masked); default-eos arm: "
+          f"logprobs null + NO "
           f"token_ids key + eos-armed truncation (eos in {n_eos_base}/8 "
           f"baselines; Request-level pin: armed eos stops early, eos=None "
           f"runs past); loud failures: 400 x {len(bad)} (bad temperature/"
-          f"prompt/logprobs/stream/echo/capacity/max_tokens), 404 x 2; "
+          f"prompt/logprobs/stream/echo/capacity/max_tokens + malformed "
+          f"id lists incl. out-of-range/negative), 404 x 2; "
           f"/health ok before+during+after; ephemeral port {port} (CLI "
           f"default 8200); shutdown clean (engine thread joined, queues "
           f"empty, {n_fin} retired); wall load {t_load:.0f} s + baseline "
-          f"{t_base:.0f} s + concurrent {t_conc:.0f} s + arms "
-          f"{time.time() - t0 - t_load - t_base - t_conc:.0f} s")
+          f"{t_base:.0f} s + concurrent {t_conc:.0f} s + ids-arm "
+          f"{t_ids:.0f} s + arms "
+          f"{time.time() - t0 - t_load - t_base - t_conc - t_ids:.0f} s")
 
 
 SOAK_SECS = 1800          # the item's 30 minutes — not configurable

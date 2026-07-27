@@ -7,6 +7,12 @@ Contract (docs/BASELINE_NOTES.md, verified live against vLLM):
   POST /v1/completions {model, prompt, max_tokens, temperature: 0,
                         logprobs: 0|1, seed, return_token_ids: bool,
                         ignore_eos: bool}
+    prompt: one non-empty string, or one non-empty token-id array
+    (list[int] — OpenAI completions spec, vLLM supports it; B3.4b: the
+    D13 teacher-forced parity gate posts prompt ids + golden-prefix ids
+    to eliminate detokenize/retokenize boundary effects). Id arrays are
+    used as input ids directly, tokenization skipped; same length/
+    capacity checks as strings.
     -> {id, object: "text_completion", created, model,
         choices: [{index, text,
                    token_ids,     # CHOICE level, present iff
@@ -225,15 +231,26 @@ class _Ctx:
 
 def _validate(body):
     """Contract checks for /v1/completions; returns (err, prompt, max_new,
-    logprobs, return_token_ids, ignore_eos) with err=None on success.
-    Anything this engine cannot serve EXACTLY is a loud 400 (greedy-only,
-    no stream/echo/stop/n>1) — never a silent semantic change."""
-    #1. prompt: one non-empty string (a singleton list is accepted)
+    logprobs, return_token_ids, ignore_eos) with err=None on success;
+    prompt comes back as a str (tokenize) or list[int] (token-id array,
+    used directly — B3.4b). Anything this engine cannot serve EXACTLY is
+    a loud 400 (greedy-only, no stream/echo/stop/n>1; malformed prompt
+    lists — empty, mixed, bool, float, nested batch — never guess) —
+    never a silent semantic change."""
+    #1. prompt: one non-empty string OR one non-empty token-id array
+    #   (a singleton [str] is unwrapped; list[int] skips tokenization,
+    #   B3.4b — OpenAI spec form the D13 teacher-forced gate sends)
     p = body.get("prompt")
     if isinstance(p, list) and len(p) == 1 and isinstance(p[0], str):
         p = p[0]
-    if not isinstance(p, str) or not p:
-        return ("prompt must be one non-empty string",) + (None,) * 5
+    if isinstance(p, list):
+        if not p or not all(isinstance(t, int) and not isinstance(t, bool)
+                            for t in p):
+            return ("prompt list must be a non-empty token-id array "
+                    "(every element an int)",) + (None,) * 5
+    elif not isinstance(p, str) or not p:
+        return ("prompt must be one non-empty string or one token-id "
+                "array",) + (None,) * 5
     #2. greedy-only: temperature must be present and exactly 0
     t = body.get("temperature")
     if (isinstance(t, bool) or not isinstance(t, (int, float))
@@ -345,9 +362,25 @@ class Handler(BaseHTTPRequestHandler):
             if err:
                 self._send(400, {"error": err})
                 return
-            #3. tokenize on CPU (under the tokenizer lock)
-            with ctx.tok_lock:
-                ids = ctx.tok(prompt, return_tensors="pt").input_ids[0]
+            #3. input ids: a token-id-array prompt is used directly
+            #   (tokenization skipped, B3.4b) after a range check against
+            #   the embed table (mc.vocab rows) — an out-of-range id
+            #   would device-assert inside the embed gather and kill the
+            #   engine thread, so it must 400 here; string prompts
+            #   tokenize on CPU (under the tokenizer lock). Length/
+            #   capacity checks below are identical for both forms.
+            if isinstance(prompt, list):
+                bad = next((t for t in prompt
+                            if not 0 <= t < ctx.mc.vocab), None)
+                if bad is not None:
+                    self._send(400, {"error": f"prompt token id {bad} "
+                                              f"outside [0, "
+                                              f"{ctx.mc.vocab})"})
+                    return
+                ids = torch.tensor(prompt, dtype=torch.long)
+            else:
+                with ctx.tok_lock:
+                    ids = ctx.tok(prompt, return_tensors="pt").input_ids[0]
             if int(ids.shape[0]) + max_new > ctx.max_seq:
                 self._send(400, {"error": f"prompt {int(ids.shape[0])} + "
                                           f"max_tokens {max_new} exceeds "
