@@ -277,6 +277,30 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
       identical workload distribution is the honest iteration-0 form. Row
       records protocol=timeboxed(1800). --engine/--label/--mechanism amended
       per the loop's finding. Proceed.
+      IN-PROGRESS 2026-07-27 (3rd session): test NOT started — budget rule.
+      End-to-end wall from cold is ~45-56 min (warmup wave 8x128 tok ~666 s
+      at the measured ~1.5 tok/s aggregate + 1800 s box + drain of in-flight
+      at deadline 0-666 s + ~4 min server start), over this session's
+      remaining runway; the 6a4d40b option-(c) dispensation authorizes the
+      >40-min RUN, not a session overrun (client killed mid-box = no ledger
+      row, no commit — worst outcome). DONE instead, the persistent half:
+      pyengine server UP in tmux session `serve`, port 8200 (max_batch 8,
+      capacity 16384 tok/seq, load 102 s), /health 200, smoke completion
+      8 tok / 8.7 s with usage.completion_tokens present (the field
+      benchmark.py counts); log /workspace/logs/serve_pyengine_8200_
+      2026-07-27.log. ALSO VERIFIED: committed HEAD benchmark.py HAS
+      --max-seconds (ruling commit 6a4d40b; uncommitted harness/ diff on
+      benchmark.py is one whitespace line — the prior session's
+      stale-harness caution is RESOLVED, no harness commit needed).
+      NEXT ITERATION: run the verbatim test FIRST-THING against the
+      running server (est. 44-52 min: warmup ~11 min + box 30 min + drain
+      3-11 min; fits a fresh hour), FOREGROUND, tick with the printed
+      [bench] timeboxed line + ledger row as evidence. If /health fails
+      (pod restart), relaunch first: `tmux new-session -d -s serve` then
+      send-keys `source /workspace/venv/bin/activate && export
+      CUDA_VISIBLE_DEVICES=4,5,6,7 && python -m engine.pyengine.server
+      --port 8200 2>&1 | tee /workspace/logs/serve_pyengine_8200_<date>.log`
+      — ready (/health 200) in ~2 min.
       test: `python harness/benchmark.py --endpoint http://localhost:8200 --config configs/canonical_decode_heavy.json --ledger-iteration 0 --engine pyengine --label "iteration 0" --mechanism "per-sequence eager engine, Triton pending" --max-seconds 1800`
 - [ ] B4.2 same for prefill_heavy.
       WAS-BLOCKED 2026-07-27 (budget rule — test NOT started; no command run, no
@@ -1545,3 +1569,28 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
   check `git status harness/` before starting B4.1 and, if the edits
   are still uncommitted (loop may not commit harness/), mark B4.1
   accordingly rather than run a stale harness.
+- 2026-07-27 B4.1 (session 3, IN-PROGRESS — no tick): budget split, no code
+  change. Verified first: HEAD benchmark.py already implements the ruled
+  --max-seconds timeboxed protocol (committed in 6a4d40b; `git diff
+  harness/benchmark.py` is a single whitespace-only hunk, and
+  correctness.py's uncommitted D13 teacher-forced rewrite is B3.5's
+  business — neither staged, B0.1 convention). The prior session's "stale
+  harness" caution is therefore MOOT. Then the budget math: at the engine's
+  measured ~1.5 tok/s aggregate (one ~5.2 s engine step gives each of 8
+  co-residents 1 token, B3.6), the verbatim command from cold = warmup wave
+  8 reqs x 128 tok ~= 666 s + 1800 s box + drain of the last wave (workers
+  admit new requests until the deadline, run_timeboxed drains in-flight;
+  overshoot 0-1 request = 0-666 s) + ~4 min server start ~= 45-56 min, vs
+  <50 min of session left at decision time -> the hard >40-min budget rule
+  says don't start; the option-(c) dispensation covers the RUN's length,
+  not a 60-min session overrun. Did the persistent half instead: server up
+  in tmux `serve` (server.py:431's own documented home) on :8200, GPUs 4-7
+  (vLLM on 0-3 untouched), load 102 s, /health 200, smoke completion 8 tok
+  in 8.7 s end-to-end, usage.completion_tokens == 8 (the exact field
+  benchmark.py counts; greedy continuation of a 'word'-loop prompt is
+  'word' repeated — sane). tmux outlives the session; GPUs 4-7 hold the
+  replica (~142 GiB/GPU) so the next iteration skips load + cold-start
+  risk and starts the verbatim test immediately (full math + relaunch
+  recipe in the item's IN-PROGRESS note; expect ~45 min; evidence = the
+  [bench] timeboxed line + the appended ledger row). PROGRESS.md staged
+  alone.
