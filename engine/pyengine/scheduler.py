@@ -1,4 +1,210 @@
-"""B3.3: continuous batching + chunked prefill. Batch-invariant by
-construction: deterministic reduction orders, no batch-size-dependent math.
-Canonical-workload specialization is Stage-3 territory, not bring-up."""
-#TODO(B3.3)
+"""B3.3: continuous batching scheduler — iteration-level scheduling (the
+Orca/vLLM shape: requests join the running set at any step boundary, leave
+the moment they finish, every running sequence advances one token per step).
+
+Batch invariance is BY CONSTRUCTION, and that is the design decision this
+module encodes: a step advances each sequence through the exact batch-1 op
+sequence (model.layer_prefill / model.layer_decode on the sequence's OWN
+kv.LayerKV), so co-scheduled sequences share weights only — never a
+reduction — and generated tokens are bitwise those of a batch-1
+model.generate_greedy run regardless of arrival order, co-residents, or
+batch cap (the t_b3 batch gate). B3.1/B3.2 established WHY a fused
+alternative could not meet that gate: bf16 accumulation order is
+row-count-dependent (T=1 GEMV vs row-batched GEMM rows), so fused-batch
+kernels drift vs batch-1 exactly the way recompute drifts vs decode.
+Fusing co-resident sequences into batched kernels is Stage-3 experiment
+work (D4 scheduler specialization / grouped GEMM), refereed by this same
+invariance test plus the parity gate. Chunked prefill (splitting a long
+prompt across steps so an arrival cannot stall running decodes) is
+deferred with it — prefill here is one whole-prompt step, fine at
+bring-up lengths; the seam is Engine.prefill.
+
+Scope: greedy only (canonical workloads are greedy, P1), ignore_eos
+semantics (no early exit — a request runs to its max_new, D6/P1), text
+only. The B3.4 server maps wall-clock arrivals onto step boundaries via
+Scheduler.submit(arrival_step=...) and consumes completions through the
+on_retire callback."""
+import torch
+
+from engine.pyengine import kv as pkv
+from engine.pyengine import model as pmodel
+
+
+class Request:
+    """One greedy generation request. `ids` [T] int64 prompt tokens on the
+    embed weight's device; `max_new` >= 1 tokens to generate. The scheduler
+    fills `tokens` (python ints) and stamps admit_step / finish_step;
+    `states` (per-layer kv.LayerKV) lives only while the request runs."""
+
+    def __init__(self, req_id, ids, max_new):
+        #1. identity + inputs
+        assert max_new >= 1, "a request must generate at least one token"
+        self.id = req_id
+        self.ids = ids
+        self.max_new = max_new
+        #2. progress, owned by the scheduler
+        self.tokens = []
+        self.states = None
+        self.admit_step = None
+        self.finish_step = None
+
+    @property
+    def done(self):
+        #1. ignore_eos semantics: length is the only stop condition
+        return len(self.tokens) >= self.max_new
+
+
+class Engine:
+    """Resident-model handle: the 66 per-layer weight dicts (possibly
+    spread over GPUs — hidden-state hops are bitwise copies, B3.2), embed /
+    final-norm / unembed weights, the verified config, and the per-layer
+    page budget for global-KV allocation. Owns NO per-request state.
+    prefill() and decode() transcribe model.generate_greedy's two step
+    forms op for op (same functions, order, dtypes, devices) because the
+    B3.3 gate is bitwise token identity with that loop; masks are pure
+    selection, cached per (device, length) exactly like generate_greedy's
+    per-device cache."""
+
+    def __init__(self, layers, w_emb, w_en, w_fn, w_un, mc, num_pages):
+        #1. weights + config; mask cache keyed (device, length)
+        self.layers = layers
+        self.w_emb, self.w_en, self.w_fn, self.w_un = w_emb, w_en, w_fn, w_un
+        self.mc = mc
+        self.num_pages = num_pages
+        self._masks = {}
+
+    def new_states(self):
+        """Fresh per-layer recurrent state on each layer's own device."""
+        #1. LayerKV picks ring vs paged from the layer type (B3.1)
+        return [pkv.LayerKV(self.mc, L, self.layers[L]["attn_norm"].device,
+                            num_pages=self.num_pages)
+                for L in range(self.mc.num_layers)]
+
+    def _mask_pos(self, dev, n):
+        #1. (full, window, positions) per (device, length), built once —
+        #   pure selection, bitwise = generate_greedy's own build (B2.6/7)
+        key = (dev, n)
+        if key not in self._masks:
+            p = torch.arange(n, device=dev)
+            dt = self.w_emb.dtype
+            self._masks[key] = (
+                pmodel.additive_causal_mask(p, p, dt),
+                pmodel.additive_causal_mask(p, p, dt, window=self.mc.window),
+                p)
+        return self._masks[key]
+
+    @torch.no_grad()
+    def prefill(self, req):
+        """Whole-prompt prefill populating req.states; returns the first
+        greedy token (generate_greedy's prefill form, model.py)."""
+        mc = self.mc
+        #1. embed -> 66 x layer_prefill(state=...) across the layer devices
+        _, h = pmodel.embed(req.ids[None], self.w_emb, self.w_en,
+                            eps=mc.rms_eps)
+        for L in range(mc.num_layers):
+            dev = self.layers[L]["attn_norm"].device
+            full, win, p = self._mask_pos(dev, req.ids.shape[0])
+            h = pmodel.layer_prefill(
+                h.to(dev), self.layers[L],
+                full if L in mc.global_layers else win, p, mc, L,
+                state=req.states[L])
+        #2. last-position logits -> fp32 argmax over the unpadded vocab
+        #   (the B2.11 comparison form, generate_greedy's _pick)
+        row = pmodel.final_logits(h[:, -1], self.w_fn, self.w_un,
+                                  mc.logits_mult, mc.vocab_unpadded,
+                                  eps=mc.rms_eps)[0]
+        return int(row.float().argmax())
+
+    @torch.no_grad()
+    def decode(self, req):
+        """One decode step: embed the previous token, run the 66 cached-
+        decode layers at absolute position T-1+s (generate_greedy's decode
+        form; s = tokens generated so far), return the next greedy token."""
+        mc = self.mc
+        s = len(req.tokens)
+        #1. embed the previous token, 66 x layer_decode through req's state
+        prev = torch.tensor([req.tokens[-1]], device=self.w_emb.device)
+        _, h = pmodel.embed(prev, self.w_emb, self.w_en, eps=mc.rms_eps)
+        for L in range(mc.num_layers):
+            h = pmodel.layer_decode(
+                h.to(self.layers[L]["attn_norm"].device), self.layers[L],
+                req.states[L], req.ids.shape[0] - 1 + s, mc, L)
+        #2. logits -> fp32 argmax, same form as prefill
+        row = pmodel.final_logits(h, self.w_fn, self.w_un, mc.logits_mult,
+                                  mc.vocab_unpadded, eps=mc.rms_eps)[0]
+        return int(row.float().argmax())
+
+
+class Scheduler:
+    """Iteration-level scheduler over one Engine. submit() queues a request
+    with an arrival step (a deterministic stand-in for wall-clock arrival);
+    each step() admits due arrivals into free slots FCFS (arrival step,
+    then submission order), prefills them (an arrival's first token IS its
+    token for that step), advances every previously-admitted running
+    sequence one decode token, then retires finished sequences — calling
+    on_retire(req) while req.states is still attached (the B3.4 completion
+    seam / test pin) before freeing the KV. run() drains everything and
+    returns {req_id: tokens}."""
+
+    def __init__(self, engine, max_batch, on_retire=None):
+        #1. config + queues; running is kept in admission order
+        assert max_batch >= 1
+        self.engine = engine
+        self.max_batch = max_batch
+        self.on_retire = on_retire
+        self.waiting = []    # (arrival_step, submit_seq, request)
+        self.running = []
+        self.finished = []
+        self.step_count = 0
+        self.peak_running = 0
+        self._seq = 0
+
+    def submit(self, req, arrival_step=0):
+        """Queue a request; it becomes admissible at `arrival_step`."""
+        #1. FCFS key = (arrival, submission order) — fully deterministic
+        self.waiting.append((arrival_step, self._seq, req))
+        self._seq += 1
+
+    def step(self):
+        """One scheduling iteration: admit -> one token per sequence ->
+        retire. Per-sequence forwards are batch-1 exact (Engine), so the
+        schedule changes only WHEN work happens, never its numerics."""
+        #1. admit due arrivals FCFS while slots are free; prefill is the
+        #   arrival's token for this step
+        for entry in sorted(w for w in self.waiting
+                            if w[0] <= self.step_count):
+            if len(self.running) >= self.max_batch:
+                break
+            self.waiting.remove(entry)
+            req = entry[2]
+            req.states = self.engine.new_states()
+            req.admit_step = self.step_count
+            self.running.append(req)
+            req.tokens.append(self.engine.prefill(req))
+        self.peak_running = max(self.peak_running, len(self.running))
+        #2. one decode token for every sequence admitted in a PRIOR step
+        for req in self.running:
+            if req.admit_step < self.step_count and not req.done:
+                req.tokens.append(self.engine.decode(req))
+        #3. retire finished sequences; free their KV after the callback
+        still_running = []
+        for req in self.running:
+            if req.done:
+                req.finish_step = self.step_count
+                if self.on_retire is not None:
+                    self.on_retire(req)
+                req.states = None
+                self.finished.append(req)
+            else:
+                still_running.append(req)
+        self.running = still_running
+        self.step_count += 1
+
+    def run(self, max_steps=1 << 20):
+        """Drain the queues; returns {req_id: token list}."""
+        #1. step until idle; a wedged schedule fails loud
+        while self.waiting or self.running:
+            if self.step_count >= max_steps:
+                raise RuntimeError("scheduler exceeded max_steps")
+            self.step()
+        return {r.id: r.tokens for r in self.finished}

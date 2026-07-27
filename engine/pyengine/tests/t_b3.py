@@ -64,6 +64,7 @@ from engine.pyengine import config as pcfg
 from engine.pyengine import kv as pkv
 from engine.pyengine import loader
 from engine.pyengine import model as pmodel
+from engine.pyengine import scheduler as psched
 from engine.pyengine.tests.t_b2 import (DEV, MODEL_DIR, PROMPTS5, _deint3,
                                         _disk, _load_refs, _rel_err,
                                         load_layer_weights)
@@ -734,6 +735,199 @@ def t_decode():
           f"recompute {time.time() - t0 - t_gen:.0f} s")
 
 
+PROMPTS8 = PROMPTS5 + (          # B3.3: 3 more in the same tiny style
+    "The chemical symbol for iron is",
+    "The capital of Japan is",
+    "One plus one equals",
+)
+MAX_NEW8 = (32, 24, 17, 32, 9, 27, 12, 21)  # varied -> retirements interleave
+ARRIVE8 = (0, 0, 0, 0, 1, 2, 3, 4)          # staggered -> joins mid-flight
+
+
+def t_batch():
+    """B3.3: continuous batching scheduler — 8 concurrent greedy requests
+    must produce IDENTICAL tokens to batch-1 runs (batch invariance; NO
+    tolerance anywhere in this test).
+
+    Baseline: model.generate_greedy per request from fresh state — the
+    exact loop B3.2 certified bitwise-deterministic (arm b, 5/5 prompts,
+    live 5x across sessions). The SAME resident engine then runs the
+    requests through scheduler.Scheduler under two genuinely different
+    schedules:
+      A: submission order 0..7, staggered arrivals (0,0,0,0,1,2,3,4),
+         cap 8 — late requests join while earlier ones are mid-decode;
+         all 8 run CONCURRENTLY (peak pinned == 8); varied max_new (9-32)
+         makes retirements interleave with continued decoding.
+      B: submission order REVERSED, all arrivals 0, cap 3 — exercises the
+         FCFS waiting queue and admission-on-retirement; every sequence
+         decodes next to different co-residents than in A.
+    Gate: every request's token list == its batch-1 list, exact int
+    equality, 8/8 in BOTH schedules. Batch invariance holds by
+    construction — Engine transcribes generate_greedy's step forms op for
+    op, each sequence owns its kv.LayerKV, co-scheduled sequences share
+    weights and never a reduction; B3.1/B3.2's row-count-drift facts are
+    WHY fused-batch kernels could not meet a bitwise gate (they are
+    Stage-3 work, D4, refereed by this same test). What is genuinely
+    under test is therefore the scheduler's bookkeeping: admission
+    timing, state isolation, position accounting, retirement — the gate
+    proves it all adds exactly nothing. Retirement pin: cache.n ==
+    T + max_new - 1 on all 66 layers inside on_retire (the last token is
+    never fed back, B3.2), KV freed right after. Prompt content is
+    irrelevant to a self-consistency gate; tiny prompts keep the test
+    inside the session budget (~174 generated tokens x 3 passes)."""
+    from transformers import AutoTokenizer
+    t0 = time.time()
+    torch.manual_seed(0)
+    mc = pcfg.load_verified(MODEL_DIR)
+    idx = loader.build_shard_index(MODEL_DIR)
+    hdr = loader.read_headers(idx)
+    dm = loader.build_dtype_map(idx, hdr)
+    ndev = torch.cuda.device_count()
+    assert ndev == 4, f"expected GPUs 4-7 visible, got {ndev}"
+
+    #1. tokenize the 8 prompts on the embed device
+    tok = AutoTokenizer.from_pretrained(MODEL_DIR, trust_remote_code=True)
+    ids = [tok(p, return_tensors="pt").input_ids[0].to(DEV) for p in PROMPTS8]
+    lens = [t.shape[0] for t in ids]
+
+    #2. layer -> GPU assignment + resident load — mirrors t_decode #2-#3
+    #   (kept inline verbatim: t_decode is BLOCKED-frozen pending the B3.2
+    #   adjudication; dedup into a shared helper once that lands)
+    lbytes = []
+    for L in range(mc.num_layers):
+        pre = f"model.llm.layers.{L}."
+        lbytes.append(sum(loader.nbytes(d, s) for n, (d, s) in hdr.items()
+                          if n.startswith(pre)))
+    total_b = sum(lbytes)
+    devs, cum, d = [], 0, 0
+    for L in range(mc.num_layers):
+        if d < ndev - 1 and cum + lbytes[L] / 2 > total_b * (d + 1) / ndev:
+            d += 1
+        devs.append(f"cuda:{d}")
+        cum += lbytes[L]
+    splits = [devs.count(f"cuda:{r}") for r in range(ndev)]
+    print(f"[t_b3 batch] layer split {splits} over {ndev} GPUs "
+          f"({total_b / (1 << 30):.0f} GiB layers)", file=sys.stderr,
+          flush=True)
+    layers = []
+    for L in range(mc.num_layers):
+        layers.append(load_layer_weights(idx, hdr, dm, mc, L, dev=devs[L],
+                                         pack_moe=True))
+        if L % 16 == 15 or L == mc.num_layers - 1:
+            print(f"[t_b3 batch] loaded layer {L + 1}/{mc.num_layers}, "
+                  f"{time.time() - t0:.0f} s", file=sys.stderr, flush=True)
+    w_emb = _disk(idx, "model.llm.embed.weight").to(devs[0])
+    w_en = _disk(idx, "model.llm.embed_norm.weight").to(devs[0])
+    w_fn = _disk(idx, "model.llm.norm.weight").to(devs[-1])
+    w_un = _disk(idx, "model.llm.unembed.weight").to(devs[-1])
+    t_load = time.time() - t0
+
+    #3. baseline: batch-1 generate_greedy per request from fresh state
+    base = []
+    with torch.no_grad():
+        for i in range(8):
+            states = [pkv.LayerKV(mc, L, devs[L], num_pages=NUM_PAGES)
+                      for L in range(mc.num_layers)]
+            toks, _ = pmodel.generate_greedy(ids[i], MAX_NEW8[i], layers,
+                                             states, w_emb, w_en, w_fn,
+                                             w_un, mc)
+            del states
+            base.append(toks)
+            print(f"[t_b3 batch] baseline r{i} ({time.time() - t0:.0f} s): "
+                  f"{tok.decode(toks)!r}", file=sys.stderr, flush=True)
+    t_base = time.time() - t0 - t_load
+
+    def _same(tag, got, want, rid):
+        #3a. exact int-list equality; report the first differing step
+        if got != want:
+            j = next((k for k in range(min(len(got), len(want)))
+                      if got[k] != want[k]), min(len(got), len(want)))
+            raise SystemExit(f"[t_b3 batch] {tag} req {rid} tokens != "
+                             f"batch-1: first diff step {j} "
+                             f"({got[j:j + 1]} vs {want[j:j + 1]}), lens "
+                             f"{len(got)}/{len(want)}")
+
+    def _mk_retire(tag):
+        #3b. retirement pin: per-layer cache token count, states attached
+        def cb(req):
+            want = req.ids.shape[0] + req.max_new - 1
+            for L in range(mc.num_layers):
+                n = req.states[L].cache.n
+                if n != want:
+                    raise SystemExit(f"[t_b3 batch] {tag} req {req.id} "
+                                     f"layer {L} cache.n {n} != {want}")
+            print(f"[t_b3 batch] {tag} req {req.id} retired at step "
+                  f"{req.finish_step} ({time.time() - t0:.0f} s)",
+                  file=sys.stderr, flush=True)
+        return cb
+
+    #4. schedule A: staggered arrivals, cap 8 — all 8 concurrent mid-run
+    eng = psched.Engine(layers, w_emb, w_en, w_fn, w_un, mc, NUM_PAGES)
+    reqs_a = [psched.Request(i, ids[i], MAX_NEW8[i]) for i in range(8)]
+    sched_a = psched.Scheduler(eng, max_batch=8, on_retire=_mk_retire("A"))
+    for i, r in enumerate(reqs_a):
+        sched_a.submit(r, arrival_step=ARRIVE8[i])
+    with torch.no_grad():
+        out_a = sched_a.run()
+    for i in range(8):
+        _same("schedule A", out_a[i], base[i], i)
+    if sched_a.peak_running != 8:
+        raise SystemExit(f"[t_b3 batch] A peak running "
+                         f"{sched_a.peak_running} != 8 — the 8 requests "
+                         f"were never concurrent")
+    admits_a = [r.admit_step for r in reqs_a]
+    if admits_a != list(ARRIVE8):
+        raise SystemExit(f"[t_b3 batch] A admit steps {admits_a} != "
+                         f"arrivals {list(ARRIVE8)}")
+    fins_a = [r.finish_step for r in reqs_a]
+    if len(set(fins_a)) < 4:
+        raise SystemExit(f"[t_b3 batch] A finish steps {fins_a}: "
+                         f"retirements did not interleave")
+    t_a = time.time() - t0 - t_load - t_base
+
+    #5. schedule B: reversed submission, all due at 0, cap 3 — FCFS queue
+    #   + admission-on-retirement, different co-residents than A
+    reqs_b = [psched.Request(i, ids[i], MAX_NEW8[i]) for i in range(8)]
+    sched_b = psched.Scheduler(eng, max_batch=3, on_retire=_mk_retire("B"))
+    for r in reversed(reqs_b):
+        sched_b.submit(r, arrival_step=0)
+    with torch.no_grad():
+        out_b = sched_b.run()
+    for i in range(8):
+        _same("schedule B", out_b[i], base[i], i)
+    if sched_b.peak_running != 3:
+        raise SystemExit(f"[t_b3 batch] B peak running "
+                         f"{sched_b.peak_running} != 3 (cap)")
+    first3 = sorted(r.id for r in reqs_b if r.admit_step == 0)
+    if first3 != [5, 6, 7]:
+        raise SystemExit(f"[t_b3 batch] B step-0 admits {first3} != "
+                         f"[5, 6, 7] — FCFS from reversed submission broken")
+    last_admit_b = max(r.admit_step for r in reqs_b)
+    if last_admit_b == 0:
+        raise SystemExit("[t_b3 batch] B queue never held a request — "
+                         "admission-on-retirement not exercised")
+    if any(r.states is not None for r in reqs_a + reqs_b):
+        raise SystemExit("[t_b3 batch] KV states not freed at retirement")
+    t_b = time.time() - t0 - t_load - t_base - t_a
+
+    #6. summary = the green evidence
+    print(f"batch ok: continuous batching scheduler — 8 concurrent greedy "
+          f"requests (T {min(lens)}-{max(lens)}, max_new {min(MAX_NEW8)}-"
+          f"{max(MAX_NEW8)}, {sum(MAX_NEW8)} tokens) IDENTICAL to batch-1 "
+          f"generate_greedy 8/8 requests x BOTH schedules (exact int "
+          f"equality, no tolerance) — A: staggered arrivals "
+          f"{list(ARRIVE8)} cap 8, peak 8 concurrent, admit==arrival 8/8, "
+          f"retirements interleaved ({len(set(fins_a))} distinct finish "
+          f"steps {min(fins_a)}..{max(fins_a)}); B: REVERSED submission "
+          f"cap 3, FCFS queue (step-0 admits {{5,6,7}}, last admit step "
+          f"{last_admit_b}), peak 3; batch-1 math per sequence on its own "
+          f"LayerKV by construction (fused-batch kernels = Stage-3/D4); "
+          f"cache.n == T+max_new-1 all 66 layers x 8 reqs x 2 schedules "
+          f"at retirement, KV freed after; resident split {splits}; wall "
+          f"load {t_load:.0f} s + baseline {t_base:.0f} s + A {t_a:.0f} s "
+          f"+ B {t_b:.0f} s")
+
+
 def _todo(item):
     def f():
         raise SystemExit(f"[t_b3] not implemented — that is item {item}'s job")
@@ -743,7 +937,7 @@ def _todo(item):
 def main():
     #1. dispatch on subcommand; unimplemented ones fail loud with their item
     cmds = {"kv": t_kv, "decode": t_decode,
-            "batch": _todo("B3.3"),
+            "batch": t_batch,
             "server": _todo("B3.4"), "soak": _todo("B3.6")}
     usage = f"usage: python -m engine.pyengine.tests.t_b3 {{{'|'.join(cmds)}}}"
     if len(sys.argv) != 2 or sys.argv[1] not in cmds:
