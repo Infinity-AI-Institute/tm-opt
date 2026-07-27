@@ -190,7 +190,19 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
       float64-exact 8/8, peak_running 8; eos/ignore_eos + fail-loud
       400 x8 / 404 x2 arms; /health before+during+after; clean shutdown
       (commit 5e00fc9)
-- [ ] B3.5 PARITY GATE vs goldens — the milestone. HUMAN VERIFIES this tick.
+- [ ] BLOCKED: B3.5 PARITY GATE vs goldens — the milestone. HUMAN VERIFIES
+      this tick.
+      BLOCKED 2026-07-27: gate RUN and FAILED honestly — parity_pass false,
+      45/50 prompt token mismatches (first divergences at pos 1/5/25/17/1;
+      pos 0 agreed), max logprob delta 2.88e-01 > 2e-2 on the 5 matched
+      prompts, wall 33.6 min. Tokenization ruled OUT same session (0/50
+      prompts differ, our AutoTokenizer vs live vLLM /tokenize inkling
+      mode). Reading: distribution-level numeric drift between our
+      transformers-parity eager math and vLLM's fused-kernel numerics —
+      full evidence, decomposition, and adjudication options in the
+      2026-07-27 B3.5 loop note. Engine-side numeric-alignment work +
+      a discriminating transformers-64-token experiment proposed there;
+      human decides direction (loop may not touch harness/ or goldens/).
       test: `python harness/correctness.py --endpoint http://localhost:8200`
 - [ ] B3.6 30-minute soak at conc 8, zero crashes/leaks (rss + vram stable).
       test: `python -m engine.pyengine.tests.t_b3 soak`
@@ -1104,3 +1116,68 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
   iteration should `tmux kill-session -t pyserve`, then rerun the gate
   the same way. Outcome note + adjudication follow below when the run
   completes.
+- 2026-07-27 B3.5 BLOCKED (same session as the hedge note above). Ran the
+  test verbatim from /workspace/tm-opt (venv active, CUDA_VISIBLE_DEVICES=
+  4,5,6,7), foreground, single run, after /health 200. Real output
+  (complete; exit code 1, wall 33m36s):
+  ```
+  [gate] reference: goldens sha=74d977632c936736 fingerprint=vllm-0.23.1rc1.dev1270+g9243e0124-tp4-0df3af17 cache_key=8451a604a8849296
+  {"parity_pass": false, "max_logprob_delta": 0.2879955768585205, "prompt_mismatches": 45, "n_prompts": 50, "first_divergences": [{"prompt": 0, "pos": 1, "golden_id": 11, "candidate_id": 13, "golden_lp": -1.6028436422348022}, {"prompt": 1, "pos": 5, "golden_id": 8591, "candidate_id": 2273, "golden_lp": -0.7586205005645752}, {"prompt": 2, "pos": 25, "golden_id": 15749, "candidate_id": 382, "golden_lp": -0.8243141770362854}, {"prompt": 3, "pos": 17, "golden_id": 21619, "candidate_id": 15913, "golden_lp": -0.9651309251785278}, {"prompt": 4, "pos": 1, "golden_id": 1546, "candidate_id": 220, "golden_lp": -2.2806103229522705}]}
+  ```
+  WHAT IS RULED OUT (same-session diagnostic, repo untouched): prompt
+  tokenization. All 50 parity prompts tokenize IDENTICALLY through our
+  server's exact path (AutoTokenizer(trust_remote_code) on the model dir,
+  server.py:350) and the live vLLM baseline's /tokenize (inkling mode,
+  port 8106, idle — correctness work, P2 precedent; D8 covers measurement
+  only). 0/50 differ, so no BOS/special-token/template bug; pos-0
+  candidate tokens also agreed on every shown divergence (all first
+  divergences are at pos >= 1).
+  READING OF THE EVIDENCE: this is distribution-level numeric drift, not
+  a structural serving bug. Three facts triangulate it: (1) the engine is
+  bitwise-faithful to native transformers modules at every component
+  (B2.2-B2.10), matches streamed native transformers full-forward top-1
+  5/5 (B2.11), and its ONLY known deviation from the transformers
+  reference is expert-kernel accumulation order (~3e-3/MoE layer,
+  9.2e-02 logits rel err at T=13 — B2.9/B2.11); (2) the goldens carry
+  vLLM's fused-kernel numerics (FlashInfer attention, fused MoE, fp32
+  router/accumulator choices) — a genuinely different bf16 rounding
+  path from eager-transformers semantics; (3) the 5 prompts whose 64
+  tokens DID all match still show max top-1 logprob delta 2.88e-01,
+  14x the 2e-2 tolerance — i.e. even a token-perfect run FAILS the
+  logprob arm at our current numeric distance from vLLM. 45/50 flipping
+  within 64 steps is consistent with that logit-level distance hitting
+  low-margin steps (B2.11 measured top-1 margins 0.8-6.0 on easy
+  prompts; parity prompts are open-ended, flatter distributions, and a
+  ~1.5-3.5%/step flip rate compounds to ~60-90% over 64 steps).
+  HYPOTHESIS (best current): our engine sits at transformers-eager
+  parity; the gate referees vLLM-kernel parity; the numeric gap between
+  those two references exceeds both gate arms. A REAL engine bug hiding
+  under that gap is not excluded — discriminating experiment proposed
+  below.
+  PROPOSED NEXT STEPS (for the human to order; loop may not touch
+  harness/, goldens/, or tolerances): (i) DISCRIMINATOR — teacher-force
+  golden prefixes (prompt + golden ids[:pos]) for the 5 printed
+  divergence points through the B2.11 streamed NATIVE transformers
+  reference and record ITS next token + top-2 margin: if transformers
+  sides with the goldens, we have a real localizable bug (start at the
+  expert accumulation order); if it sides with us (or the margin is
+  sub-1e-2), the gap is vLLM-vs-transformers numerics and the work is
+  numeric ALIGNMENT to vLLM; ~130 s/prompt-point via the existing
+  streamed machinery, well inside one session. (ii) Alignment candidates
+  in likelihood order (each one engine-side experiment refereed by this
+  same gate): fp32 MoE router (vLLM keeps gate bias/global_scale + the
+  sigmoid/softmax chain f32 — modelopt.py/moe.py — vs our all-bf16
+  transcription of transformers, B2.8, whose weights sit on a ~2^-8
+  grid); fp32-accumulated attention scores/softmax mirroring
+  FlashInfer's online-softmax (vs eager bf16-matmul scores);
+  grouped/batched expert GEMM accumulation order (B2.9's known
+  3e-3/layer term). (iii) If the human rules the gate's premise is
+  vLLM-numerics-unreachable for an eager engine, that ruling has to
+  come from them — the loop proposes only engine-side changes.
+  SESSION LEDGER: hedge note committed pre-gate (d7f57ef) per the
+  no-silent-no-commit rule; server ran in tmux `pyserve` (log
+  /workspace/logs/pyengine_server_b35_*.log), killed cleanly after the
+  diagnostic, GPUs 4-7 back to 4 MiB; no engine code changed this
+  session; this PROGRESS.md edit is the only change, committed alone
+  per the BLOCKED rule. Walls: server load ~70 s to /health, gate
+  33m36s, tokenization diagnostic ~40 s.
