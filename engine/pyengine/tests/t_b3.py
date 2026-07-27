@@ -56,6 +56,7 @@ Layers exercised: 0, 1 (dense MLP + SWA), 2 (bf16-MoE + SWA), 3
 stream one layer at a time (B2.11 pattern); the single propagating stream
 is the T=602 recompute (oracle) stream."""
 import sys
+import threading
 import time
 
 import torch
@@ -65,6 +66,7 @@ from engine.pyengine import kv as pkv
 from engine.pyengine import loader
 from engine.pyengine import model as pmodel
 from engine.pyengine import scheduler as psched
+from engine.pyengine import server as pserver
 from engine.pyengine.tests.t_b2 import (DEV, MODEL_DIR, PROMPTS5, _deint3,
                                         _disk, _load_refs, _rel_err,
                                         load_layer_weights)
@@ -928,6 +930,269 @@ def t_batch():
           f"+ B {t_b:.0f} s")
 
 
+def t_server():
+    """B3.4: OpenAI server over the B3.3 scheduler — protocol shape +
+    self-consistency (the external semantic referee is B3.5 vs vLLM
+    goldens). What this test pins:
+      (a) 8 requests POSTed CONCURRENTLY to /v1/completions with the EXACT
+          parity-gate payload shape (harness/correctness.py: temperature 0,
+          logprobs 1, seed 0, return_token_ids true) plus ignore_eos true:
+          HTTP 200 8/8; choice-level token_ids EQUAL (exact ints) to
+          batch-1 model.generate_greedy on the same resident weights;
+          token_logprobs EQUAL (exact float64 — JSON round-trips float64
+          losslessly) to server.chosen_logprobs applied to generate_greedy
+          capture= rows: the served path and the reference are the same
+          fp32 CPU math on rows produced by the same op sequence (B3.3
+          batch invariance), so exactness is the honest gate;
+      (b) protocol fields: text == the same detok call on the ids,
+          logprobs arrays aligned (tokens/token_logprobs/top_logprobs/
+          text_offset), usage exact (benchmark.py reads
+          usage.completion_tokens), finish_reason, envelope fields;
+          token_ids ABSENT unless requested + logprobs null unless
+          requested (correctness.py's fail-loud contract needs the
+          present-iff-requested distinction);
+      (c) requests were genuinely co-resident (scheduler peak_running
+          >= 2; expected 8) — continuous batching through the HTTP path,
+          arrivals mapped onto step boundaries;
+      (d) ignore_eos semantics: default (absent) arms eos — expected
+          tokens = the batch-1 baseline truncated at the first eos
+          (dynamic: no assumption eos appears in tiny continuations);
+          plus a no-GPU Request.done unit pin (armed eos stops early,
+          eos=None runs past eos to max_new — B3.3's canonical form);
+      (e) contract violations fail LOUD, never silently mis-serve:
+          400 for temperature != 0 / temperature absent / missing prompt /
+          logprobs > 1 / stream / echo / max_tokens over KV capacity /
+          max_tokens < 1, 404 for unknown paths; /health 200 before,
+          DURING the concurrent batch, and after; clean shutdown (engine
+          thread joins, queues empty, no engine error)."""
+    import requests as rq
+    from concurrent.futures import ThreadPoolExecutor
+    from transformers import AutoTokenizer
+    t0 = time.time()
+    torch.manual_seed(0)
+
+    #1. resident engine via the SERVER's own build path (NUM_PAGES=8 ->
+    #   128-token capacity, >= max T+max_new = 45 here and small enough
+    #   to make the capacity-400 arm cheap)
+    eng, splits = pserver.build_resident(MODEL_DIR, num_pages=NUM_PAGES)
+    mc = eng.mc
+    tok = AutoTokenizer.from_pretrained(MODEL_DIR, trust_remote_code=True)
+    ids = [tok(p, return_tensors="pt").input_ids[0].to(eng.w_emb.device)
+           for p in PROMPTS8]
+    lens = [t.shape[0] for t in ids]
+    t_load = time.time() - t0
+
+    #2. batch-1 baselines with fp32 logits capture — tokens + the
+    #   reference logprobs through the same helper the server uses
+    base, ref_lps = [], []
+    with torch.no_grad():
+        for i in range(8):
+            cap = []
+            states = eng.new_states()
+            toks, _ = pmodel.generate_greedy(
+                ids[i], MAX_NEW8[i], eng.layers, states, eng.w_emb,
+                eng.w_en, eng.w_fn, eng.w_un, mc, capture=cap)
+            del states
+            base.append(toks)
+            ref_lps.append(pserver.chosen_logprobs(cap, toks))
+            print(f"[t_b3 server] baseline r{i} ({time.time() - t0:.0f} s)"
+                  f": {tok.decode(toks)!r}", file=sys.stderr, flush=True)
+    t_base = time.time() - t0 - t_load
+
+    #3. serve on an ephemeral port (CLI default is 8200; a stray listener
+    #   must not be able to fail this test) — http thread + engine thread
+    httpd, loop = pserver.serve(eng, tok, host="127.0.0.1", port=0,
+                                max_batch=8)
+    port = httpd.server_address[1]
+    url = f"http://127.0.0.1:{port}"
+    th = threading.Thread(target=httpd.serve_forever, daemon=True)
+    th.start()
+    h0 = rq.get(f"{url}/health", timeout=10)
+    if h0.status_code != 200 or h0.json().get("status") != "ok":
+        raise SystemExit(f"[t_b3 server] /health before: {h0.status_code} "
+                         f"{h0.text}")
+
+    #4. 8 concurrent parity-shaped posts + one /health probe mid-flight
+    def _post(i):
+        return rq.post(f"{url}/v1/completions",
+                       json={"model": MODEL_DIR, "prompt": PROMPTS8[i],
+                             "max_tokens": MAX_NEW8[i], "temperature": 0,
+                             "logprobs": 1, "seed": 0,
+                             "return_token_ids": True, "ignore_eos": True},
+                       timeout=600)
+
+    def _health_during():
+        time.sleep(3)  # the batch runs ~2 min; 3 s in it is mid-flight
+        return rq.get(f"{url}/health", timeout=10)
+
+    with ThreadPoolExecutor(max_workers=9) as pool:
+        fut_h = pool.submit(_health_during)
+        resps = list(pool.map(_post, range(8)))
+        hd = fut_h.result()
+    if hd.status_code != 200:
+        raise SystemExit(f"[t_b3 server] /health during: {hd.status_code}")
+    t_conc = time.time() - t0 - t_load - t_base
+
+    #5. per-response gates: ids exact, logprobs exact, protocol fields
+    for i, r in enumerate(resps):
+        if r.status_code != 200:
+            raise SystemExit(f"[t_b3 server] req {i} HTTP {r.status_code}: "
+                             f"{r.text[:400]}")
+        j = r.json()
+        ch = j["choices"][0]
+        got = ch.get("token_ids")
+        if got != base[i]:
+            k = next((k for k in range(min(len(got or []), len(base[i])))
+                      if got[k] != base[i][k]), None)
+            raise SystemExit(f"[t_b3 server] req {i} token_ids != batch-1 "
+                             f"(first diff at {k}): {got} vs {base[i]}")
+        lp = ch["logprobs"]
+        if lp["token_logprobs"] != ref_lps[i]:
+            dm = max(abs(a - b) for a, b in
+                     zip(lp["token_logprobs"], ref_lps[i]))
+            raise SystemExit(f"[t_b3 server] req {i} token_logprobs != "
+                             f"reference (max |delta| {dm:.3e})")
+        want_strs = [tok.decode([t]) for t in base[i]]
+        if lp["tokens"] != want_strs:
+            raise SystemExit(f"[t_b3 server] req {i} logprobs.tokens "
+                             f"mismatch: {lp['tokens'][:4]}...")
+        if lp["top_logprobs"] != [{s: l} for s, l in
+                                  zip(want_strs, ref_lps[i])]:
+            raise SystemExit(f"[t_b3 server] req {i} top_logprobs mismatch")
+        if len(lp["text_offset"]) != MAX_NEW8[i]:
+            raise SystemExit(f"[t_b3 server] req {i} text_offset len "
+                             f"{len(lp['text_offset'])} != {MAX_NEW8[i]}")
+        if ch["text"] != tok.decode(base[i], skip_special_tokens=True):
+            raise SystemExit(f"[t_b3 server] req {i} text mismatch: "
+                             f"{ch['text']!r}")
+        if ch["finish_reason"] != "length":
+            raise SystemExit(f"[t_b3 server] req {i} finish_reason "
+                             f"{ch['finish_reason']!r} != 'length'")
+        want_usage = {"prompt_tokens": lens[i],
+                      "completion_tokens": MAX_NEW8[i],
+                      "total_tokens": lens[i] + MAX_NEW8[i]}
+        if j["usage"] != want_usage:
+            raise SystemExit(f"[t_b3 server] req {i} usage {j['usage']} != "
+                             f"{want_usage}")
+        if (j["object"] != "text_completion" or j["model"] != MODEL_DIR
+                or not str(j["id"]).startswith("cmpl-")):
+            raise SystemExit(f"[t_b3 server] req {i} envelope fields: "
+                             f"{j['id']} {j['object']} {j['model']}")
+    peak = loop.sched.peak_running
+    if peak < 2:
+        raise SystemExit(f"[t_b3 server] peak_running {peak} — requests "
+                         f"were never co-resident; not continuous "
+                         f"batching through HTTP")
+
+    #6. default-eos + minimal-fields arm: no logprobs / return_token_ids /
+    #   ignore_eos -> logprobs null, NO token_ids key, eos armed (expected
+    #   = baseline truncated at first eos — dynamic, works either way)
+    r = rq.post(f"{url}/v1/completions",
+                json={"model": MODEL_DIR, "prompt": PROMPTS8[0],
+                      "max_tokens": 8, "temperature": 0}, timeout=600)
+    if r.status_code != 200:
+        raise SystemExit(f"[t_b3 server] eos-arm HTTP {r.status_code}: "
+                         f"{r.text[:400]}")
+    j = r.json()
+    ch = j["choices"][0]
+    exp = base[0][:8]
+    exp_eos = (exp[:exp.index(mc.eos) + 1] if mc.eos in exp else exp)
+    fin_want = "stop" if mc.eos in exp else "length"
+    if "token_ids" in ch:
+        raise SystemExit("[t_b3 server] token_ids present without "
+                         "return_token_ids — breaks the present-iff-"
+                         "requested contract")
+    if ch["logprobs"] is not None:
+        raise SystemExit("[t_b3 server] logprobs not null when unrequested")
+    if ch["text"] != tok.decode(exp_eos, skip_special_tokens=True):
+        raise SystemExit(f"[t_b3 server] eos-arm text {ch['text']!r} != "
+                         f"baseline-derived {exp_eos}")
+    if (ch["finish_reason"] != fin_want
+            or j["usage"]["completion_tokens"] != len(exp_eos)):
+        raise SystemExit(f"[t_b3 server] eos-arm finish/usage: "
+                         f"{ch['finish_reason']} {j['usage']}")
+    n_eos_base = sum(mc.eos in b for b in base)
+
+    #7. Request-level eos unit pin (no GPU): armed eos stops early;
+    #   eos=None (ignore_eos) runs past eos to max_new
+    r_eos = psched.Request(99, ids[0].cpu(), 8, eos=7)
+    r_eos.tokens.extend([3, 5])
+    assert not r_eos.done, "eos pin: done before eos"
+    r_eos.tokens.append(7)
+    assert r_eos.done, "eos pin: armed eos did not stop the request"
+    r_ign = psched.Request(98, ids[0].cpu(), 3, eos=None)
+    r_ign.tokens.extend([7, 7])
+    assert not r_ign.done, "eos pin: eos=None stopped early"
+    r_ign.tokens.append(1)
+    assert r_ign.done, "eos pin: length cap did not stop the request"
+
+    #8. loud-failure arms: each of these MUST 400 (silently serving any
+    #   of them would corrupt a gate or a benchmark), unknown paths 404
+    bad = [({"prompt": "x", "max_tokens": 4, "temperature": 0.7},
+            "temperature 0.7"),
+           ({"prompt": "x", "max_tokens": 4}, "temperature absent"),
+           ({"max_tokens": 4, "temperature": 0}, "prompt missing"),
+           ({"prompt": "x", "max_tokens": 4, "temperature": 0,
+             "logprobs": 5}, "logprobs 5"),
+           ({"prompt": "x", "max_tokens": 4, "temperature": 0,
+             "stream": True}, "stream"),
+           ({"prompt": "x", "max_tokens": 4, "temperature": 0,
+             "echo": True}, "echo"),
+           ({"prompt": "x", "max_tokens": NUM_PAGES * pkv.PAGE_SIZE,
+             "temperature": 0}, "over capacity"),
+           ({"prompt": "x", "max_tokens": 0, "temperature": 0},
+            "max_tokens 0")]
+    for body, tag in bad:
+        rb = rq.post(f"{url}/v1/completions", json=body, timeout=30)
+        if rb.status_code != 400 or "error" not in rb.json():
+            raise SystemExit(f"[t_b3 server] bad-input arm '{tag}': "
+                             f"HTTP {rb.status_code} (want 400+error)")
+    r404p = rq.post(f"{url}/v1/chat/completions", json={}, timeout=30)
+    r404g = rq.get(f"{url}/nope", timeout=30)
+    if r404p.status_code != 404 or r404g.status_code != 404:
+        raise SystemExit(f"[t_b3 server] unknown paths: "
+                         f"{r404p.status_code}/{r404g.status_code} != 404")
+
+    #9. /health after + clean shutdown; nothing stranded, no engine error
+    ha = rq.get(f"{url}/health", timeout=10)
+    if ha.status_code != 200:
+        raise SystemExit(f"[t_b3 server] /health after: {ha.status_code}")
+    httpd.shutdown()
+    th.join(10)
+    if not loop.stop():
+        raise SystemExit("[t_b3 server] engine thread did not join")
+    if loop.error is not None:
+        raise SystemExit(f"[t_b3 server] engine error:\n{loop.error}")
+    if loop.sched.waiting or loop.sched.running:
+        raise SystemExit("[t_b3 server] scheduler queues not empty at "
+                         "shutdown")
+    n_fin = len(loop.sched.finished)
+    if n_fin != 9:
+        raise SystemExit(f"[t_b3 server] finished {n_fin} != 9 (8 "
+                         f"concurrent + 1 eos-arm; 400s must never reach "
+                         f"the scheduler)")
+
+    #10. summary = the green evidence
+    print(f"server ok: /v1/completions x 8 CONCURRENT parity-shaped "
+          f"requests (temperature 0, logprobs 1, seed, return_token_ids, "
+          f"ignore_eos; T {min(lens)}-{max(lens)}, max_new {min(MAX_NEW8)}"
+          f"-{max(MAX_NEW8)}, {sum(MAX_NEW8)} tokens) — choice-level "
+          f"token_ids == batch-1 generate_greedy 8/8 (exact ints), "
+          f"token_logprobs == fp32 log-softmax of batch-1 captured logits "
+          f"8/8 (exact float64 via JSON), tokens/top_logprobs/text_offset "
+          f"aligned, text == detok, finish 'length', usage exact 8/8, "
+          f"peak_running {peak}; default-eos arm: logprobs null + NO "
+          f"token_ids key + eos-armed truncation (eos in {n_eos_base}/8 "
+          f"baselines; Request-level pin: armed eos stops early, eos=None "
+          f"runs past); loud failures: 400 x {len(bad)} (bad temperature/"
+          f"prompt/logprobs/stream/echo/capacity/max_tokens), 404 x 2; "
+          f"/health ok before+during+after; ephemeral port {port} (CLI "
+          f"default 8200); shutdown clean (engine thread joined, queues "
+          f"empty, {n_fin} retired); wall load {t_load:.0f} s + baseline "
+          f"{t_base:.0f} s + concurrent {t_conc:.0f} s + arms "
+          f"{time.time() - t0 - t_load - t_base - t_conc:.0f} s")
+
+
 def _todo(item):
     def f():
         raise SystemExit(f"[t_b3] not implemented — that is item {item}'s job")
@@ -938,7 +1203,7 @@ def main():
     #1. dispatch on subcommand; unimplemented ones fail loud with their item
     cmds = {"kv": t_kv, "decode": t_decode,
             "batch": t_batch,
-            "server": _todo("B3.4"), "soak": _todo("B3.6")}
+            "server": t_server, "soak": _todo("B3.6")}
     usage = f"usage: python -m engine.pyengine.tests.t_b3 {{{'|'.join(cmds)}}}"
     if len(sys.argv) != 2 or sys.argv[1] not in cmds:
         raise SystemExit(usage)

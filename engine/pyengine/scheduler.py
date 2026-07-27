@@ -32,16 +32,23 @@ from engine.pyengine import model as pmodel
 
 class Request:
     """One greedy generation request. `ids` [T] int64 prompt tokens on the
-    embed weight's device; `max_new` >= 1 tokens to generate. The scheduler
-    fills `tokens` (python ints) and stamps admit_step / finish_step;
-    `states` (per-layer kv.LayerKV) lives only while the request runs."""
+    embed weight's device; `max_new` >= 1 tokens to generate. `eos` arms
+    early exit after that token id is generated (B3.4 server,
+    ignore_eos=false semantics; None = run to max_new, the canonical
+    ignore_eos form, D6/P1). `capture`, when a list, receives each step's
+    full fp32 logits row on CPU (read-only copies, generate_greedy's
+    capture= pattern — the B3.4 logprobs source). The scheduler fills
+    `tokens` (python ints) and stamps admit_step / finish_step; `states`
+    (per-layer kv.LayerKV) lives only while the request runs."""
 
-    def __init__(self, req_id, ids, max_new):
+    def __init__(self, req_id, ids, max_new, eos=None, capture=None):
         #1. identity + inputs
         assert max_new >= 1, "a request must generate at least one token"
         self.id = req_id
         self.ids = ids
         self.max_new = max_new
+        self.eos = eos
+        self.capture = capture
         #2. progress, owned by the scheduler
         self.tokens = []
         self.states = None
@@ -50,8 +57,13 @@ class Request:
 
     @property
     def done(self):
-        #1. ignore_eos semantics: length is the only stop condition
-        return len(self.tokens) >= self.max_new
+        #1. length cap — the only stop condition when eos is None
+        #   (ignore_eos semantics, the B3.3 default)
+        if len(self.tokens) >= self.max_new:
+            return True
+        #2. armed eos early-exit (B3.4 server, ignore_eos=false)
+        return (self.eos is not None and len(self.tokens) > 0
+                and self.tokens[-1] == self.eos)
 
 
 class Engine:
@@ -109,11 +121,16 @@ class Engine:
                 full if L in mc.global_layers else win, p, mc, L,
                 state=req.states[L])
         #2. last-position logits -> fp32 argmax over the unpadded vocab
-        #   (the B2.11 comparison form, generate_greedy's _pick)
+        #   (the B2.11 comparison form, generate_greedy's _pick); optional
+        #   fp32-row capture (B3.4 logprobs, generate_greedy's capture=
+        #   pattern — a read-only CPU copy, token math untouched)
         row = pmodel.final_logits(h[:, -1], self.w_fn, self.w_un,
                                   mc.logits_mult, mc.vocab_unpadded,
                                   eps=mc.rms_eps)[0]
-        return int(row.float().argmax())
+        lg = row.float()
+        if req.capture is not None:
+            req.capture.append(lg.cpu())
+        return int(lg.argmax())
 
     @torch.no_grad()
     def decode(self, req):
@@ -129,10 +146,13 @@ class Engine:
             h = pmodel.layer_decode(
                 h.to(self.layers[L]["attn_norm"].device), self.layers[L],
                 req.states[L], req.ids.shape[0] - 1 + s, mc, L)
-        #2. logits -> fp32 argmax, same form as prefill
+        #2. logits -> fp32 argmax + optional capture, same form as prefill
         row = pmodel.final_logits(h, self.w_fn, self.w_un, mc.logits_mult,
                                   mc.vocab_unpadded, eps=mc.rms_eps)[0]
-        return int(row.float().argmax())
+        lg = row.float()
+        if req.capture is not None:
+            req.capture.append(lg.cpu())
+        return int(lg.argmax())
 
 
 class Scheduler:
