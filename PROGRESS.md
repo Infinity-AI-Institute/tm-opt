@@ -135,7 +135,7 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
       attn half <= 7.9e-05, dense out <= 9.7e-05, MoE out <= 5.4e-03 (expert
       choice identical); cache K/V + 4 sconv-ring tails bit-equal replay 5/5
       layers; ring/page positional pins exact; wall 13 s (commit f3b1fbd)
-- [ ] B3.2 greedy decode loop (batch 1): SELF-CONSISTENCY, not transformers.
+- [ ] BLOCKED: B3.2 greedy decode loop (batch 1): SELF-CONSISTENCY, not transformers.
       Decode 32 tokens for the 5 tiny prompts; verify (a) per-step decode
       logits vs full-prefill-of-prefix logits at every step, using B3.1's
       decomposed gates (attention half < 1e-3, dense < 1e-3, MoE < 1e-2
@@ -158,6 +158,22 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
       interpretation FLAGGED FOR HUMAN).
       HUMAN RULING 2026-07-27: near-tie provision APPROVED as specified in 
       1ec0c82; proceed — run arm (a) to completion and tick.
+      BLOCKED 2026-07-27 (2nd session): the ruled-on run FAILED at a NEW 4th
+      finding — `p2 s8 L5 layer out 1.012e-02 >= 0.01` (1.2% over the MoE
+      gate; L0-4 all 155 streams + L5 p0/p1/p2s1-7 green first). Diagnosed
+      decisively (standalone diagnostic, repo untouched): it is an expert-
+      CHOICE flip (single pair 21<->25) OUTSIDE the approved provision —
+      recompute-side score gap 1.562e-02 >= the 1e-2 tie ceiling (6c' would
+      also fail), but the DECODE-side scores are EXACTLY tied (gap 0.0e+00,
+      bf16 bit-equal; topk broke an exact tie by index) and forcing the
+      oracle's routing onto the decode activations collapses MoE-out drift
+      2.6e-01 -> 3.0e-03: the flip IS the whole overrun; all upstream gates
+      pass (attn half 4.6e-05). Hypothesis: spec gap, not engine bug —
+      legitimate drift moves bf16 choice scores a few ulps (~1.5e-2 here),
+      so exact-tie flips WILL occur in ~10^4 comparisons and a genuinely
+      different expert legitimately exceeds the 1e-2 layer-out budget
+      (|MoE|/|residual| ~1.5e-02). Adjudication options in the 2026-07-27
+      BLOCKED loop note. Loop may not alter gates; human decides.
       test: `python -m engine.pyengine.tests.t_b3 decode`
 - [ ] B3.3 continuous batching scheduler: 8 concurrent greedy requests give
       IDENTICAL tokens to batch-1 runs (batch invariance).
@@ -855,3 +871,92 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
   t_b2 ref/embed sanity before the tick commit. Stray t_b3_decode.stderr.log
   deleted per hint; t_kv_reg.stderr briefly committed in b5b651d by an
   over-broad `git add -A`, removed in 1ec0c82 (lesson: stage explicitly).
+- 2026-07-27 B3.2 BLOCKED (2nd session; the ruled-on clean run). Ran test
+  verbatim from /workspace/tm-opt (venv active, CUDA_VISIBLE_DEVICES=
+  4,5,6,7), foreground, single run. Real output (complete):
+  ```
+  [t_b3 decode] layer split [16, 17, 16, 17] over 4 GPUs (537 GiB layers)
+  [t_b3 decode] loaded layer 8/66, 16 s
+  [t_b3 decode] loaded layer 16/66, 28 s
+  [t_b3 decode] loaded layer 24/66, 41 s
+  [t_b3 decode] loaded layer 32/66, 53 s
+  [t_b3 decode] loaded layer 40/66, 65 s
+  [t_b3 decode] loaded layer 48/66, 77 s
+  [t_b3 decode] loaded layer 56/66, 89 s
+  [t_b3 decode] loaded layer 64/66, 102 s
+  [t_b3 decode] loaded layer 66/66, 105 s
+  [t_b3 decode] p0 x2 (150 s): ' Berlin.\nThe capital of France is Paris, and that of Germany is Berlin.\nThe capital of France is Paris, and the capital of Germany is also.\nThe'
+  [t_b3 decode] p1 x2 (190 s): ' Au, and its atomic number is 79, indicating that a gold atom has 79 protons and 79 electrons. The number of protons determines the'
+  [t_b3 decode] p2 x2 (230 s): ' oxygen atoms, but they are not present in water in the form of hydrogen and oxygen molecules. The atoms are present in the form of water molecules.\n\nQuestion '
+  [t_b3 decode] p3 x2 (271 s): ' cold. The opposite of good is bad. The opposite of up is down. The opposite of left is right. The opposite of right is wrong. The opposite'
+  [t_b3 decode] p4 x2 (310 s): ' four. Two plus three equals five. Three plus three equals six. Two plus four equals six. Four plus two equals six. Five plus one equals six.'
+  [t_b3 decode] p2 s8 L5 layer out 1.012e-02 >= 0.01
+  ```
+  Arm (b) green AGAIN (runs 4+5 per prompt overall: token_ids bitwise
+  identical 5/5 prompts, continuations identical to the 3 prior sessions'
+  runs). Arm (a) died on a NEW 4th gate finding: teacher-forced full-layer
+  out at p2 s8 L5 = 1.012e-02, 1.2% over GATE_MOE 1e-2. Sweep is
+  layer-major, so L0-L4 passed ALL 155 teacher-forced streams each (incl.
+  expert-choice checks on L2-L4; the previously-flagged p0 s19 L2 exact
+  near-tie passed via the approved 6c' FLAG path) and L5 passed p0 s1-31,
+  p1 s1-31, p2 s1-7 before the failure.
+  DIAGNOSED, not guessed — standalone script (repo untouched; preserved at
+  /workspace/logs/diag_b32_p2s8L5.py): full resident load exactly as
+  t_decode #2-#3, regenerate p2's tokens[:8] (deterministic; matches the
+  arm-b print), advance stream (2,8) through layers 0..5 with t_decode
+  #6b's oracle prefills + materialized experts, then t_decode #6c's exact
+  teacher-forced arm at L5, then decompose. Real output (key lines):
+  ```
+  [diag] p2 tokens[:8] = [34398, 63489, 11, 889, 1023, 553, 625, 3333] = ' oxygen atoms, but they are not present', 114 s
+  [diag] REPRODUCTION: attn half 4.557e-05, layer out 1.012e-02 (run reported 1.012e-02)
+  [diag] mlpin drift (decode vs oracle row): 6.868e-04
+  [diag] expert top-6: decode [0, 14, 21, 43, 128, 211] vs oracle [0, 14, 25, 43, 128, 211] — IDENTICAL: False, sym-diff [21, 25]
+  [diag] oracle-side choice-score gap of the swapped pair: 1.562e-02 (near-tie iff < 1e-2)
+  [diag] decode-side choice-score gap of the swapped pair: 0.000e+00 (near-tie iff < 1e-2)
+  [diag] shared gammas: decode [0.003631591796875, 0.00469970703125] oracle [0.0038604736328125, 0.00494384765625]
+  [diag] MoE-out shape effect (same input row, T=1 vs in-batch T=14): 0.000e+00
+  [diag] MoE-out input-drift effect (T=1 both, decode vs oracle input): 2.599e-01
+  [diag] MoE-out with ORACLE routing forced onto decode activations, vs oracle T=1: 3.009e-03
+  [diag] MoE-out magnitude ratio |moe|/|layer-in residual x1|: 1.459e-02
+  ```
+  READING: this is NOT the routing-WEIGHT granularity tail (B3.1's 5e-3
+  mechanism) — it is an expert CHOICE flip, single swapped pair 21<->25,
+  and the approved near-tie provision does NOT cover it: the provision
+  tests the RECOMPUTE's own scores (6c'), whose gap is 1.562e-02 >= the
+  1e-2 tie ceiling — had the layer-out gate not fired first, 6c' would
+  have exited "not a near-tie pair" at the SAME comparison. Both failures
+  are one event. The decode row's scores for 21 vs 25 are EXACTLY equal
+  (bf16 bit-equal, fp32 gap 0.0 — torch.topk broke an exact tie by index);
+  the oracle row separates them by ~4-8 bf16 ulps. Upstream is healthy:
+  attn half 4.557e-05 (13x under its own gate), mlpin drift 6.868e-04, and
+  the pure GEMM-shape effect on the identical input row measured 0.0e+00
+  (bit-equal T=1 vs in-batch at these tiny row counts). Forcing the
+  oracle's routing (indices+weights+gammas) onto the decode activations
+  collapses MoE-out drift 2.599e-01 -> 3.009e-03 — the flip IS the entire
+  layer-out overrun (different expert => genuinely different output;
+  |MoE out|/|residual| = 1.459e-02 puts the resulting layer-out at
+  1.01e-02, just over the budget). Shared-gamma deltas are downstream of
+  the same flip (norm_after_topk renormalizes over the chosen set).
+  HYPOTHESIS: spec gap, not an engine bug. Legitimate decode-vs-recompute
+  drift that PASSES every upstream gate moves bf16 choice scores by a few
+  ulps (~1.5e-2 here); whenever two experts sit within that band of each
+  other the discrete top-6 flips on one side, and picking the other member
+  of an (exactly, on the decode side) tied pair legitimately exceeds the
+  1e-2 layer-out budget. At ~10^4 comparisons such events are expected —
+  the same class of unattainability B3.1 documented for bitwise
+  decode==recompute, one level up (discrete choice instead of continuous
+  weights). OPTIONS FOR THE HUMAN (loop may not alter gates/items):
+  (a) extend the 6c' tie test to either-side scores (the decode-side EXACT
+  tie 0.0 < 1e-2 qualifies; recompute-side stays as evidence) AND scope
+  the MoE-out gate at such flagged-flip steps to the forced-routing
+  replay (< 1e-2 with the oracle routing forced — measured 3.0e-03 — so
+  any real numerics bug still fails while a pure tie-break diverges
+  honestly); the free-run-vs-recompute TOKEN gate and B3.5 vs vLLM goldens
+  remain the semantic backstops; (b) rule strict-as-specified, accepting
+  that arm (a) is then unattainable in principle at this comparison count,
+  and re-specify the item; (c) any other ruling — e.g. adjudicate this
+  single deterministic comparison directly. BUDGET honesty: failed run
+  ~11 min, 2 diagnostic runs ~2 min each (load-dominated), regressions
+  (t_b2 logits rewire) NOT rerun — nothing ticked, no repo code changed
+  this session; working tree contains only this PROGRESS.md edit,
+  committed alone per the BLOCKED rule.
