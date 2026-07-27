@@ -3,8 +3,14 @@
 # Usage: bash scripts/ralph_build.sh [max_iters]   (default 10)
 # Stop early: touch /workspace/tm-opt/STOP_RALPH
 # Logs: /workspace/ralph_logs/build_<ts>/iter_N.log
+
+export BASH_DEFAULT_TIMEOUT_MS=2700000   # 45 min per foreground tool command
+export BASH_MAX_TIMEOUT_MS=3300000      # 55 min hard cap (< the loop's 1h guillotine)
+
 set -uo pipefail
 cd /workspace/tm-opt
+source /workspace/venv/bin/activate
+command -v claude >/dev/null || { echo "[ralph-build] FATAL: claude CLI not on PATH"; exit 1; }
 MAX=${1:-10}
 RUN="/workspace/ralph_logs/build_$(date +%Y%m%d_%H%M%S)"; mkdir -p "$RUN"
 echo "[ralph-build] up to $MAX iterations; logs in $RUN; stop: touch STOP_RALPH"

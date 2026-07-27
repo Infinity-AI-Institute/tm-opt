@@ -4,6 +4,10 @@
 # Requires: dispatcher running (python harness/dispatcher.py) to drain the queue.
 # Run as the non-root 'ralph' user (CLI refuses --dangerously-skip-permissions
 # as root; the cage is also just better design).
+
+export BASH_DEFAULT_TIMEOUT_MS=2700000   # 45 min per foreground tool command
+export BASH_MAX_TIMEOUT_MS=3300000       # 55 min hard cap (< the loop's 1h guillotine)
+
 set -uo pipefail
 cd /workspace/tm-opt
 
