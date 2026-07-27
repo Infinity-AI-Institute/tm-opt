@@ -182,9 +182,14 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
       generate_greedy 8/8 x TWO schedules (staggered arrivals cap 8, peak 8
       concurrent; reversed submission cap 3, FCFS queueing); invariance by
       construction — per-seq batch-1 ops on own LayerKV (commit dd6dedd)
-- [ ] B3.4 OpenAI server: /v1/completions with temperature 0, logprobs,
+- [x] B3.4 OpenAI server: /v1/completions with temperature 0, logprobs,
       return_token_ids (choice-level), ignore_eos, /health.
       test: `python -m engine.pyengine.tests.t_b3 server`
+      — green: 8 CONCURRENT parity-shaped requests — choice-level
+      token_ids exact 8/8 vs batch-1 generate_greedy, token_logprobs
+      float64-exact 8/8, peak_running 8; eos/ignore_eos + fail-loud
+      400 x8 / 404 x2 arms; /health before+during+after; clean shutdown
+      (commit 5e00fc9)
 - [ ] B3.5 PARITY GATE vs goldens — the milestone. HUMAN VERIFIES this tick.
       test: `python harness/correctness.py --endpoint http://localhost:8200`
 - [ ] B3.6 30-minute soak at conc 8, zero crashes/leaks (rss + vram stable).
@@ -1018,3 +1023,66 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
   throughput scales ~1/batch for now — that is the EXPECTED losing
   iteration-0 shape (case study started at 13.6%); the batched-kernel
   experiments that fix it are Stage-3 and must re-pass this test.
+- 2026-07-27 B3.4: implemented server.py (was an empty stub) + t_b3 server
+  + the two scheduler.py seams B3.3's note reserved: Request grew
+  eos=None (armed -> done after that token id; None = run to max_new,
+  the canonical ignore_eos form — B3.3 default preserved) and
+  capture=None (a list receives each step's full fp32 logits row on CPU,
+  generate_greedy's capture= pattern), Engine.prefill/decode grew the
+  matching 3-line capture hook (row.float() computed once, token math
+  untouched). server.py design: ONE EngineLoop thread owns all CUDA work
+  (B3.3 Scheduler: FCFS admission, prefill-on-admit, one decode/seq/step,
+  on_retire sets the request's Event); HTTP handler threads only tokenize
+  (AutoTokenizer under a lock), enqueue, block on the Event, format JSON;
+  wall-clock arrivals map onto step boundaries via
+  submit(arrival_step=step_count) exactly as the B3.3 module note
+  specified. Contract per BASELINE_NOTES: token_ids at CHOICE level iff
+  return_token_ids; logprobs {tokens, token_logprobs, top_logprobs,
+  text_offset} | null, logprob = row[tid] - logsumexp(row) in fp32 off
+  the engine thread (capture rows freed after use; ~0.8 MB/token only
+  when logprobs requested — the canonical benchmark requests none);
+  usage.completion_tokens (benchmark.py's read); finish_reason
+  stop/length. Greedy-only honesty: temperature must be exactly 0;
+  stream/echo/suffix/stop/n>1/logprobs>1/capacity-overrun all fail LOUD
+  400 pre-scheduler, unknown paths 404. CLI: `python -m
+  engine.pyengine.server` (default port 8200 for B3.5, --num-pages 1024
+  = 16384-token capacity/seq); resident load mirrors t_batch #2 (third
+  copy — dedup into loader.py once B3.2 is adjudicated). Ran test
+  verbatim from /workspace/tm-opt (venv active,
+  CUDA_VISIBLE_DEVICES=4,5,6,7), foreground. Real output (final line;
+  stderr showed load 103 s, 8 baseline continuations identical to the
+  B3.3 tick's, access log 200 x9 + 400 x8 + 404 x2 + health x3):
+  ```
+  server ok: /v1/completions x 8 CONCURRENT parity-shaped requests (temperature 0, logprobs 1, seed, return_token_ids, ignore_eos; T 4-13, max_new 9-32, 174 tokens) — choice-level token_ids == batch-1 generate_greedy 8/8 (exact ints), token_logprobs == fp32 log-softmax of batch-1 captured logits 8/8 (exact float64 via JSON), tokens/top_logprobs/text_offset aligned, text == detok, finish 'length', usage exact 8/8, peak_running 8; default-eos arm: logprobs null + NO token_ids key + eos-armed truncation (eos in 0/8 baselines; Request-level pin: armed eos stops early, eos=None runs past); loud failures: 400 x 8 (bad temperature/prompt/logprobs/stream/echo/capacity/max_tokens), 404 x 2; /health ok before+during+after; ephemeral port 33567 (CLI default 8200); shutdown clean (engine thread joined, queues empty, 9 retired); wall load 103 s + baseline 114 s + concurrent 112 s + arms 7 s
+  ```
+  That is the SECOND green run: run 1 (identical evidence line, port
+  37893, walls 105/115/116/8) exposed one real HTTP wart in its access
+  log — the POST-to-unknown-path 404 branch answered without draining
+  the request body, so keep-alive parsed the leftover `{}` as a request
+  line (server-side "Bad request syntax" noise; client behavior
+  correct). Fixed (3-line drain in do_POST) and RERAN so the pasted
+  output is the committed code's. Gate design notes: token_ids gate is
+  exact ints vs batch-1 generate_greedy on the same resident engine
+  (B3.3 invariance makes the served rows the same op sequence, so the
+  logprob gate is EXACT float64 — JSON round-trips float64 losslessly —
+  against server.chosen_logprobs applied to generate_greedy capture=
+  rows, same helper both sides); eos truncation expectation is derived
+  dynamically from the baseline (eos never appears in these 8 tiny
+  continuations — 0/8 — so the armed-eos stop is pinned at Request
+  level, no GPU). Test binds an EPHEMERAL port by design (a stray 8200
+  listener cannot fail it; CLI default stays 8200). Regression after
+  the scheduler.py edits: t_b3 batch green, evidence line IDENTICAL to
+  the B3.3 tick modulo walls (104/116/117/116 vs 105/115/113/113 s) —
+  eos=None/capture=None defaults are bitwise no-ops. NOTE for B3.5:
+  serve via `python -m engine.pyengine.server --port 8200` in tmux
+  `serve` (load ~105 s); the gate posts 50 prompts x 64 tokens
+  SEQUENTIALLY at ~0.66 s/token unbatched ≈ 35-40 min — budget the
+  session around that (it is one verbatim command; consider starting
+  the server first, gate immediately after /health). NOTE for B3.6: the
+  soak can drive this server at conc 8; EngineLoop.error + the 500 path
+  make engine death visible. ENV NOTE: three more root-owned
+  .git/objects fan-out dirs (a2, 79, 84) blocked the code commit; fixed
+  as ralph via the B1.3 same-parent-rename recipe, originals parked at
+  .git/objects/zz-{a2,79,84}-rootowned (root may delete), fsck clean.
+  Code committed first (5e00fc9) per convention; this tick is its own
+  commit.
