@@ -1,6 +1,6 @@
 # tm-opt — Context & Execution Plan (handoff for pod-side Claude)
 
-> Paste-into-context document. State as of 2026-07-20. Everything here is
+> Paste-into-context document. State as of 2026-07-27. Everything here is
 > either verified on this pod (evidence path given) or an explicit decision
 > with rationale. When this document conflicts with older docs, this wins;
 > update the older doc in the same commit.
@@ -88,6 +88,9 @@ is compute/scheduler-bound, set empirically. Evidence: BASELINE_NOTES.md.
 | D8 | Engines never run simultaneously during measurement; experiments serialize | Fairness constitution §4.3 |
 | D9 | Multi-node out of scope (one pod); multi-GPU TP=4 NCCL is our version of the "multi-node challenge" | README scope note |
 | D10 | Canonical concurrency = 512, both workloads (peak, not plateau: decode 13,374 tok/s @512 → 4,959 @768; prefill 5,109 @512). Canonical point sits at the KV-capacity edge → scheduler must sustain 512 seqs; KV efficiency is a cliff (ARCHITECTURE rev 4) | Three-stage sweep, docs/logs/; noise: decode 0.68%, prefill 2.2% run-to-run at 512 |
+| D11 | Parity reference = pinned vLLM (Path C). Goldens generated under `VLLM_BATCH_INVARIANT=1` (deterministic, ~5× slower; 0/50 re-run diff, sha 74d9776). Bench role NEVER runs the flag (canonical measures vLLM at its fastest). transformers-NVFP4 path dead: grouped-fp4 expert loader defect ("Reinit due to size mismatch", layers 3–65). Path B bf16 spot-check pending as hardening. Consequence: our engine ships a deterministic parity mode | docs/logs/ probe runs 2026-07-24/25; goldens meta; 2026-07-25 determinism logs |
+| D12 | Baselines captured 2026-07-26: decode 13,409.5 tok/s (noise 0.12%), prefill 4,999.3 (noise 0.82%) → per-workload merge bars max(2×noise, 0.3%): decode +0.30%, prefill +1.64%. Iteration-0 vllm rows in ledger; adapted OPTIMIZATION_INSTRUCTIONS.md is the binding constitution | harness/benchmark.py records; docs/logs/2026-07-26_baseline_*.log |
+| D13 | Cross-implementation parity gate = teacher-forced envelope form. Free-run exact-token vs goldens is DETERMINISTIC SELF-CONSISTENCY only (bench-vLLM itself scores 45/50 mismatch / delta 0.583 against its own deterministic goldens). Parity gate: K=16 golden positions/prompt, 1-token greedy on prompt-ids+golden-prefix-ids; PASS = within the pinned bench-vLLM envelope (agree −2pts, delta_mean ×1.25). Measured: envelope 95.0%/0.0466; pyengine 95.87%/0.0453 — PASS, beating the reference on both arms | docs/logs/tf_envelope_benchvllm_*.log, tf_pyengine_d13_*.log, gate_vs_benchvllm_*.log |
 
 ## 3. Repo state (Infinity-AI-Institute/tm-opt, working copy /workspace/tm-opt)
 
@@ -98,8 +101,12 @@ dispatcher/worker) committed with token_ids gate fix, serve script
 self-logging to /workspace/logs (evidence logs curated into docs/logs/),
 docs current (ARCHITECTURE rev 3, BASELINE_NOTES, SECURITY_LEDGER, PLAN).
 
-Not yet: canonical freeze, goldens, committed baseline numbers, pyengine,
-Ralph kit, trajectory plot script.
+Done since (see D10–D13 + PROGRESS.md): canonical freeze (cache_key
+8451a604), deterministic goldens, committed baselines, Ralph kit (build
+loop ran P4 end-to-end), pyengine (loader/graph/KV/scheduler/server —
+parity green under D13, iteration-0 decode row in ledger),
+plot_trajectory.py. Not yet: B4.2 prefill iteration-0 row, dispatcher
+bring-up (Stage 3), MTP in engine, Path B spot-check.
 
 ## 4. Execution plan from here (strict order; each step has an acceptance test)
 
@@ -129,7 +136,7 @@ peak at conc 512 both workloads, collapse past 512 = KV-capacity edge)
   → `experiments/baseline_vllm.json` committed. This is the wall target.
 - **Accept:** baseline numbers in repo + BASELINE_NOTES updated.
 
-### P4. pyengine bring-up (the Ralph BUILD loop's job)
+### P4. pyengine bring-up (the Ralph BUILD loop's job) ✅ 2026-07-27 (B3.5 parity green under D13, human-verified; B4.1 iteration-0 row in ledger — accept condition met; B4.2 prefill row pending)
 Target layout `engine/pyengine/`:
 - `loader.py` (safetensors → NVFP4 tensors on 4 GPUs, expert-major),
 - `model.py` (66-layer graph: rel-attn two shapes, sconv, MoE sigmoid-top6,
@@ -146,7 +153,7 @@ full parity set (**human-verified milestone**); B4 first honest benchmark
 number in ledger (losing is expected — case-study iteration 0 was 13.6%).
 - **Accept:** B3 green + B4 row in ledger.
 
-### P5. Ralph kit (write before P4 runs; the loop executes P4)
+### P5. Ralph kit (write before P4 runs; the loop executes P4) ✅ 2026-07-26 (supervised iteration observed; loop has since executed all of P4 — 20+ items, 4 adjudicated BLOCKEDs)
 - `agent/PROMPT_BUILD.md` — bring-up brief: read PROGRESS.md, pick next
   unchecked item, small diffs, run that item's test, update PROGRESS.md,
   commit. Never touch harness/, configs/, goldens/.
