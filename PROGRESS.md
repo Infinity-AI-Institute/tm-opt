@@ -175,9 +175,13 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
       (|MoE|/|residual| ~1.5e-02). Adjudication options in the 2026-07-27
       BLOCKED loop note. Loop may not alter gates; human decides.
       test: `python -m engine.pyengine.tests.t_b3 decode`
-- [ ] B3.3 continuous batching scheduler: 8 concurrent greedy requests give
+- [x] B3.3 continuous batching scheduler: 8 concurrent greedy requests give
       IDENTICAL tokens to batch-1 runs (batch invariance).
       test: `python -m engine.pyengine.tests.t_b3 batch`
+      — green: 8 requests (T 4-13, max_new 9-32) token-IDENTICAL to batch-1
+      generate_greedy 8/8 x TWO schedules (staggered arrivals cap 8, peak 8
+      concurrent; reversed submission cap 3, FCFS queueing); invariance by
+      construction — per-seq batch-1 ops on own LayerKV (commit dd6dedd)
 - [ ] B3.4 OpenAI server: /v1/completions with temperature 0, logprobs,
       return_token_ids (choice-level), ignore_eos, /health.
       test: `python -m engine.pyengine.tests.t_b3 server`
@@ -960,3 +964,57 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
   (t_b2 logits rewire) NOT rerun — nothing ticked, no repo code changed
   this session; working tree contains only this PROGRESS.md edit,
   committed alone per the BLOCKED rule.
+- 2026-07-27 B3.3 (B3.2 stays BLOCKED awaiting the human ruling — first
+  non-BLOCKED unchecked item was B3.3; it depends only on B3.2's COMMITTED
+  and arm-(b)-certified generate_greedy loop, not on the blocked arm-(a)
+  adjudication): implemented scheduler.py (Request / Engine / Scheduler) +
+  t_b3 batch. DESIGN, from the repo's own facts: the item's gate is BITWISE
+  token identity vs batch-1, and B3.1/B3.2 established bf16 accumulation is
+  row-count-dependent (T=1 GEMV vs row-batched GEMM) — so fused-batch
+  kernels cannot meet a bitwise gate in principle; the honest v1 is
+  iteration-level (Orca-style) continuous batching whose per-sequence step
+  runs the EXACT batch-1 op sequence (Engine.prefill/decode transcribe
+  model.generate_greedy's two step forms op for op; each sequence owns its
+  per-layer kv.LayerKV; co-scheduled sequences share weights, never a
+  reduction). Fusing co-residents into batched kernels is Stage-3 work (D4)
+  refereed by this same test; chunked prefill deferred with it (seam:
+  Engine.prefill). Scheduler semantics: submit(arrival_step) queues
+  (deterministic stand-in for wall-clock arrival; B3.4 maps real arrivals
+  onto step boundaries), each step admits due arrivals FCFS into free
+  slots (prefill = the arrival's token that step), decodes every
+  previously-admitted running seq once, retires finished seqs via
+  on_retire(req) with states still attached (B3.4 completion seam / test
+  pin) then frees KV. Ran test verbatim from /workspace/tm-opt (venv
+  active, CUDA_VISIBLE_DEVICES=4,5,6,7), foreground, single run, green
+  first try. Real output (final line; stderr showed load 105 s, 8 baseline
+  continuations, 16 retirement lines):
+  ```
+  batch ok: continuous batching scheduler — 8 concurrent greedy requests (T 4-13, max_new 9-32, 174 tokens) IDENTICAL to batch-1 generate_greedy 8/8 requests x BOTH schedules (exact int equality, no tolerance) — A: staggered arrivals [0, 0, 0, 0, 1, 2, 3, 4] cap 8, peak 8 concurrent, admit==arrival 8/8, retirements interleaved (7 distinct finish steps 9..31); B: REVERSED submission cap 3, FCFS queue (step-0 admits {5,6,7}, last admit step 38), peak 3; batch-1 math per sequence on its own LayerKV by construction (fused-batch kernels = Stage-3/D4); cache.n == T+max_new-1 all 66 layers x 8 reqs x 2 schedules at retirement, KV freed after; resident split [16, 16, 16, 17]; wall load 105 s + baseline 115 s + A 113 s + B 113 s
+  ```
+  Baseline = model.generate_greedy per request from fresh state (the loop
+  B3.2 arm (b) certified bitwise-deterministic 5x live); its r0-r4
+  32/24/17/32/9-token continuations visibly match B3.2's printed arm-(b)
+  prefixes (' Berlin.\nThe capital of France is Paris...', ' Au, and its
+  atomic number is 79...', etc.) — untested-but-visible cross-session
+  consistency. Schedule A: all 8 concurrent steps 4-9 (peak pinned == 8),
+  late arrivals joined mid-decode (admit == arrival 8/8), varied max_new
+  interleaved retirements (7 distinct finish steps). Schedule B: same
+  requests, REVERSED submission, cap 3 — FCFS queue held 5 requests
+  (step-0 admits exactly {7,6,5} = first three submitted), admissions
+  followed retirements out to step 38, different co-residents than A —
+  tokens again identical 8/8, which is the actual invariance claim.
+  3 new prompts added for 8 total (PROMPTS8; content irrelevant to a
+  self-consistency gate). t_decode left bit-for-bit UNTOUCHED (BLOCKED-
+  frozen pending adjudication) — the ~28-line resident-load block is
+  mirrored inline in t_batch with a dedup note for after B3.2 lands.
+  Regression after the t_b3.py edit: t_b3 kv green, evidence line
+  IDENTICAL to the B3.1 tick (t_b1/t_b2 untouched this iteration; t_batch
+  itself exercises the new import). Code committed first (dd6dedd) per
+  convention; this tick is its own commit. NOTE for B3.4: the server
+  drives Scheduler.submit/step directly; return_token_ids needs the
+  per-request token lists (Request.tokens) and choice-level logprobs need
+  a capture hook in Engine — generate_greedy's capture= form is the
+  pattern to mirror. NOTE for B3.6/B4.1: per-sequence execution means
+  throughput scales ~1/batch for now — that is the EXPECTED losing
+  iteration-0 shape (case study started at 13.6%); the batched-kernel
+  experiments that fix it are Stage-3 and must re-pass this test.
