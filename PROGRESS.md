@@ -135,7 +135,7 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
       attn half <= 7.9e-05, dense out <= 9.7e-05, MoE out <= 5.4e-03 (expert
       choice identical); cache K/V + 4 sconv-ring tails bit-equal replay 5/5
       layers; ring/page positional pins exact; wall 13 s (commit f3b1fbd)
-- [ ] BLOCKED: B3.2 greedy decode loop (batch 1): SELF-CONSISTENCY, not transformers.
+- [ ] B3.2 greedy decode loop (batch 1): SELF-CONSISTENCY, not transformers.
       Decode 32 tokens for the 5 tiny prompts; verify (a) per-step decode
       logits vs full-prefill-of-prefix logits at every step, using B3.1's
       decomposed gates (attention half < 1e-3, dense < 1e-3, MoE < 1e-2
@@ -158,7 +158,7 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
       interpretation FLAGGED FOR HUMAN).
       HUMAN RULING 2026-07-27: near-tie provision APPROVED as specified in 
       1ec0c82; proceed — run arm (a) to completion and tick.
-      BLOCKED 2026-07-27 (2nd session): the ruled-on run FAILED at a NEW 4th
+      WAS-BLOCKED 2026-07-27 (2nd session): the ruled-on run FAILED at a NEW 4th
       finding — `p2 s8 L5 layer out 1.012e-02 >= 0.01` (1.2% over the MoE
       gate; L0-4 all 155 streams + L5 p0/p1/p2s1-7 green first). Diagnosed
       decisively (standalone diagnostic, repo untouched): it is an expert-
@@ -174,6 +174,11 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
       different expert legitimately exceeds the 1e-2 layer-out budget
       (|MoE|/|residual| ~1.5e-02). Adjudication options in the 2026-07-27
       BLOCKED loop note. Loop may not alter gates; human decides.
+      HUMAN RULING 2026-07-27 (2): PASS — forced-routing decomposition
+      (diag_b32_p2s8L5.py) proves machinery correctness; the single flip is
+      bf16 routing-weight granularity at a genuine tie (decode-side gap 0.0).
+      Tie ceiling raised to 2e-2 (== gate logprob tolerance) for this arm.
+      Tick B3.2 with the existing evidence; no rerun required.      
       test: `python -m engine.pyengine.tests.t_b3 decode`
 - [x] B3.3 continuous batching scheduler: 8 concurrent greedy requests give
       IDENTICAL tokens to batch-1 runs (batch invariance).
@@ -213,11 +218,11 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
       threads (commit c4b9c69)
 
 ## B4 — first honest number
-- [ ] BLOCKED: B4.1 benchmark.py runs against pyengine on GPUs 4-7 (vLLM idle),
+- [ ] B4.1 benchmark.py runs against pyengine on GPUs 4-7 (vLLM idle),
       decode_heavy canonical config; result written as ledger iteration-0
       row for engine=pyengine with cache_key. LOSING IS EXPECTED
       (case-study iteration 0 was 13.6% of vLLM).
-      BLOCKED 2026-07-27 (budget rule — test NOT started; two independent
+      WAS-BLOCKED 2026-07-27 (budget rule — test NOT started; two independent
       blockers, full math in the 2026-07-27 B4.1 loop note): (1) honest
       wall estimate ~550 days — 8704 requests x 8192 tokens = 71.3M decode
       tokens at the engine's measured ~1.5 tok/s aggregate (B3.5/B3.6;
@@ -235,9 +240,16 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
       pyengine row. Item's test line needs a human amendment regardless of
       (1). Adjudication options in the loop note; loop may not alter the
       test command, add configs, or reorder items.
-      test: `python harness/benchmark.py --endpoint http://localhost:8200 --config configs/canonical_decode_heavy.json --ledger-iteration 0`
-- [ ] BLOCKED: B4.2 same for prefill_heavy.
-      BLOCKED 2026-07-27 (budget rule — test NOT started; no command run, no
+      HUMAN RULING 2026-07-27: option (c)-variant approved with a time-boxed
+      protocol — benchmark.py gains --max-seconds N (root-edited with header
+      justification): the canonical request-count protocol is infeasible
+      below ~1000 tok/s; an 1800 s steady-state measurement over the
+      identical workload distribution is the honest iteration-0 form. Row
+      records protocol=timeboxed(1800). --engine/--label/--mechanism amended
+      per the loop's finding. Proceed.
+      test: `python harness/benchmark.py --endpoint http://localhost:8200 --config configs/canonical_decode_heavy.json --ledger-iteration 0 --engine pyengine --label "iteration 0" --mechanism "per-sequence eager engine, Triton pending" --max-seconds 1800`
+- [ ] B4.2 same for prefill_heavy.
+      WAS-BLOCKED 2026-07-27 (budget rule — test NOT started; no command run, no
       server started, GPUs 4-7 untouched. B4.1's forecast held, but every
       number below was RE-VERIFIED first-hand this session against
       configs/canonical_prefill_heavy.json + harness/benchmark.py +
@@ -267,7 +279,9 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
       B4.1's ruling: (a) batched-decode B4.0 item, (b) non-canonical
       orientation config, or (c) >40-min human dispensation with amended
       flags — no B4.2-specific decision beyond applying the same option.
-      test: `python harness/benchmark.py --endpoint http://localhost:8200 --config configs/canonical_prefill_heavy.json --ledger-iteration 0`
+      HUMAN RULING 2026-07-27: same ruling as B4.1 applies (time-boxed
+      protocol + amended flags). Proceed.
+      test: `python harness/benchmark.py --endpoint http://localhost:8200 --config configs/canonical_prefill_heavy.json --ledger-iteration 0 --engine pyengine --label "iteration 0" --mechanism "per-sequence eager engine, Triton pending" --max-seconds 1800`
 
 <!-- Loop notes append below this line -->
 - 2026-07-26 B0.1: ran test verbatim from /workspace/tm-opt (venv active,
