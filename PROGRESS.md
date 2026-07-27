@@ -236,7 +236,37 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
       (1). Adjudication options in the loop note; loop may not alter the
       test command, add configs, or reorder items.
       test: `python harness/benchmark.py --endpoint http://localhost:8200 --config configs/canonical_decode_heavy.json --ledger-iteration 0`
-- [ ] B4.2 same for prefill_heavy.
+- [ ] BLOCKED: B4.2 same for prefill_heavy.
+      BLOCKED 2026-07-27 (budget rule — test NOT started; no command run, no
+      server started, GPUs 4-7 untouched. B4.1's forecast held, but every
+      number below was RE-VERIFIED first-hand this session against
+      configs/canonical_prefill_heavy.json + harness/benchmark.py +
+      server.py — full math in the 2026-07-27 B4.2 loop note): (1) honest
+      wall estimate ~69 days minimum — 8704 requests (1024 warmup + 3x2560)
+      x OSL 1024 under ignore_eos = 8.9M decode tokens at the measured ~1.5
+      tok/s aggregate (B3.5/B3.6; per-sequence execution, concurrency does
+      not multiply), PLUS ~53.5M prefill tokens (ISL uniform 4096-8192,
+      mean ~6144) that decode-heavy never had; and the run CRASHES in
+      warmup before any number: at the server's max_batch-8 FCFS cap
+      (server.py:379) each co-resident gains 1 token per ~5.2 s engine
+      step (B3.6), so 1024 tokens needs >= ~5,300 s — before counting the
+      ~6K-token prefill or longer-context decode — vs benchmark.py's
+      3600 s per-request timeout (line 57): all 512 first-wave threads
+      raise requests.Timeout, pool.map propagates, harness aborts with
+      zero output. Completion floor for the first wave alone: 512x1024 =
+      524,288 decode + 512x~6144 = 3.15M prefill tokens inside 3600 s ~
+      146 tok/s decode + ~874 tok/s prefill concurrently (~100x current).
+      (2) same independent ledger-poison blocker as B4.1: the verbatim
+      test command omits `--engine pyengine`; benchmark.py defaults
+      --engine "vllm" / --label "baseline" / --baseline-id vllm_mtp_off
+      (lines 142-146), and with --ledger-iteration set the appended row
+      would claim engine=vllm / pct 100.0 for workload=prefill_heavy in
+      the append-only ledger — adopted as the denominator by the
+      last-match baseline scan (lines 168-174) for every future pyengine
+      prefill row. Needs the same human amendment as B4.1. UNBLOCKS WITH
+      B4.1's ruling: (a) batched-decode B4.0 item, (b) non-canonical
+      orientation config, or (c) >40-min human dispensation with amended
+      flags — no B4.2-specific decision beyond applying the same option.
       test: `python harness/benchmark.py --endpoint http://localhost:8200 --config configs/canonical_prefill_heavy.json --ledger-iteration 0`
 
 <!-- Loop notes append below this line -->
@@ -1328,5 +1358,64 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
   convention; (c) once (a) lands, grant the canonical B4.1 run a >40-min
   dispensation (human-run, or a human-specified multi-session tmux
   protocol), with the amended --engine/--label/--mechanism flags from (5).
+  SESSION LEDGER: this PROGRESS.md edit is the only change, committed
+  alone per the BLOCKED rule.
+- 2026-07-27 B4.2 BLOCKED (budget rule — test NOT started; no command run,
+  no server started, GPUs 4-7 untouched, no code changed this session).
+  B3.2 + B3.5 + B4.1 remain BLOCKED (human rulings pending), so B4.2 was
+  the first non-BLOCKED unchecked item. The mandatory pre-start wall-time
+  estimate came out ~4 orders of magnitude over the ~40-min ceiling. B4.1's
+  forecast predicted this, but nothing was taken on faith — every input was
+  re-verified FIRST-HAND this session from the frozen artifacts (read-only
+  reads; loop may read configs/harness, not write them):
+  (1) VERIFIED CONFIG (configs/canonical_prefill_heavy.json): ISL 8192 with
+  range_ratio 0.5 (make_prompts draws randint(4096, 8192), mean ~6144),
+  OSL 1024, ignore_eos true, concurrency 512, num_warmup_requests 1024,
+  num_bench_requests 2560; benchmark.py --repeats defaults 3 => total
+  8704 requests = 8,912,896 decode tokens + ~53.5M prefill tokens.
+  (2) VERIFIED HARNESS (harness/benchmark.py): per-request timeout=3600 s
+  (line 57); run_block posts ALL prompts through ThreadPoolExecutor
+  max_workers=conc=512 at t0 (line 67); --engine defaults "vllm", --label
+  "baseline", --mechanism "vLLM pinned build..." (lines 142-146);
+  pct_vs_baseline takes the LAST ledger row matching engine=vllm +
+  workload + baseline_id as denominator (lines 168-174).
+  (3) VERIFIED ENGINE SPEED (committed measurements, no new run needed):
+  B3.6 soak = 2625 tokens / 1800 s at conc 8 = ~1.5 tok/s AGGREGATE, 363
+  steps => ~5.2 s/engine-step, i.e. each co-resident seq gains ONE token
+  per ~5.2 s wall; B3.5 gate = 0.63 s/tok sequential. Concurrency does not
+  multiply throughput (B3.3 per-sequence execution, by design); server
+  admits max_batch=8 FCFS (server.py:379 default, verified).
+  (4) ESTIMATE: decode 8.9M / ~1.5 tok/s ~ 5.9e6 s ~ 69 DAYS, before
+  counting ~53.5M prefill tokens through eager T~6K attention (decode-heavy
+  B4.1 had ~6.7M; this workload is 8x heavier in prefill). Warmup block
+  alone = 1.05M decode tokens ~ 8 days.
+  (5) MECHANICAL FAILURE MODE, crash before any number: the first 8
+  admitted requests each need 1024 tokens x ~5.2 s = >= ~5,300 s wall —
+  BEFORE their ~6K-token prefills and the slower longer-context decode
+  steps — vs the 3600 s per-request clock that starts at t0 for all 512
+  first-wave threads. Every thread raises requests.Timeout during WARMUP,
+  pool.map propagates, the harness aborts with zero output. First-wave
+  completion floor: 512x1024 = 524,288 decode + 512x~6144 ~ 3.15M prefill
+  tokens inside 3600 s ~ 146 tok/s decode + ~874 tok/s prefill
+  CONCURRENTLY (~100x current on the decode arm alone; the B4.1 floor was
+  1,165 tok/s because its OSL is 8x larger — same class, different knee).
+  (6) SECOND INDEPENDENT BLOCKER, identical to B4.1's: the verbatim test
+  command sets --ledger-iteration 0 but omits --engine pyengine, so a
+  completed run would append engine=vllm / label=baseline / baseline_id=
+  vllm_mtp_off / pct 100.0 for workload=prefill_heavy into the append-only
+  ledger (rule 3 — unremovable), which the last-match scan would then adopt
+  as the denominator for every future pyengine prefill_heavy row in place
+  of the real committed 4,999.3 baseline. The test line needs the same
+  human amendment as B4.1 (e.g. --engine pyengine --label iteration0
+  --mechanism "pyengine bring-up, per-sequence execution").
+  NO NEW ADJUDICATION REQUESTED: B4.2 unblocks mechanically with whichever
+  option the human picks for B4.1 — (a) B4.0 batched decode first, (b)
+  non-canonical orientation config, or (c) >40-min dispensation with
+  amended flags — applied to the prefill_heavy config pair. With B3.2/
+  B3.5/B4.1/B4.2 all BLOCKED on human rulings, PROGRESS.md now has ZERO
+  loop-actionable items: the next ralph iteration will find no unchecked
+  non-BLOCKED item and should report exactly that (with a hedge note)
+  rather than invent scope — the queue needs a human ruling or new items
+  before the loop can do further work.
   SESSION LEDGER: this PROGRESS.md edit is the only change, committed
   alone per the BLOCKED rule.
