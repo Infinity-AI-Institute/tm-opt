@@ -1193,17 +1193,273 @@ def t_server():
           f"{time.time() - t0 - t_load - t_base - t_conc:.0f} s")
 
 
-def _todo(item):
-    def f():
-        raise SystemExit(f"[t_b3] not implemented — that is item {item}'s job")
-    return f
+SOAK_SECS = 1800          # the item's 30 minutes — not configurable
+SOAK_SAMPLE_S = 10        # monitor cadence (~180 samples over the soak)
+SOAK_W1 = (300, 600)      # steady-state reference window (s from soak start)
+SOAK_W2 = (1500, 1800)    # final window; drift = mean(W2) - mean(W1)
+SOAK_GATE_RSS_MB = 512    # process RSS drift ceiling
+SOAK_GATE_ALLOC_MB = 512  # per-device torch allocated drift ceiling
+SOAK_GATE_RESV_MB = 1024  # per-device torch reserved drift ceiling
+SOAK_MAX_NEW = (32, 24, 17, 32, 9, 27, 12, 16)  # varied -> constant churn
+SOAK_LONG = "The quick brown fox jumps over the lazy dog. " * 70
+
+
+def _vmrss_mb():
+    """Process resident set size in MiB (/proc/self/status VmRSS)."""
+    #1. VmRSS is reported in kB
+    with open("/proc/self/status") as f:
+        for line in f:
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1]) / 1024.0
+    raise SystemExit("[t_b3 soak] VmRSS not found in /proc/self/status")
+
+
+def t_soak():
+    """B3.6: 30-minute soak at concurrency 8 — zero crashes/leaks, rss +
+    vram stable. Drives the B3.4 server in its SERVING config (num_pages
+    1024 = the 16384-token capacity, max_batch 8) with 8 driver threads
+    posting parity-shaped requests back-to-back on keep-alive sessions;
+    thread 7 soaks a ~700-token prompt so every cycle crosses the 512 ring
+    window + sconv boundary (B2.7) and exercises multi-page paged-KV
+    alloc/free churn; the rest reuse the B3.3 tiny prompts with varied
+    max_new so admissions/retirements interleave continuously.
+
+    Leak gates (drift = mean over W2=[1500,1800)s minus mean over
+    W1=[300,600)s, ~30 samples each; the first 300 s are allocator warmup
+    — every request shape completes a full cycle within ~200 s):
+      - vram allocated <= 512 MiB/device: the smallest plausible real KV
+        leak is ONE layer's state per retired request (~67 MiB paged pool,
+        ~4 MiB ring); ~40 retirements between window midpoints => >= 2.7
+        GiB signal, while sampling-phase noise (+-1 resident seq ~ 260
+        MiB instantaneous) mean-smooths far below the gate;
+      - vram reserved <= 1 GiB/device: fragmentation creep; fixed request
+        shapes recycle identical block sizes, so reserved must plateau;
+      - rss <= 512 MiB: a leaked fp32 capture row is ~0.8 MiB/token and
+        every request asks logprobs; ~1800 tokens between window midpoints
+        => ~1.4 GiB signal; in-flight rows are bounded (~8 x 32 rows).
+    Crash gates: HTTP 200 on every completion, /health 200 every 10 s
+    (before/throughout/after), engine loop error None, clean drain +
+    shutdown (thread joins, queues empty, finished == completions).
+    Consistency gates (corruption referee): every completion's token_ids
+    AND token_logprobs EXACTLY equal the same thread's cycle-0 response
+    (same batch-1 op sequence per B3.3 invariance — exact ints / exact
+    float64 via JSON, the B3.4 precedent), usage/finish_reason/lengths
+    exact. Concurrency evidence: peak_running == 8, mean co-residency
+    >= 6 (back-to-back posts leave at most one-step admission gaps)."""
+    import math
+    import requests as rq
+    from transformers import AutoTokenizer
+    t0 = time.time()
+
+    #1. resident engine in the SERVING config (server.py CLI defaults),
+    #   tokenize the 8 fixed request shapes; pin ring-crossing coverage
+    eng, splits = pserver.build_resident(MODEL_DIR, num_pages=1024)
+    mc = eng.mc
+    tok = AutoTokenizer.from_pretrained(MODEL_DIR, trust_remote_code=True)
+    prompts = list(PROMPTS8[:7]) + [SOAK_LONG]
+    lens = [int(tok(p, return_tensors="pt").input_ids[0].shape[0])
+            for p in prompts]
+    if lens[7] <= mc.window + mc.sconv_k - 1:
+        raise SystemExit(f"[t_b3 soak] long prompt T={lens[7]} does not "
+                         f"cross the window+sconv boundary "
+                         f"{mc.window + mc.sconv_k - 1}")
+    ndev = torch.cuda.device_count()
+    t_load = time.time() - t0
+
+    #2. serve on an ephemeral port (a stray 8200 listener must not be able
+    #   to fail this test); /health must answer before the soak starts
+    httpd, loop = pserver.serve(eng, tok, host="127.0.0.1", port=0,
+                                max_batch=8)
+    port = httpd.server_address[1]
+    url = f"http://127.0.0.1:{port}"
+    th = threading.Thread(target=httpd.serve_forever, daemon=True)
+    th.start()
+    if rq.get(f"{url}/health", timeout=10).status_code != 200:
+        raise SystemExit("[t_b3 soak] /health before soak failed")
+
+    #3. shared soak state; any failure aborts the soak LOUDLY via `abort`
+    #   so a broken run fails in seconds, not after 30 idle minutes
+    errors, err_lock = [], threading.Lock()
+    refs = [None] * 8      # (token_ids, token_logprobs) of cycle 0
+    counts = [0] * 8       # completed-and-verified cycles per thread
+    samples = []           # (t, rss_mb, alloc_mb[ndev], resv_mb[ndev], n_running)
+    abort = threading.Event()
+    mon_stop = threading.Event()
+    t_start = time.time()
+    deadline = t_start + SOAK_SECS
+
+    def _fail(msg):
+        with err_lock:
+            errors.append(msg)
+        abort.set()
+
+    def _drive(i):
+        #1. one fixed request shape per thread, posted back-to-back on a
+        #   keep-alive session until the 30-minute deadline
+        sess = rq.Session()
+        body = {"model": MODEL_DIR, "prompt": prompts[i],
+                "max_tokens": SOAK_MAX_NEW[i], "temperature": 0,
+                "logprobs": 1, "seed": 0, "return_token_ids": True,
+                "ignore_eos": True}
+        while time.time() < deadline and not abort.is_set():
+            try:
+                r = sess.post(f"{url}/v1/completions", json=body,
+                              timeout=600)
+            except Exception as e:
+                _fail(f"r{i} cycle {counts[i]}: transport {e!r}")
+                break
+            if r.status_code != 200:
+                _fail(f"r{i} cycle {counts[i]}: HTTP {r.status_code} "
+                      f"{r.text[:200]}")
+                break
+            #2. shape checks: exact usage/lengths/finish, finite logprobs
+            j = r.json()
+            ch = j["choices"][0]
+            tids = ch.get("token_ids")
+            lps = (ch.get("logprobs") or {}).get("token_logprobs")
+            usage = {"prompt_tokens": lens[i],
+                     "completion_tokens": SOAK_MAX_NEW[i],
+                     "total_tokens": lens[i] + SOAK_MAX_NEW[i]}
+            if (not isinstance(tids, list) or len(tids) != SOAK_MAX_NEW[i]
+                    or ch["finish_reason"] != "length"
+                    or j["usage"] != usage
+                    or not isinstance(lps, list)
+                    or len(lps) != SOAK_MAX_NEW[i]
+                    or not all(math.isfinite(x) for x in lps)):
+                _fail(f"r{i} cycle {counts[i]}: malformed response "
+                      f"{str(j)[:300]}")
+                break
+            #3. consistency vs this thread's cycle 0 — exact (B3.3/B3.4)
+            if refs[i] is None:
+                refs[i] = (tids, lps)
+            elif refs[i] != (tids, lps):
+                _fail(f"r{i} cycle {counts[i]}: token_ids/logprobs changed "
+                      f"vs cycle 0 — cross-request state corruption")
+                break
+            counts[i] += 1
+        sess.close()
+
+    def _monitor():
+        #1. every SOAK_SAMPLE_S: rss + per-device vram gauges +
+        #   co-residency + a /health probe; engine death aborts
+        sess = rq.Session()
+        while not mon_stop.is_set():
+            t = time.time() - t_start
+            alloc = [torch.cuda.memory_allocated(d) / (1 << 20)
+                     for d in range(ndev)]
+            resv = [torch.cuda.memory_reserved(d) / (1 << 20)
+                    for d in range(ndev)]
+            samples.append((t, _vmrss_mb(), alloc, resv,
+                            len(loop.sched.running)))
+            try:
+                if sess.get(f"{url}/health",
+                            timeout=10).status_code != 200:
+                    _fail(f"/health at {t:.0f} s: non-200")
+            except Exception as e:
+                _fail(f"/health at {t:.0f} s: {e!r}")
+            if loop.error is not None:
+                _fail(f"engine died at {t:.0f} s:\n{loop.error}")
+            mon_stop.wait(SOAK_SAMPLE_S)
+        sess.close()
+
+    #4. run the soak: 8 drivers + 1 monitor; drivers exit at the deadline
+    #   (after their last response) or on abort
+    drv = [threading.Thread(target=_drive, args=(i,)) for i in range(8)]
+    mon = threading.Thread(target=_monitor)
+    for d in drv:
+        d.start()
+    mon.start()
+    for d in drv:
+        d.join()
+    t_soaked = time.time() - t_start
+
+    #5. drain (every issued request already answered, so this is at most
+    #   one step) then stop the monitor; fail with the recorded errors
+    t_dr = time.time()
+    while ((loop.sched.running or loop.sched.waiting)
+           and time.time() - t_dr < 300):
+        time.sleep(1)
+    mon_stop.set()
+    mon.join()
+    if errors:
+        raise SystemExit("[t_b3 soak] FAILED:\n" + "\n".join(errors[:10]))
+    if loop.sched.running or loop.sched.waiting:
+        raise SystemExit("[t_b3 soak] scheduler did not drain in 300 s")
+
+    #6. stability evaluation over the two steady-state windows
+    def _win(lo, hi):
+        return [s for s in samples if lo <= s[0] < hi]
+
+    def _mean(xs):
+        return sum(xs) / len(xs)
+
+    w1, w2 = _win(*SOAK_W1), _win(*SOAK_W2)
+    if len(w1) < 10 or len(w2) < 10:
+        raise SystemExit(f"[t_b3 soak] windows too thin ({len(w1)}/"
+                         f"{len(w2)} samples) — soak did not run 30 min")
+    rss1, rss2 = _mean([s[1] for s in w1]), _mean([s[1] for s in w2])
+    d_rss = rss2 - rss1
+    d_alloc = [_mean([s[2][d] for s in w2]) - _mean([s[2][d] for s in w1])
+               for d in range(ndev)]
+    d_resv = [_mean([s[3][d] for s in w2]) - _mean([s[3][d] for s in w1])
+              for d in range(ndev)]
+    mean_run = _mean([s[4] for s in samples
+                      if SOAK_W1[0] <= s[0] < SOAK_SECS])
+    peak = loop.sched.peak_running
+    bad = []
+    if d_rss > SOAK_GATE_RSS_MB:
+        bad.append(f"rss drift {d_rss:+.0f} MiB > {SOAK_GATE_RSS_MB}")
+    for d in range(ndev):
+        if d_alloc[d] > SOAK_GATE_ALLOC_MB:
+            bad.append(f"cuda:{d} alloc drift {d_alloc[d]:+.0f} MiB > "
+                       f"{SOAK_GATE_ALLOC_MB}")
+        if d_resv[d] > SOAK_GATE_RESV_MB:
+            bad.append(f"cuda:{d} reserved drift {d_resv[d]:+.0f} MiB > "
+                       f"{SOAK_GATE_RESV_MB}")
+    if peak != 8:
+        bad.append(f"peak_running {peak} != 8")
+    if mean_run < 6:
+        bad.append(f"mean co-residency {mean_run:.2f} < 6")
+    if bad:
+        raise SystemExit("[t_b3 soak] STABILITY FAIL: " + "; ".join(bad))
+
+    #7. /health after + clean shutdown, nothing stranded, no engine error
+    if rq.get(f"{url}/health", timeout=10).status_code != 200:
+        raise SystemExit("[t_b3 soak] /health after soak failed")
+    httpd.shutdown()
+    th.join(10)
+    if not loop.stop():
+        raise SystemExit("[t_b3 soak] engine thread did not join")
+    if loop.error is not None:
+        raise SystemExit(f"[t_b3 soak] engine error:\n{loop.error}")
+    n_fin = len(loop.sched.finished)
+    if n_fin != sum(counts):
+        raise SystemExit(f"[t_b3 soak] finished {n_fin} != completions "
+                         f"{sum(counts)}")
+
+    #8. summary = the green evidence
+    tok_total = sum(c * m for c, m in zip(counts, SOAK_MAX_NEW))
+    print(f"soak ok: {SOAK_SECS // 60} min at conc 8 — {sum(counts)} "
+          f"completions ({tok_total} tokens; per-thread {counts}, max_new "
+          f"{list(SOAK_MAX_NEW)}, T {min(lens)}-{max(lens)} incl. "
+          f"{lens[7]}-tok ring-crossing prompt), {loop.sched.step_count} "
+          f"steps, peak_running {peak}, mean co-residency {mean_run:.2f}; "
+          f"ZERO crashes (200 x {sum(counts)}, /health 200 x {len(samples)}"
+          f" probes, engine error None); token_ids + token_logprobs exact-"
+          f"equal cycle 0 on all 8 threads; rss {rss1:.0f} -> {rss2:.0f} "
+          f"MiB (drift {d_rss:+.0f} <= {SOAK_GATE_RSS_MB}); vram drift/dev "
+          f"MiB alloc {[f'{x:+.0f}' for x in d_alloc]} <= "
+          f"{SOAK_GATE_ALLOC_MB}, reserved {[f'{x:+.0f}' for x in d_resv]} "
+          f"<= {SOAK_GATE_RESV_MB} (mean W2 [1500,1800)s - W1 [300,600)s); "
+          f"drain + shutdown clean ({n_fin} retired); wall load "
+          f"{t_load:.0f} s + soak {t_soaked:.0f} s")
 
 
 def main():
-    #1. dispatch on subcommand; unimplemented ones fail loud with their item
+    #1. dispatch on subcommand
     cmds = {"kv": t_kv, "decode": t_decode,
             "batch": t_batch,
-            "server": t_server, "soak": _todo("B3.6")}
+            "server": t_server, "soak": t_soak}
     usage = f"usage: python -m engine.pyengine.tests.t_b3 {{{'|'.join(cmds)}}}"
     if len(sys.argv) != 2 or sys.argv[1] not in cmds:
         raise SystemExit(usage)
