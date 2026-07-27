@@ -2028,11 +2028,16 @@ def _deint3(t):
     return t.reshape(E, r // 2, 2, c).transpose(1, 2).reshape(E, r, c)
 
 
-def load_layer_weights(idx, hdr, dm, mc, L):
+def load_layer_weights(idx, hdr, dm, mc, L, dev=DEV, pack_moe=False):
     """Disk -> module-layout tensors for one whole decoder layer (the `w`
     dict model.layer_prefill/layer_decode consume); every conversion is one
     proven by an earlier item (B2.5-B2.10). Lifted out of t_logits (B2.11)
-    unchanged so B3 tests load layers the same proven way."""
+    unchanged so B3 tests load layers the same proven way. `dev` places the
+    layer (default the historical cuda:0); `pack_moe=True` (B3.2) keeps
+    NVFP4 routed experts in checkpoint-packed form behind
+    loader.PackedExperts (on-demand per-expert dequant, bit-identical
+    numerics — dequant is elementwise per expert) so all 66 layers fit
+    resident across 4 GPUs; layer 2's bf16 experts always load dense."""
     #1. layer-type shapes from the verified config
     is_g = L in mc.global_layers
     kvd = (mc.g_kv_heads if is_g else mc.s_kv_heads) * mc.head_dim
@@ -2049,7 +2054,7 @@ def load_layer_weights(idx, hdr, dm, mc, L):
              "mlp_norm": "mlp_norm.weight",
              "attn_sconv": "attn_sconv.weight",
              "mlp_sconv": "mlp_sconv.weight"}
-    w = {key: _disk(idx, base + suf).to(DEV)
+    w = {key: _disk(idx, base + suf).to(dev)
          for key, suf in names.items()}
     shapes = {"wq": (qd, mc.hidden), "wk": (kvd, mc.hidden),
               "wv": (kvd, mc.hidden),
@@ -2066,60 +2071,140 @@ def load_layer_weights(idx, hdr, dm, mc, L):
     if L < mc.dense_idx:
         #1a. dense MLP: w13_dn interleaved rows -> de-interleave ->
         #    chunk halves (B2.10)
-        w13 = _disk(idx, base + "mlp.w13_dn.weight").to(DEV)
+        w13 = _disk(idx, base + "mlp.w13_dn.weight").to(dev)
         assert w13.shape == (2 * mc.dense_ffn, mc.hidden), w13.shape
         wg, wu = _deinterleave_rows(w13).chunk(2, dim=0)
         w["mlp_gate"], w["mlp_up"] = wg.contiguous(), wu.contiguous()
         del w13, wg, wu
-        w["mlp_down"] = _disk(idx, base + "mlp.w2_md.weight").to(DEV)
+        w["mlp_down"] = _disk(idx, base + "mlp.w2_md.weight").to(dev)
         assert w["mlp_down"].shape == (mc.hidden, mc.dense_ffn)
-        w["mlp_gs"] = _disk(idx, base + "mlp.global_scale").to(DEV)
+        w["mlp_gs"] = _disk(idx, base + "mlp.global_scale").to(dev)
         assert w["mlp_gs"].shape == (1,)
         assert w["mlp_gs"].dtype == torch.bfloat16
     else:
         #1b. MoE: gate (f32 bias/global_scale -> bf16 like the ref
         #    load, B2.8), routed experts (bf16 straight on layer 2,
         #    NVFP4 dequant in 32-expert chunks elsewhere — bounded
-        #    fp32 workspace), shared sink experts (B2.9)
+        #    fp32 workspace — or kept packed under pack_moe, B3.2),
+        #    shared sink experts (B2.9)
         gb = base + "mlp.gate."
-        w["gate_w"] = _disk(idx, gb + "weight").to(DEV)
+        w["gate_w"] = _disk(idx, gb + "weight").to(dev)
         assert w["gate_w"].shape == (mc.n_experts + mc.n_shared,
                                      mc.hidden)
-        w["gate_b"] = _disk(idx, gb + "bias").to(DEV).to(torch.bfloat16)
-        w["gate_gs"] = _disk(idx, gb + "global_scale").to(DEV).to(
+        w["gate_b"] = _disk(idx, gb + "bias").to(dev).to(torch.bfloat16)
+        w["gate_gs"] = _disk(idx, gb + "global_scale").to(dev).to(
             torch.bfloat16)
         eb = base + "mlp.experts."
-        gu = torch.empty(mc.n_experts, 2 * mc.expert_ffn, mc.hidden,
-                         dtype=torch.bfloat16, device=DEV)
-        w2 = torch.empty(mc.n_experts, mc.hidden, mc.expert_ffn,
-                         dtype=torch.bfloat16, device=DEV)
-        if hdr[eb + "w13_weight"][0] == "BF16":
-            assert L == 2, L   # census B1.2: the only bf16 MoE layer
-            gu.copy_(_deint3(_disk(idx, eb + "w13_weight").to(DEV)))
-            w2.copy_(_disk(idx, eb + "w2_weight").to(DEV))
+        if pack_moe and hdr[eb + "w13_weight"][0] != "BF16":
+            #1b'. B3.2 resident form: routed experts stay checkpoint-
+            #     packed; model.moe_experts dequants per hit expert
+            #     through PackedExperts.__getitem__ (bit-identical to
+            #     the chunked path below — pinned by t_b3 decode)
+            for key, wname, deint in (("gu", "w13_weight", True),
+                                      ("w2", "w2_weight", False)):
+                pk = _disk(idx, eb + wname).to(dev)
+                rows = 2 * mc.expert_ffn if deint else mc.hidden
+                cols = mc.hidden if deint else mc.expert_ffn
+                assert pk.shape == (mc.n_experts, rows, cols // 2), pk.shape
+                w[key] = loader.PackedExperts(
+                    pk, _disk(idx, eb + wname + ".scale").to(dev),
+                    _disk(idx, eb + wname + ".scale2").to(dev),
+                    dm.group_size, deint)
+                del pk
         else:
-            for wname, dst, deint in (("w13_weight", gu, True),
-                                      ("w2_weight", w2, False)):
-                packed = _disk(idx, eb + wname)
-                scale = _disk(idx, eb + wname + ".scale")
-                scale2 = _disk(idx, eb + wname + ".scale2").to(DEV)
-                for e0 in range(0, mc.n_experts, 32):
-                    e1 = e0 + 32
-                    deq = loader.dequant_nvfp4(
-                        packed[e0:e1].to(DEV), scale[e0:e1].to(DEV),
-                        scale2[e0:e1], dm.group_size)
-                    dst[e0:e1] = _deint3(deq) if deint else deq
-                del packed, scale, scale2, deq
-        w["gu"], w["w2"] = gu, w2
+            gu = torch.empty(mc.n_experts, 2 * mc.expert_ffn, mc.hidden,
+                             dtype=torch.bfloat16, device=dev)
+            w2 = torch.empty(mc.n_experts, mc.hidden, mc.expert_ffn,
+                             dtype=torch.bfloat16, device=dev)
+            if hdr[eb + "w13_weight"][0] == "BF16":
+                assert L == 2, L   # census B1.2: the only bf16 MoE layer
+                gu.copy_(_deint3(_disk(idx, eb + "w13_weight").to(dev)))
+                w2.copy_(_disk(idx, eb + "w2_weight").to(dev))
+            else:
+                for wname, dst, deint in (("w13_weight", gu, True),
+                                          ("w2_weight", w2, False)):
+                    packed = _disk(idx, eb + wname)
+                    scale = _disk(idx, eb + wname + ".scale")
+                    scale2 = _disk(idx, eb + wname + ".scale2").to(dev)
+                    for e0 in range(0, mc.n_experts, 32):
+                        e1 = e0 + 32
+                        deq = loader.dequant_nvfp4(
+                            packed[e0:e1].to(dev), scale[e0:e1].to(dev),
+                            scale2[e0:e1], dm.group_size)
+                        dst[e0:e1] = _deint3(deq) if deint else deq
+                    del packed, scale, scale2, deq
+            w["gu"], w["w2"] = gu, w2
         sb = base + "mlp.shared_experts."
-        w13 = _disk(idx, sb + "shared_w13_weight").to(DEV)
+        w13 = _disk(idx, sb + "shared_w13_weight").to(dev)
         assert w13.shape == (mc.n_shared, 2 * mc.expert_ffn, mc.hidden)
         g, u = _deint3(w13).chunk(2, dim=1)
         w["shg"], w["shu"] = g.contiguous(), u.contiguous()
         del w13, g, u
-        w["shd"] = _disk(idx, sb + "shared_w2_weight").to(DEV)
+        w["shd"] = _disk(idx, sb + "shared_w2_weight").to(dev)
         assert w["shd"].shape == (mc.n_shared, mc.hidden, mc.expert_ffn)
     return w
+
+
+def build_native_layer(tc, mc, L, w):
+    """The streamed-reference layer: the ACTUAL transformers
+    InklingDecoderLayer on DEV, every parameter copied from the same
+    converted tensors our engine consumes. Lifted out of t_logits (B2.11)
+    unchanged so t_b3 (B3.2) streams the same proven reference."""
+    from transformers.models.inkling.modeling_inkling import (
+        InklingDecoderLayer)
+    #6. the reference layer itself: the ACTUAL InklingDecoderLayer,
+    #   constructed under a bf16 default dtype (a fp32 MoE layer would
+    #   waste 54 GiB), eval mode, the four sconv convs back to fp32
+    #   (_keep_in_fp32_modules_strict :610), every parameter copied
+    #   from the same converted tensors our engine consumes
+    old = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        with torch.device(DEV):
+            lay = InklingDecoderLayer(tc, L)
+    finally:
+        torch.set_default_dtype(old)
+    lay.eval()
+    for sc in (lay.self_attn.k_sconv, lay.self_attn.v_sconv,
+               lay.attn_sconv, lay.mlp_sconv):
+        sc.conv1d.to(torch.float32)
+        assert sc.conv1d.bias is None
+    src = {"self_attn.q_proj.weight": w["wq"],
+           "self_attn.k_proj.weight": w["wk"],
+           "self_attn.v_proj.weight": w["wv"],
+           "self_attn.r_proj.weight": w["wr"],
+           "self_attn.o_proj.weight": w["wo"],
+           "self_attn.q_norm.weight": w["qn"],
+           "self_attn.k_norm.weight": w["kn"],
+           "self_attn.rel_logits_proj.proj": w["proj"],
+           "self_attn.k_sconv.conv1d.weight": w["ksc"].float(),
+           "self_attn.v_sconv.conv1d.weight": w["vsc"].float(),
+           "input_layernorm.weight": w["attn_norm"],
+           "post_attention_layernorm.weight": w["mlp_norm"],
+           "attn_sconv.conv1d.weight": w["attn_sconv"].float(),
+           "mlp_sconv.conv1d.weight": w["mlp_sconv"].float()}
+    if L < mc.dense_idx:
+        src.update({"mlp.gate_proj.weight": w["mlp_gate"],
+                    "mlp.up_proj.weight": w["mlp_up"],
+                    "mlp.down_proj.weight": w["mlp_down"],
+                    "mlp.global_scale": w["mlp_gs"]})
+    else:
+        src.update({"mlp.gate.weight": w["gate_w"],
+                    "mlp.gate.e_score_correction_bias": w["gate_b"],
+                    "mlp.gate.global_scale": w["gate_gs"],
+                    "mlp.experts.gate_up_proj": w["gu"],
+                    "mlp.experts.down_proj": w["w2"],
+                    "mlp.shared_experts.gate_proj": w["shg"],
+                    "mlp.shared_experts.up_proj": w["shu"],
+                    "mlp.shared_experts.down_proj": w["shd"]})
+    params = dict(lay.named_parameters())
+    assert set(params) == set(src), (L, set(params) ^ set(src))
+    with torch.no_grad():
+        for n, s in src.items():
+            assert params[n].shape == s.shape, (L, n, params[n].shape)
+            assert params[n].dtype == s.dtype, (L, n, params[n].dtype)
+            params[n].copy_(s)
+    return lay
 
 
 def t_logits():
@@ -2162,8 +2247,7 @@ def t_logits():
     from transformers.masking_utils import (
         create_causal_mask, create_recurrent_attention_mask,
         create_sliding_window_causal_mask)
-    from transformers.models.inkling.modeling_inkling import (
-        InklingDecoderLayer, InklingRMSNorm)
+    from transformers.models.inkling.modeling_inkling import InklingRMSNorm
     torch.manual_seed(0)
     t0 = time.time()
     tens, meta, _ = _load_refs()
@@ -2251,61 +2335,6 @@ def t_logits():
             m_ours.append((mf, ms))
             m_nat.append((nf, ns))
 
-    def build_layer(L, w):
-        #6. the reference layer itself: the ACTUAL InklingDecoderLayer,
-        #   constructed under a bf16 default dtype (a fp32 MoE layer would
-        #   waste 54 GiB), eval mode, the four sconv convs back to fp32
-        #   (_keep_in_fp32_modules_strict :610), every parameter copied
-        #   from the same converted tensors our engine consumes
-        old = torch.get_default_dtype()
-        torch.set_default_dtype(torch.bfloat16)
-        try:
-            with torch.device(DEV):
-                lay = InklingDecoderLayer(tc, L)
-        finally:
-            torch.set_default_dtype(old)
-        lay.eval()
-        for sc in (lay.self_attn.k_sconv, lay.self_attn.v_sconv,
-                   lay.attn_sconv, lay.mlp_sconv):
-            sc.conv1d.to(torch.float32)
-            assert sc.conv1d.bias is None
-        src = {"self_attn.q_proj.weight": w["wq"],
-               "self_attn.k_proj.weight": w["wk"],
-               "self_attn.v_proj.weight": w["wv"],
-               "self_attn.r_proj.weight": w["wr"],
-               "self_attn.o_proj.weight": w["wo"],
-               "self_attn.q_norm.weight": w["qn"],
-               "self_attn.k_norm.weight": w["kn"],
-               "self_attn.rel_logits_proj.proj": w["proj"],
-               "self_attn.k_sconv.conv1d.weight": w["ksc"].float(),
-               "self_attn.v_sconv.conv1d.weight": w["vsc"].float(),
-               "input_layernorm.weight": w["attn_norm"],
-               "post_attention_layernorm.weight": w["mlp_norm"],
-               "attn_sconv.conv1d.weight": w["attn_sconv"].float(),
-               "mlp_sconv.conv1d.weight": w["mlp_sconv"].float()}
-        if L < mc.dense_idx:
-            src.update({"mlp.gate_proj.weight": w["mlp_gate"],
-                        "mlp.up_proj.weight": w["mlp_up"],
-                        "mlp.down_proj.weight": w["mlp_down"],
-                        "mlp.global_scale": w["mlp_gs"]})
-        else:
-            src.update({"mlp.gate.weight": w["gate_w"],
-                        "mlp.gate.e_score_correction_bias": w["gate_b"],
-                        "mlp.gate.global_scale": w["gate_gs"],
-                        "mlp.experts.gate_up_proj": w["gu"],
-                        "mlp.experts.down_proj": w["w2"],
-                        "mlp.shared_experts.gate_proj": w["shg"],
-                        "mlp.shared_experts.up_proj": w["shu"],
-                        "mlp.shared_experts.down_proj": w["shd"]})
-        params = dict(lay.named_parameters())
-        assert set(params) == set(src), (L, set(params) ^ set(src))
-        with torch.no_grad():
-            for n, s in src.items():
-                assert params[n].shape == s.shape, (L, n, params[n].shape)
-                assert params[n].dtype == s.dtype, (L, n, params[n].dtype)
-                params[n].copy_(s)
-        return lay
-
     #7. the 66-layer streamed forward, both engines in lockstep on the same
     #   converted weights (load_layer_weights, module level since B3.1).
     #   Prompt 0 carries the frozen-capture pins.
@@ -2315,7 +2344,7 @@ def t_logits():
     with torch.no_grad():
         for L in range(mc.num_layers):
             w = load_layer_weights(idx, hdr, dm, mc, L)
-            lay = build_layer(L, w)
+            lay = build_native_layer(tc, mc, L, w)
             mi = 0 if L in mc.global_layers else 1
             for p in range(5):
                 if p == 0 and L in REF_LAYERS:

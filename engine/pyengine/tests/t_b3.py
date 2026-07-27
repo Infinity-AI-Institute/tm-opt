@@ -18,7 +18,8 @@ shape the gates: (i) the drift COMPOUNDS when streams propagate their own
 outputs (600-row and 602-row streams diverge to 7e-04 by layer 1 with NO
 cache involved), so every layer is TEACHER-FORCED with the recompute
 stream's own layer input and compared over exactly one layer — end-to-end
-composition is B3.2's job against the external transformers oracle;
+composition is B3.2's job (self-consistency vs full-prefill-of-prefix +
+bitwise determinism; the binding external referee is B3.5 vs vLLM goldens);
 (ii) MoE routing WEIGHTS pass through an all-bf16 chain (sigmoid ->
 logsigmoid -> softmax on a ~2^-8-granular grid, B2.8 semantics), so a
 1-ulp logit difference legitimately moves weights ~1e-2 relative and the
@@ -63,7 +64,8 @@ from engine.pyengine import config as pcfg
 from engine.pyengine import kv as pkv
 from engine.pyengine import loader
 from engine.pyengine import model as pmodel
-from engine.pyengine.tests.t_b2 import (DEV, MODEL_DIR, _disk, _rel_err,
+from engine.pyengine.tests.t_b2 import (DEV, MODEL_DIR, PROMPTS5, _deint3,
+                                        _disk, _load_refs, _rel_err,
                                         load_layer_weights)
 
 LAYERS = (0, 1, 2, 3, 5)  # dense/SWA x2, bf16-MoE/SWA, nvfp4-MoE/SWA, nvfp4-MoE/global
@@ -353,6 +355,349 @@ def t_kv():
           f"wall {time.time() - t0:.0f} s")
 
 
+N_NEW = 32     # B3.2: the item's "32 tokens"
+NUM_PAGES = 8  # per-global-layer page budget: 8*16=128 >= max T+31 (=44)
+GATE_TIE = 1e-2  # fp32 logit gap below which a greedy flip FLAGs, not fails
+
+
+def _materialize(pex):
+    """Full bf16 expert stack from a loader.PackedExperts — the SAME
+    32-expert-chunk dequant + de-interleave as load_layer_weights' dense
+    path (B2.9/B2.11). PackedExperts.__getitem__ is pinned bit-equal to
+    this chunked form (t_decode step #4), so swapping the packed form for
+    this tensor changes no bit anywhere downstream; it exists so the
+    160-stream recompute arm dequants each NVFP4 layer ONCE instead of
+    once per hit expert per stream forward."""
+    #1. chunked dequant, exactly load_layer_weights' resident loop
+    E, rows, half = pex.packed.shape
+    out = torch.empty(E, rows, 2 * half, dtype=torch.bfloat16,
+                      device=pex.packed.device)
+    for e0 in range(0, E, 32):
+        e1 = e0 + 32
+        deq = loader.dequant_nvfp4(pex.packed[e0:e1], pex.scale[e0:e1],
+                                   pex.scale2[e0:e1], pex.group_size)
+        out[e0:e1] = _deint3(deq) if pex.deinterleave else deq
+    del deq
+    return out
+
+
+def t_decode():
+    """B3.2: greedy decode loop (batch 1) — SELF-CONSISTENCY gates, not
+    transformers (the item as restructured: accumulated eager-vs-
+    grouped_mm drift is non-probative at 9.2e-02, B2.11; the binding
+    external referee is B3.5 vs vLLM goldens).
+
+    Engine: all 66 layers RESIDENT at once — contiguous layer groups over
+    the 4 visible GPUs balanced by checkpoint header bytes (device-to-
+    device hidden-state hops are bitwise copies, so placement never
+    touches numerics). bf16-dense routed experts (~1.8 TB) fit nowhere,
+    so NVFP4 layers keep their experts checkpoint-PACKED behind
+    loader.PackedExperts — model.moe_experts dequants each HIT expert on
+    demand, and that path is PINNED bit-equal to the proven chunked
+    dequant (B2.9/B2.11) on layer 3, experts {0,7,31}, both w13 and w2.
+
+    Arm (b), engine determinism (NO tolerance): model.generate_greedy
+    runs TWICE per prompt from fresh kv.LayerKV state; token_ids must be
+    IDENTICAL; bitwise equality of the captured fp32 logits rows and
+    margins is reported alongside (expected — same kernels, same shapes).
+
+    Arm (a), self-consistency vs recompute: for every step s (0..31) the
+    free run is compared against a FULL PREFILL of its own prefix
+    prompt + tokens[:s] (fresh state, from scratch):
+      - greedy top-1: argmax(prefill-of-prefix logits) == the free run's
+        token at EVERY step; a flip FAILS unless the recompute's fp32 gap
+        between its top-1 and our token is < 1e-2 — then it is a reported
+        near-tie FLAG (item wording);
+      - B3.1's decomposed per-layer gates, TEACHER-FORCED in t_kv's
+        EXACT structure: each layer_decode is fed the recompute stream's
+        own layer input, with its cache/rings freshly populated by
+        prefilling the SAME stream's first T+s-1 rows — one layer of
+        shape effects per comparison. (First attempt used the state of
+        the NEIGHBORING prompt+tokens[:s-1] stream instead: its rows
+        carry L layers of compounded row-count drift — the B3.1
+        dead-end — and the dense MLP amplified a sub-gate x1 drift to
+        7.7e-03 at layer 1, honestly over the 1e-3 gate. Same-stream
+        state is what B3.1's gates mean.) Gates: attention-half residual
+        x1 < 1e-3, dense layer out < 1e-3, MoE layer out < 1e-2 with
+        expert top-6 CHOICE identical, truncated-prefill prefix drift
+        < 1e-3 (B3.1's diagnostic floor) — at every decode step of every
+        prompt (66 layers x 31 steps x 5 prompts = 10230 comparisons).
+    The 160 prefix streams advance LAYER-major so each NVFP4 layer's
+    experts materialize once (_materialize — bit-equal by the pin above)
+    instead of ~10^6 single-expert dequants; stream s=0 (the bare prompt)
+    must reproduce the free run's step-0 logits BIT-exactly, certifying
+    the materialized-vs-packed + trace-hook recompute path end to end.
+
+    No eos early-exit (canonical workloads run ignore_eos, P1/D6); eos
+    presence in the 32 tokens is reported. Prompt-0 ids are pinned
+    against the frozen B2.1 input_ids capture."""
+    from transformers import AutoTokenizer
+    t0 = time.time()
+    torch.manual_seed(0)
+    tens, _, _ = _load_refs()
+    mc = pcfg.load_verified(MODEL_DIR)
+    idx = loader.build_shard_index(MODEL_DIR)
+    hdr = loader.read_headers(idx)
+    dm = loader.build_dtype_map(idx, hdr)
+    ndev = torch.cuda.device_count()
+    assert ndev == 4, f"expected GPUs 4-7 visible, got {ndev}"
+
+    #1. the B2.11 prompts; prompt-0 ids pinned against the frozen capture
+    tok = AutoTokenizer.from_pretrained(MODEL_DIR, trust_remote_code=True)
+    ids = [tok(p, return_tensors="pt").input_ids[0].to(DEV) for p in PROMPTS5]
+    lens = [t.shape[0] for t in ids]
+    if not torch.equal(ids[0][None], tens["input_ids"].to(DEV)):
+        raise SystemExit("[t_b3 decode] prompt-0 ids != frozen input_ids")
+
+    #2. layer -> GPU assignment: contiguous groups, balanced by header bytes
+    lbytes = []
+    for L in range(mc.num_layers):
+        pre = f"model.llm.layers.{L}."
+        lbytes.append(sum(loader.nbytes(d, s) for n, (d, s) in hdr.items()
+                          if n.startswith(pre)))
+    total_b = sum(lbytes)
+    devs, cum, d = [], 0, 0
+    for L in range(mc.num_layers):
+        if d < ndev - 1 and cum + lbytes[L] / 2 > total_b * (d + 1) / ndev:
+            d += 1
+        devs.append(f"cuda:{d}")
+        cum += lbytes[L]
+    splits = [devs.count(f"cuda:{r}") for r in range(ndev)]
+    print(f"[t_b3 decode] layer split {splits} over {ndev} GPUs "
+          f"({total_b / (1 << 30):.0f} GiB layers)", file=sys.stderr,
+          flush=True)
+
+    #3. resident engine load: 66 layers (NVFP4 experts packed) + embed on
+    #   the first device, logits head on the last layer's device
+    layers = []
+    for L in range(mc.num_layers):
+        layers.append(load_layer_weights(idx, hdr, dm, mc, L, dev=devs[L],
+                                         pack_moe=True))
+        if L % 8 == 7 or L == mc.num_layers - 1:
+            print(f"[t_b3 decode] loaded layer {L + 1}/{mc.num_layers}, "
+                  f"{time.time() - t0:.0f} s", file=sys.stderr, flush=True)
+    w_emb = _disk(idx, "model.llm.embed.weight").to(devs[0])
+    w_en = _disk(idx, "model.llm.embed_norm.weight").to(devs[0])
+    w_fn = _disk(idx, "model.llm.norm.weight").to(devs[-1])
+    w_un = _disk(idx, "model.llm.unembed.weight").to(devs[-1])
+    assert isinstance(layers[2]["gu"], torch.Tensor)   # bf16 layer: dense
+    assert isinstance(layers[3]["gu"], loader.PackedExperts)
+
+    #4. packed-path pin: on-demand PackedExperts[e] must be bit-equal the
+    #   proven chunked dequant + de-interleave (B2.9/B2.11 path) on the
+    #   same bytes — layer 3, experts {0,7,31}, both w13 (deint) and w2
+    with torch.no_grad():
+        for name, pex in (("w13", layers[3]["gu"]), ("w2", layers[3]["w2"])):
+            chunk = loader.dequant_nvfp4(pex.packed[:32], pex.scale[:32],
+                                         pex.scale2[:32], dm.group_size)
+            want = _deint3(chunk) if pex.deinterleave else chunk
+            for e in (0, 7, 31):
+                if not torch.equal(pex[e], want[e]):
+                    raise SystemExit(f"[t_b3 decode] PackedExperts {name} "
+                                     f"expert {e} != chunked dequant")
+            del chunk, want
+
+    #5. arm (b): the item's loop TWICE per prompt from fresh state —
+    #   token_ids must be IDENTICAL (no tolerance); fp32 logits rows are
+    #   captured for arm (a); cache token counts pinned per layer per run
+    ours, ourm, cap, n_bits = [], [], [], 0
+    with torch.no_grad():
+        for p in range(5):
+            runs = []
+            for r in range(2):
+                states = [pkv.LayerKV(mc, L, devs[L], num_pages=NUM_PAGES)
+                          for L in range(mc.num_layers)]
+                c = []
+                toks, margs = pmodel.generate_greedy(
+                    ids[p], N_NEW, layers, states, w_emb, w_en, w_fn,
+                    w_un, mc, capture=c)
+                assert len(toks) == N_NEW and all(
+                    0 <= t < mc.vocab_unpadded for t in toks)
+                fed = lens[p] + N_NEW - 1   # last token is never fed back
+                for L in range(mc.num_layers):
+                    if states[L].cache.n != fed:
+                        raise SystemExit(f"[t_b3 decode] p{p} run{r} layer "
+                                         f"{L} cache.n {states[L].cache.n} "
+                                         f"!= {fed}")
+                del states
+                runs.append((toks, margs, c))
+            (toks, margs, c), (tok2, mar2, c2) = runs
+            if toks != tok2:
+                raise SystemExit(f"[t_b3 decode] p{p} NON-DETERMINISTIC: "
+                                 f"run1 {toks} != run2 {tok2}")
+            n_bits += (margs == mar2
+                       and all(torch.equal(a, b) for a, b in zip(c, c2)))
+            ours.append(toks)
+            ourm.append(margs)
+            cap.append(c)
+            print(f"[t_b3 decode] p{p} x2 ({time.time() - t0:.0f} s): "
+                  f"{tok.decode(toks)!r}", file=sys.stderr, flush=True)
+    t_gen = time.time() - t0
+
+    #6. arm (a): 160 recompute streams (5 prompts x steps 0..31), stream
+    #   (p, s) = full prefill of prompt + tokens[:s]; LAYER-major advance
+    keys = [(p, s) for p in range(5) for s in range(N_NEW)]
+    streams, mcache = {}, {}
+    worst = {"attn": 0.0, "dense": 0.0, "moe": 0.0, "pfx": 0.0}
+    n_choice = 0
+
+    def _pm(dev, n):
+        #6a. per-(device, length) masks + positions, built once
+        if (dev, n) not in mcache:
+            pos = torch.arange(n, device=dev)
+            mcache[(dev, n)] = (
+                pmodel.additive_causal_mask(pos, pos, torch.bfloat16),
+                pmodel.additive_causal_mask(pos, pos, torch.bfloat16,
+                                            window=mc.window), pos)
+        return mcache[(dev, n)]
+
+    with torch.no_grad():
+        for p, s in keys:
+            seq = torch.cat([ids[p], torch.tensor(ours[p][:s],
+                                                  dtype=torch.long,
+                                                  device=DEV)])
+            _, streams[(p, s)] = pmodel.embed(seq[None], w_emb, w_en,
+                                              eps=mc.rms_eps)
+        for L in range(mc.num_layers):
+            is_moe = L >= mc.dense_idx
+            wm = layers[L]
+            if is_moe and isinstance(wm["gu"], loader.PackedExperts):
+                wm = dict(wm)
+                wm["gu"] = _materialize(layers[L]["gu"])
+                wm["w2"] = _materialize(layers[L]["w2"])
+            mi = 0 if L in mc.global_layers else 1
+            ys, trs = {}, {}
+            #6b. oracle: prefill every stream through layer L with the
+            #    x1/mlpin trace at the last row (no state here — the
+            #    teacher-forced arm rebuilds state from each stream's
+            #    OWN rows below)
+            for p, s in keys:
+                x = streams[(p, s)].to(devs[L])
+                streams[(p, s)] = x   # the layer input, kept for 6c
+                m = _pm(devs[L], x.shape[1])
+                tr = {}
+                ys[(p, s)] = pmodel.layer_prefill(x, wm, m[mi], m[2], mc,
+                                                  L, trace=tr)
+                trs[(p, s)] = (tr["x1"][:, -1], tr["mlpin"][:, -1])
+            #6c. teacher-forced decode of every step s>=1, t_kv's EXACT
+            #    structure: fresh state from prefilling THIS stream's own
+            #    first T+s-1 rows (one layer of shape effects — a cross-
+            #    stream cache compounds the B3.1 dead-end drift), then
+            #    one decode of the last row; gates per B3.1
+            for p, s in keys:
+                if s == 0:
+                    continue
+                x = streams[(p, s)]
+                m = _pm(devs[L], x.shape[1] - 1)
+                st = pkv.LayerKV(mc, L, devs[L], num_pages=NUM_PAGES)
+                y_tf = pmodel.layer_prefill(x[:, :-1], wm, m[mi], m[2],
+                                            mc, L, state=st)
+                trd = {}
+                yd = pmodel.layer_decode(x[:, -1], wm, st,
+                                         lens[p] + s - 1, mc, L,
+                                         trace=trd)
+                a = _rel_err(trd["x1"][0], trs[(p, s)][0][0])
+                o = _rel_err(yd[0], ys[(p, s)][0, -1])
+                f = _rel_err(y_tf, ys[(p, s)][:, :-1])
+                worst["attn"] = max(worst["attn"], a)
+                worst["pfx"] = max(worst["pfx"], f)
+                kind = "moe" if is_moe else "dense"
+                worst[kind] = max(worst[kind], o)
+                if a >= GATE_ATTN:
+                    raise SystemExit(f"[t_b3 decode] p{p} s{s} L{L} attn "
+                                     f"half {a:.3e} >= {GATE_ATTN}")
+                if o >= (GATE_MOE if is_moe else GATE_ATTN):
+                    raise SystemExit(f"[t_b3 decode] p{p} s{s} L{L} layer "
+                                     f"out {o:.3e} >= "
+                                     f"{GATE_MOE if is_moe else GATE_ATTN}")
+                if f >= GATE_ATTN:
+                    raise SystemExit(f"[t_b3 decode] p{p} s{s} L{L} prefix"
+                                     f" drift {f:.3e} >= {GATE_ATTN}")
+                if is_moe:
+                    got = _topk_set(trd["mlpin"], wm, mc)[0]
+                    want = _topk_set(trs[(p, s)][1], wm, mc)[0]
+                    if got != want:
+                        raise SystemExit(f"[t_b3 decode] p{p} s{s} L{L} "
+                                         f"expert choice {sorted(got)} != "
+                                         f"recompute {sorted(want)}")
+                    n_choice += 1
+                del st, y_tf
+            #6d. advance streams, drop this layer's transients
+            for k in keys:
+                streams[k] = ys[k]
+            del ys, trs
+            if wm is not layers[L]:
+                del wm
+                torch.cuda.empty_cache()
+            if L % 8 == 7 or L == mc.num_layers - 1:
+                print(f"[t_b3 decode] recompute layer {L + 1}"
+                      f"/{mc.num_layers}, worst attn {worst['attn']:.1e} "
+                      f"dense {worst['dense']:.1e} moe {worst['moe']:.1e},"
+                      f" {time.time() - t0:.0f} s", file=sys.stderr,
+                      flush=True)
+
+        #7. the per-step logits gate: argmax(prefill-of-prefix) == the
+        #   free run's token (a flip FLAGs below GATE_TIE, else fails);
+        #   stream s=0 pinned BIT-equal to the free run's prefill logits
+        flags, lg_err, rec_min = [], 0.0, []
+        for p in range(5):
+            pmarg = []
+            for s in range(N_NEW):
+                row = pmodel.final_logits(streams[(p, s)][:, -1], w_fn,
+                                          w_un, mc.logits_mult,
+                                          mc.vocab_unpadded,
+                                          eps=mc.rms_eps)[0].float().cpu()
+                if s == 0 and not torch.equal(row, cap[p][0]):
+                    raise SystemExit(f"[t_b3 decode] p{p}: s=0 recompute "
+                                     f"logits not bit-equal the free "
+                                     f"run's prefill logits")
+                top2 = torch.topk(row, 2).values
+                pmarg.append(float(top2[0] - top2[1]))
+                lg_err = max(lg_err, _rel_err(row, cap[p][s]))
+                want = int(row.argmax())
+                if want != ours[p][s]:
+                    gap = float(row[want] - row[ours[p][s]])
+                    if gap >= GATE_TIE:
+                        raise SystemExit(
+                            f"[t_b3 decode] p{p} s{s}: recompute greedy "
+                            f"{want} ({tok.decode([want])!r}) != ours "
+                            f"{ours[p][s]} ({tok.decode([ours[p][s]])!r})"
+                            f", fp32 gap {gap:.3e} >= {GATE_TIE} — not a "
+                            f"near-tie")
+                    flags.append((p, s, gap, ourm[p][s]))
+            rec_min.append(min(pmarg))
+
+    #8. summary = the green evidence
+    flag_s = "; ".join(f"p{pp}s{ss} gap {g:.1e} our margin {m:.1e}"
+                       for pp, ss, g, m in flags) or "none"
+    texts = " | ".join(tok.decode(ours[p][:6]).strip()[:24]
+                       for p in range(5))
+    n_eos = sum(mc.eos in o for o in ours)
+    n_moe = mc.num_layers - mc.dense_idx
+    print(f"decode ok: batch-1 greedy, {N_NEW} tokens x 5 prompts (T "
+          f"{min(lens)}-{max(lens)}), SELF-CONSISTENCY (restructured "
+          f"item) — (a) free-run token == recompute argmax at all "
+          f"{5 * N_NEW} steps, near-tie flips {len(flags)} ({flag_s}); "
+          f"teacher-forced per-layer decode-vs-prefill at every step "
+          f"({mc.num_layers}L x {N_NEW - 1} x 5, same-stream state per "
+          f"t_kv): attn half {worst['attn']:.1e} < {GATE_ATTN}, dense "
+          f"{worst['dense']:.1e} < {GATE_ATTN}, moe {worst['moe']:.1e} < "
+          f"{GATE_MOE}, expert top-6 identical "
+          f"{n_choice}/{(N_NEW - 1) * 5 * n_moe}, prefix drift "
+          f"{worst['pfx']:.1e} < {GATE_ATTN}; "
+          f"free-vs-recompute logits rel err <= {lg_err:.1e}, min top-2 "
+          f"margin recompute {min(rec_min):.2f} ours "
+          f"{min(min(m) for m in ourm):.2f}; (b) 2 fresh runs/prompt: "
+          f"token_ids IDENTICAL 5/5, logits+margins bitwise {n_bits}/5; "
+          f"s=0 recompute BIT-equal free-run prefill logits 5/5 "
+          f"(packed==materialized end to end); PackedExperts[e] "
+          f"bit-equal chunked dequant (L3 e{{0,7,31}} w13+w2); resident "
+          f"split {splits}, cache.n == T+{N_NEW - 1} all layers x 2 runs"
+          f" x 5 prompts; starts: {texts}; eos in {n_eos}/5 (no early "
+          f"exit, ignore_eos semantics); wall gen {t_gen:.0f} s + "
+          f"recompute {time.time() - t0 - t_gen:.0f} s")
+
+
 def _todo(item):
     def f():
         raise SystemExit(f"[t_b3] not implemented — that is item {item}'s job")
@@ -361,8 +706,8 @@ def _todo(item):
 
 def main():
     #1. dispatch on subcommand; unimplemented ones fail loud with their item
-    cmds = {"kv": t_kv,
-            "decode": _todo("B3.2"), "batch": _todo("B3.3"),
+    cmds = {"kv": t_kv, "decode": t_decode,
+            "batch": _todo("B3.3"),
             "server": _todo("B3.4"), "soak": _todo("B3.6")}
     usage = f"usage: python -m engine.pyengine.tests.t_b3 {{{'|'.join(cmds)}}}"
     if len(sys.argv) != 2 or sys.argv[1] not in cmds:

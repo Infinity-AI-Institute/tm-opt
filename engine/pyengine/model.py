@@ -355,7 +355,7 @@ def attn_prefill(x, wq, wk, wv, wr, wo, w_k_sconv, w_v_sconv, w_q_norm,
     return F.linear(out.reshape(B, T, n_heads * head_dim), wo)
 
 
-def layer_prefill(x, w, mask, pos, mc, layer_idx, state=None):
+def layer_prefill(x, w, mask, pos, mc, layer_idx, state=None, trace=None):
     """One full decoder layer, PREFILL form — exact InklingDecoderLayer
     op order (transformers models/inkling/modeling_inkling.py:566-591):
     input_layernorm -> attention (B2.6 global / B2.7 SWA) -> attn_sconv
@@ -372,7 +372,10 @@ def layer_prefill(x, w, mask, pos, mc, layer_idx, state=None):
     verified ModelConfig; the caller's mask must match the layer type
     (window=mc.window on SWA layers). `state` (kv.LayerKV, batch-1)
     additionally populates the layer's KV cache + all four sconv rings —
-    same numerics either way (B3.1)."""
+    same numerics either way (B3.1). `trace` (a dict, tests only) records
+    the attention-half residual stream ('x1') and the MLP input stream
+    ('mlpin'), mirroring layer_decode's hook (B3.2) — references only,
+    numerics untouched."""
     is_global = layer_idx in mc.global_layers
     #1. attention half: pre-norm, attention, attn_sconv, outer residual
     #   in the ref's order residual + hidden (:574-583)
@@ -389,6 +392,9 @@ def layer_prefill(x, w, mask, pos, mc, layer_idx, state=None):
     #2. MLP half: pre-norm, dense MLP or MoE block, mlp_sconv, residual
     #   (:585-591)
     h = rmsnorm(x, w["mlp_norm"], mc.rms_eps)
+    if trace is not None:
+        trace["x1"] = x
+        trace["mlpin"] = h
     if layer_idx < mc.dense_idx:
         h = dense_mlp(h, w["mlp_gate"], w["mlp_up"], w["mlp_down"],
                       w["mlp_gs"])
@@ -504,6 +510,70 @@ def layer_decode(x, w, state, pos, mc, layer_idx, trace=None):
                 mc.n_shared, mc.route_scale)
     h = sconv_decode(h, w["mlp_sconv"], state.mlp_ring)
     return x + h
+
+
+def generate_greedy(ids, n_new, layers, states, w_emb, w_en, w_fn, w_un, mc,
+                    capture=None):
+    """B3.2: batch-1 greedy decode loop. ids [T] int64 on w_emb's device;
+    `layers` = the 66 per-layer weight dicts in layer_prefill layout
+    (t_b2.load_layer_weights; MoE routed experts may be loader.PackedExperts
+    — moe_experts only indexes them), possibly spread across GPUs (the
+    hidden state hops with .to(); a copy is bitwise, so placement never
+    changes numerics); `states` = one FRESH kv.LayerKV per layer on that
+    layer's device. Prefill populates the recurrent state and yields token
+    1 from the last-position logits; each further token embeds the previous
+    one and runs layer_decode at absolute position T-1+s (B3.1). Greedy =
+    argmax of the unpadded-vocab logits in fp32 (the B2.11 comparison
+    form). No eos early-exit: the canonical workloads run ignore_eos (P1),
+    and greedy stays well-defined past eos. Returns (tokens, margins):
+    n_new generated ids and their top1-top2 fp32 logit gaps. `capture` (a
+    list, tests only) additionally receives each step's full fp32 logits
+    row on CPU — read-only copies, numerics untouched (B3.2)."""
+    T = ids.shape[0]
+    dt = w_emb.dtype
+    #1. per-device prefill masks/positions, built once per GPU (the mask
+    #   build is pure selection — identical on every device, B2.6/B2.7)
+    per_dev = {}
+
+    def _masks(dev):
+        if dev not in per_dev:
+            p = torch.arange(T, device=dev)
+            per_dev[dev] = (additive_causal_mask(p, p, dt),
+                           additive_causal_mask(p, p, dt, window=mc.window),
+                           p)
+        return per_dev[dev]
+
+    tokens, margins = [], []
+
+    def _pick(logit_row):
+        #1. fp32 argmax + top-2 margin over the unpadded vocab (B2.11 form)
+        lg = logit_row.float()
+        top2 = torch.topk(lg, 2).values
+        tokens.append(int(lg.argmax()))
+        margins.append(float(top2[0] - top2[1]))
+        if capture is not None:
+            capture.append(lg.cpu())
+
+    #2. prefill: embed -> 66 x layer_prefill(state=...) -> last-pos logits
+    _, h = embed(ids[None], w_emb, w_en, eps=mc.rms_eps)
+    for L in range(mc.num_layers):
+        dev = layers[L]["attn_norm"].device
+        full, win, p = _masks(dev)
+        h = layer_prefill(h.to(dev), layers[L],
+                          full if L in mc.global_layers else win, p, mc, L,
+                          state=states[L])
+    _pick(final_logits(h[:, -1], w_fn, w_un, mc.logits_mult,
+                       mc.vocab_unpadded, eps=mc.rms_eps)[0])
+    #3. decode loop: feed token s-1 at absolute position T-1+s
+    for s in range(1, n_new):
+        prev = torch.tensor([tokens[-1]], device=w_emb.device)
+        _, h = embed(prev, w_emb, w_en, eps=mc.rms_eps)
+        for L in range(mc.num_layers):
+            h = layer_decode(h.to(layers[L]["attn_norm"].device), layers[L],
+                             states[L], T - 1 + s, mc, L)
+        _pick(final_logits(h, w_fn, w_un, mc.logits_mult, mc.vocab_unpadded,
+                           eps=mc.rms_eps)[0])
+    return tokens, margins
 
 
 def final_logits(h, w_norm, w_unembed, mult, n_unpadded, eps=1e-6):

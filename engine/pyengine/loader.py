@@ -254,6 +254,45 @@ def dequant_nvfp4(packed, scale, scale2, group_size, out_dtype=torch.bfloat16):
     return out.to(out_dtype)
 
 
+class PackedExperts:
+    """B3.2: one MoE layer's routed-expert weight kept PACKED on GPU
+    (checkpoint form: U8 nibbles + F8_E4M3 block scales + per-expert F32
+    scale2), dequantized ONE EXPERT AT A TIME on demand via __getitem__ —
+    model.moe_experts consumes it unchanged (it only ever indexes w[e]).
+    Why: bf16-resident routed experts are ~29 GiB/layer (~1.8 TB across the
+    63 NVFP4 layers) and fit on no GPU set here, while the packed form is
+    the checkpoint's own ~7.6 GiB/layer; top-6 routing touches at most a
+    handful of experts per token, so decode-time dequant is cheap.
+    dequant_nvfp4 is elementwise per expert (lead dims broadcast, never
+    mix), so a single-expert dequant is bit-identical to slicing the
+    chunked load path's output (t_b2.load_layer_weights; pinned by t_b3
+    decode). Real NVFP4 GEMM kernels are Stage-3 work (D4)."""
+
+    def __init__(self, packed, scale, scale2, group_size, deinterleave):
+        #1. keep the checkpoint-form pieces; same dtype contract dequant
+        #   enforces per call
+        assert packed.dtype == torch.uint8, packed.dtype
+        assert scale2.dtype == torch.float32, scale2.dtype
+        assert packed.dim() == 3 and packed.shape[0] == scale2.shape[0]
+        self.packed, self.scale, self.scale2 = packed, scale, scale2
+        self.group_size, self.deinterleave = group_size, deinterleave
+
+    def __getitem__(self, e):
+        """Dequant expert e alone -> bf16 [rows, cols] on the pack's
+        device (bit-equal to any chunked dequant of the same bytes)."""
+        #1. one-expert slice through the proven B1.4 dequant
+        deq = dequant_nvfp4(self.packed[e:e + 1], self.scale[e:e + 1],
+                            self.scale2[e:e + 1], self.group_size)[0]
+        #2. w13 rows are stored interleaved [g0,u0,g1,u1,..]: de-interleave
+        #   into [gates;ups] halves — exact mirror of transformers'
+        #   Interleave conversion (proven bit-exact vs HF's own op, B2.1)
+        #   / vLLM inkling nvidia/moe.py:583-595
+        if self.deinterleave:
+            r, c = deq.shape
+            deq = deq.reshape(r // 2, 2, c).transpose(0, 1).reshape(r, c)
+        return deq
+
+
 #B1.5: TP=4 sharding plan. Placement kinds: SHARD along one dim into tp equal
 #slices, REPLICATE full copy on every rank, SKIP not loaded at all.
 SHARD, REPLICATE, SKIP = "shard", "replicate", "skip"

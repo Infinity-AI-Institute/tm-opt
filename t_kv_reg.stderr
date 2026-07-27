@@ -1,0 +1,5 @@
+[t_b3 kv] layer 0 done: attn-half 2.1e-05 out 8.1e-05 prefix 2.3e-05, 3 s
+[t_b3 kv] layer 1 done: attn-half 1.6e-05 out 9.7e-05 prefix 4.3e-05, 3 s
+[t_b3 kv] layer 2 done: attn-half 7.9e-05 out 6.5e-04 prefix 9.7e-05, 9 s
+[t_b3 kv] layer 3 done: attn-half 1.2e-05 out 4.0e-04 prefix 6.9e-05, 11 s
+[t_b3 kv] layer 5 done: attn-half 7.9e-06 out 5.4e-03 prefix 3.0e-04, 12 s
