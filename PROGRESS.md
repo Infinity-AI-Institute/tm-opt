@@ -1181,3 +1181,28 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
   session; this PROGRESS.md edit is the only change, committed alone
   per the BLOCKED rule. Walls: server load ~70 s to /health, gate
   33m36s, tokenization diagnostic ~40 s.
+- 2026-07-27 B3.6 IN-PROGRESS (hedge note, committed BEFORE the run so a
+  session-cap kill cannot produce a silent no-commit iteration). B3.2 +
+  B3.5 remain BLOCKED (human rulings pending), so B3.6 is the first
+  non-BLOCKED unchecked item. Implemented t_b3 soak (commit c4b9c69):
+  in-process server on an ephemeral port in the SERVING config (num_pages
+  1024, max_batch 8), 8 driver threads posting parity-shaped requests
+  (logprobs 1, return_token_ids, ignore_eos; max_new 9-32) back-to-back on
+  keep-alive sessions for 1800 s — thread 7 uses a 701-token prompt
+  (pre-checked vs the real tokenizer) so every cycle crosses the 512+3
+  ring/sconv boundary (B2.7) and churns multi-page paged KV; monitor
+  samples rss + per-device torch alloc/reserved + /health every 10 s;
+  gates: window-mean drift (W2 [1500,1800)s - W1 [300,600)s) rss <= 512
+  MiB, alloc <= 512 MiB/dev, reserved <= 1 GiB/dev (calibration in the
+  docstring: smallest real per-request KV leak ~2.7 GiB signal, capture-
+  row leak ~1.4 GiB, vs sampling noise well under), zero non-200, exact
+  token_ids+token_logprobs vs each thread's cycle 0 (B3.3 invariance),
+  peak_running == 8, mean co-residency >= 6, clean drain/shutdown; any
+  failure aborts LOUDLY within one monitor tick. Pre-flight: GPUs 4-7
+  idle (4 MiB), vLLM resident-idle on 0-3 (P2/B3.5 precedent — soak is
+  stability work, not measurement; D8 covers measurement only). Test
+  starting FOREGROUND now, ETA ~35 min (load ~105 s + 1800 s soak +
+  drain). If this note is the session's last word: the soak outlived the
+  session cap — next iteration should verify GPUs 4-7 are back to 4 MiB
+  (the test process died with the session) and simply rerun the verbatim
+  command. Outcome note follows below when the run completes.
