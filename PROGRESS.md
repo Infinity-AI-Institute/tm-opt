@@ -152,6 +152,10 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
       ~110 s (B1.6) — fine in the foreground; the KILLER was streaming the
       transformers reference per step, which this restructured test no
       longer requires. Delete stray t_b3_decode.stderr.log.
+      IN-PROGRESS 2026-07-27: implementation committed (b5b651d + 1ec0c82),
+      arm (b) determinism verified green live 3x; arm (a) needs one clean
+      ~15-20 min run — see the 2026-07-27 loop note (incl. one
+      interpretation FLAGGED FOR HUMAN).
       test: `python -m engine.pyengine.tests.t_b3 decode`
 - [ ] B3.3 continuous batching scheduler: 8 concurrent greedy requests give
       IDENTICAL tokens to batch-1 runs (batch invariance).
@@ -785,3 +789,67 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
   logits (identical evidence lines incl. top-1 5/5, wall 129 s); t_b1 index
   + census + dtypes + plan. Code committed first (f3b1fbd) per convention;
   this tick is its own commit.
+- 2026-07-27 B3.2 IN PROGRESS — NOT ticked (test not yet green end to end);
+  implementation complete and committed (b5b651d main, 1ec0c82 gate fixes).
+  What was built (adapting the hint's uncommitted work to the RESTRUCTURED
+  self-consistency item): loader.PackedExperts (routed experts stay
+  checkpoint-packed on GPU, per-hit-expert dequant in moe_experts via
+  __getitem__ — bf16-dense experts are ~1.8 TB and fit nowhere; pinned
+  bit-equal to the proven B1.4/B2.9 chunked dequant on L3 e{0,7,31} w13+w2);
+  t_b2.load_layer_weights(dev=, pack_moe=) + build_native_layer lifted from
+  t_logits (verbatim code motion, t_logits rewired — needs its regression
+  run); model.generate_greedy (batch-1 greedy loop, prefill + 31
+  layer_decode steps, fp32-logits capture hook) + layer_prefill trace= hook
+  (mirrors layer_decode's, numerics untouched — t_b3 kv rerun green with
+  IDENTICAL evidence line); t_b3 decode: engine resident across GPUs 4-7
+  (contiguous layer groups by header bytes, split [16,17,16,17], load 104 s
+  page-cache warm), arm (b) = generate_greedy TWICE per prompt from fresh
+  LayerKV — token_ids bitwise-identical gate, arm (a) = 160 recompute
+  streams (5 prompts x steps 0..31, prefix = prompt+tokens[:s]) advanced
+  LAYER-major with per-layer expert materialization (pinned bit-equal the
+  packed path; s=0 stream must reproduce the free run's prefill logits
+  BIT-exactly), per-step logits gate argmax==our token w/ near-tie FLAG,
+  plus B3.1's teacher-forced per-layer decomposed gates at every step.
+  VERIFIED GREEN LIVE (three separate runs): arm (b) fully — 2 fresh runs
+  per prompt, token_ids IDENTICAL 5/5 prompts, ~40 s per prompt-pair;
+  continuations sensible (p0 ' Berlin.\nThe capital of France is Paris...',
+  p1 ' Au, and its atomic number is 79...', p2 ' oxygen atoms...', p3
+  ' cold. The opposite of good is bad...', p4 ' four. Two plus three
+  equals five...'); PackedExperts pin bit-equal; prompt-0 ids == frozen
+  capture; cache.n == T+31 all layers x runs. NOT YET RUN GREEN: arm (a)'s
+  full 66-layer sweep — three successive runs each died ~8-9 min in on an
+  honest gate finding, each finding fixed and committed:
+  (1) cross-stream teacher-forced cache (state from the prompt+tokens[:s-1]
+  stream) hit dense-out 7.669e-03 >= 1e-3 at p3 s16 L1 — that stream's rows
+  carry L layers of compounded row-count drift (the exact B3.1 dead-end)
+  and the dense MLP amplifies ~10x; restructured to t_kv's EXACT form:
+  state from prefilling the SAME stream's first T+s-1 rows.
+  (2) my ADDED prefix-drift diagnostic (truncated-vs-full prefill, NO
+  decode/cache in that comparison — not an item gate) tripped its borrowed
+  1e-3 floor at 1.713e-03 (p2 s26 L1): B3.1 calibrated that floor at T=600;
+  at T~30 the row-count noise through the dense MLP is bigger. Re-scoped to
+  a reported value + 1e-2 sanity ceiling (a real state/mask bug sits orders
+  above); the ITEM's gates were untouched.
+  (3) expert top-6 EQUAL hit ONE single-pair swap in ~10^4 teacher-forced
+  comparisons (p0 s19 L2: 118<->40, other 5 identical) — a rank-6/7
+  sigmoid+bias score tie moved by ~1e-5 attention-half noise, the same
+  bf16-granularity fact B3.1 documented for routing weights.
+  INTERPRETATION FLAGGED FOR HUMAN: applied the item's near-tie provision
+  ("report the margin and FLAG rather than fail if |logit gap| < 1e-2") to
+  the expert-choice arm — a flip passes ONLY as a reported FLAG when it is
+  a single swapped pair AND the recompute's own choice scores tie within
+  1e-2 (measured ~1e-5), with the MoE-out < 1e-2 gate still binding at
+  that step; strict set-equality at 9920 comparisons is otherwise
+  unattainable in principle (ties + shape-dependent bf16 rounding). If the
+  human reads the provision as token-gate-only, un-FLAG by reverting the
+  6c' block in 1ec0c82 and adjudicate the tie directly.
+  BUDGET honesty: 3 runs x ~8-9 min ate the session (hard 1-h cap); a
+  clean run needs ~15-20 min (load 104 s + gen ~330 s + 66-layer recompute
+  sweep) and was NOT started at ~50 min elapsed per the >40-min rule.
+  NEXT ITERATION: just run `python -m engine.pyengine.tests.t_b3 decode`
+  verbatim (foreground, ~20 min), paste output, tick if green; then rerun
+  regressions t_b2 logits (build_native_layer lift + load_layer_weights
+  signature — t_b3 kv and t_b1 index already rerun green this session) and
+  t_b2 ref/embed sanity before the tick commit. Stray t_b3_decode.stderr.log
+  deleted per hint; t_kv_reg.stderr briefly committed in b5b651d by an
+  over-broad `git add -A`, removed in 1ec0c82 (lesson: stage explicitly).
