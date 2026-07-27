@@ -195,6 +195,18 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
       float64-exact 8/8, peak_running 8; eos/ignore_eos + fail-loud
       400 x8 / 404 x2 arms; /health before+during+after; clean shutdown
       (commit 5e00fc9)
+- [ ] B3.4b server accepts token-id-array prompts: per the OpenAI completions
+      spec, "prompt" may be a list[int] of token ids (vLLM supports this);
+      the D13 teacher-forced parity gate sends prompt ids + golden-prefix
+      ids to eliminate detokenize/retokenize boundary effects, and currently
+      gets a 400. Extend server.py request validation: if prompt is a list
+      of ints, use it directly as the input ids (skip tokenization; same
+      length/capacity checks); strings unchanged; anything else still 400s.
+      Update the fail-loud validation note. Extend t_b3 server with an
+      ids-prompt arm: the same 8 parity-shaped requests sent as token-id
+      arrays (tokenize the prompts in the test with AutoTokenizer) must
+      return byte-identical responses to their string-prompt forms.
+      test: `python -m engine.pyengine.tests.t_b3 server`
 - [ ] BLOCKED: B3.5 PARITY GATE vs goldens — the milestone. HUMAN VERIFIES
       this tick.
       BLOCKED 2026-07-27: gate RUN and FAILED honestly — parity_pass false,
