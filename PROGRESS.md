@@ -210,7 +210,7 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
       float64-exact 8/8, peak_running 8; eos/ignore_eos + fail-loud
       400 x8 / 404 x2 arms; /health before+during+after; clean shutdown
       (commit 5e00fc9)
-- [ ] B3.4b server accepts token-id-array prompts: per the OpenAI completions
+- [x] B3.4b server accepts token-id-array prompts: per the OpenAI completions
       spec, "prompt" may be a list[int] of token ids (vLLM supports this);
       the D13 teacher-forced parity gate sends prompt ids + golden-prefix
       ids to eliminate detokenize/retokenize boundary effects, and currently
@@ -222,6 +222,9 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
       arrays (tokenize the prompts in the test with AutoTokenizer) must
       return byte-identical responses to their string-prompt forms.
       test: `python -m engine.pyengine.tests.t_b3 server`
+      — green: ids-prompt arm byte-identical to string forms 8/8
+      (id/created nonces masked), all prior arms intact, 400 x15 incl.
+      7 malformed-id-list arms, 17 retired, wall ~7.5 min (commit e8074c6)
 - [ ] BLOCKED: B3.5 PARITY GATE vs goldens — the milestone. HUMAN VERIFIES
       this tick.
       BLOCKED 2026-07-27: gate RUN and FAILED honestly — parity_pass false,
@@ -1497,3 +1500,48 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
   the human's; staged PROGRESS.md only (B0.1 convention). No code change;
   next loop-actionable item is B3.4b (B3.5 remains BLOCKED on its own
   ruling).
+- 2026-07-27 B3.4b: implemented the token-id-array prompt form (commit
+  e8074c6). server.py: _validate #1 now accepts one non-empty list[int]
+  as the prompt (singleton [str] unwrap unchanged; empty/mixed/bool/
+  float/nested lists 400 — bool excluded explicitly since bool is an
+  int subtype in Python); do_POST #3 uses id-list prompts directly as
+  input ids via torch.tensor(dtype=long), tokenization skipped, after a
+  fail-loud range check against the embed table ([0, mc.vocab=201024) —
+  an out-of-range id would device-assert inside the embed gather and
+  kill the engine thread, so it 400s instead; module docstring + the
+  fail-loud validation note updated per the item). Length/capacity
+  checks are shared with the string path, verbatim. t_b3 t_server
+  gained: (#6) ids-prompt arm — the same 8 parity-shaped requests
+  POSTed as token-id arrays (the test's own AutoTokenizer encodings
+  from step #1, so the engine sees identical ids) with the gate
+  RESPONSE BODIES BYTE-IDENTICAL to the string-prompt responses after
+  masking exactly two per-request envelope nonces (id = request
+  counter, created = wall-clock second; both sides re-dumped through
+  the same json.dumps, so byte equality pins token_ids, float64
+  logprobs, text, usage, finish_reason at once — the honest reading of
+  the item's "byte-identical", which cannot hold on raw bytes because
+  the OpenAI envelope nonces differ per request BY DESIGN); 7 new
+  malformed-id-list 400 arms (empty, mixed str, bool, float, nested
+  batch, id==mc.vocab, -1); retired-count gate 9 -> 17. Pre-flight:
+  GPUs 4-7 idle (4 MiB), _validate unit-checked without GPU (10/10).
+  Ran the test verbatim from /workspace/tm-opt (venv active,
+  CUDA_VISIBLE_DEVICES=4,5,6,7), FOREGROUND, green first try. Real
+  output (stdout; stderr = load progress + http access log, 200/400/404
+  only):
+  ```
+  server ok: /v1/completions x 8 CONCURRENT parity-shaped requests (temperature 0, logprobs 1, seed, return_token_ids, ignore_eos; T 4-13, max_new 9-32, 174 tokens) — choice-level token_ids == batch-1 generate_greedy 8/8 (exact ints), token_logprobs == fp32 log-softmax of batch-1 captured logits 8/8 (exact float64 via JSON), tokens/top_logprobs/text_offset aligned, text == detok, finish 'length', usage exact 8/8, peak_running 8; B3.4b ids-prompt arm: same 8 requests as token-id arrays -> responses byte-identical to string forms 8/8 (id/created nonces masked); default-eos arm: logprobs null + NO token_ids key + eos-armed truncation (eos in 0/8 baselines; Request-level pin: armed eos stops early, eos=None runs past); loud failures: 400 x 15 (bad temperature/prompt/logprobs/stream/echo/capacity/max_tokens + malformed id lists incl. out-of-range/negative), 404 x 2; /health ok before+during+after; ephemeral port 39083 (CLI default 8200); shutdown clean (engine thread joined, queues empty, 17 retired); wall load 103 s + baseline 114 s + concurrent 113 s + ids-arm 113 s + arms 7 s
+  ```
+  All pre-existing arms reran green inside the same invocation (this
+  test IS its own regression for server.py/scheduler paths); ids-arm
+  wall 113 s == string arm (same 174 tokens through the same per-
+  sequence engine). SESSION LEDGER: the human's uncommitted harness/
+  edits (--max-seconds work) remain UNSTAGED (staged only server.py +
+  t_b3.py, then PROGRESS.md alone — B0.1 convention). Code committed
+  first (e8074c6) per convention; this tick is its own commit. Next
+  loop-actionable item: none in B3 (B3.5 BLOCKED on its ruling) —
+  B4.1 is now unblocked by the 6a4d40b ruling BUT its amended test
+  command requires benchmark.py --max-seconds, which exists only in
+  the human's uncommitted harness/ edits; the next iteration must
+  check `git status harness/` before starting B4.1 and, if the edits
+  are still uncommitted (loop may not commit harness/), mark B4.1
+  accordingly rather than run a stale harness.
