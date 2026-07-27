@@ -204,8 +204,13 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
       a discriminating transformers-64-token experiment proposed there;
       human decides direction (loop may not touch harness/ or goldens/).
       test: `python harness/correctness.py --endpoint http://localhost:8200`
-- [ ] B3.6 30-minute soak at conc 8, zero crashes/leaks (rss + vram stable).
+- [x] B3.6 30-minute soak at conc 8, zero crashes/leaks (rss + vram stable).
       test: `python -m engine.pyengine.tests.t_b3 soak`
+      — green: 1800 s at conc 8 (147 completions, 2625 tokens, incl.
+      701-tok ring-crossing prompt), ZERO crashes (200 x147, /health 200
+      x188, engine error None), rss drift +1 MiB, vram alloc drift <= 40
+      MiB/dev, reserved 0, responses exact-equal cycle 0 on all 8
+      threads (commit c4b9c69)
 
 ## B4 — first honest number
 - [ ] B4.1 benchmark.py runs against pyengine on GPUs 4-7 (vLLM idle),
@@ -1206,3 +1211,34 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
   session cap — next iteration should verify GPUs 4-7 are back to 4 MiB
   (the test process died with the session) and simply rerun the verbatim
   command. Outcome note follows below when the run completes.
+- 2026-07-27 B3.6 tick (same session as the hedge note): ran the test
+  verbatim from /workspace/tm-opt (venv active, CUDA_VISIBLE_DEVICES=
+  4,5,6,7), FOREGROUND, single run, green first try. Real output (final
+  stdout line; stderr showed load 102 s + the http access log — 200 x
+  147 POST + 188 GET /health, nothing else):
+  ```
+  soak ok: 30 min at conc 8 — 147 completions (2625 tokens; per-thread [11, 14, 19, 11, 34, 12, 26, 20], max_new [32, 24, 17, 32, 9, 27, 12, 16], T 4-701 incl. 701-tok ring-crossing prompt), 363 steps, peak_running 8, mean co-residency 7.65; ZERO crashes (200 x 147, /health 200 x 188 probes, engine error None); token_ids + token_logprobs exact-equal cycle 0 on all 8 threads; rss 3175 -> 3176 MiB (drift +1 <= 512); vram drift/dev MiB alloc ['+12', '+15', '+40', '-15'] <= 512, reserved ['+0', '+0', '+0', '+0'] <= 1024 (mean W2 [1500,1800)s - W1 [300,600)s); drain + shutdown clean (147 retired); wall load 104 s + soak 1879 s
+  ```
+  Reading: memory is genuinely flat — rss +1 MiB over 25 min of window
+  separation (capture rows freed correctly), torch reserved bitwise-flat
+  on all 4 devices (fixed request shapes recycle identical block sizes,
+  zero fragmentation creep), alloc means within +-40 MiB (sampling-phase
+  residency noise, well under the +-260 MiB single-seq amplitude); the
+  ~147 admit/retire cycles churned ~0.96 GiB of per-request KV each with
+  no drift, and the 701-token thread crossed the 512+3 ring/sconv
+  boundary on all 20 of its cycles. Consistency arm doubles as a
+  corruption referee: every completion's token_ids AND token_logprobs
+  (exact float64) equal its thread's cycle-0 response under constantly
+  varying co-residents — B3.3 invariance held for the whole soak.
+  Throughput observed ~1.4 tok/s aggregate (363 steps/1800 s x ~8 seqs
+  /step /5.2 s-step) — the expected per-sequence-execution iteration-0
+  shape (B3.3 note; B4.1 measures it honestly). Soak wall 1879 s = 1800
+  issuance + 79 s drain of in-flight requests. No regressions rerun:
+  this iteration touched only t_b3.py (new soak constants + t_soak +
+  dispatch swap of the _todo stub); kv/decode/batch/server paths are
+  bit-untouched (py_compile + the soak itself exercise the module).
+  Code committed first (c4b9c69) per convention, hedge 14ab511; this
+  tick is its own commit. B3 track now: B3.2 + B3.5 BLOCKED on human
+  rulings, everything else green — next unchecked non-BLOCKED item is
+  B4.1 (first honest benchmark number; NOTE its ~35-40 min budget:
+  reuse the B3.5 tmux-server pattern and the hedge-note-first rule).
