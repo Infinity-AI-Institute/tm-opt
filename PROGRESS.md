@@ -213,10 +213,28 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
       threads (commit c4b9c69)
 
 ## B4 — first honest number
-- [ ] B4.1 benchmark.py runs against pyengine on GPUs 4-7 (vLLM idle),
+- [ ] BLOCKED: B4.1 benchmark.py runs against pyengine on GPUs 4-7 (vLLM idle),
       decode_heavy canonical config; result written as ledger iteration-0
       row for engine=pyengine with cache_key. LOSING IS EXPECTED
       (case-study iteration 0 was 13.6% of vLLM).
+      BLOCKED 2026-07-27 (budget rule — test NOT started; two independent
+      blockers, full math in the 2026-07-27 B4.1 loop note): (1) honest
+      wall estimate ~550 days — 8704 requests x 8192 tokens = 71.3M decode
+      tokens at the engine's measured ~1.5 tok/s aggregate (B3.5/B3.6;
+      per-sequence execution, concurrency does not multiply), and the run
+      CRASHES before any number: one request needs ~89 min > benchmark.py's
+      own 3600 s per-request timeout (harness/benchmark.py:57), so all 512
+      first-wave threads raise requests.Timeout during WARMUP; mechanical
+      completion floor ~1,165 tok/s aggregate (~780x current). (2) the
+      verbatim test command omits `--engine pyengine`; benchmark.py
+      defaults --engine to "vllm" (benchmark.py:142), so the ledger row it
+      appends would be tagged engine=vllm / label=baseline / baseline_id=
+      vllm_mtp_off at pct 100.0 — a POISONED baseline row in the
+      append-only ledger that the pct-vs-baseline scan (last-match-wins,
+      benchmark.py:168-174) would adopt as the denominator for every future
+      pyengine row. Item's test line needs a human amendment regardless of
+      (1). Adjudication options in the loop note; loop may not alter the
+      test command, add configs, or reorder items.
       test: `python harness/benchmark.py --endpoint http://localhost:8200 --config configs/canonical_decode_heavy.json --ledger-iteration 0`
 - [ ] B4.2 same for prefill_heavy.
       test: `python harness/benchmark.py --endpoint http://localhost:8200 --config configs/canonical_prefill_heavy.json --ledger-iteration 0`
@@ -1242,3 +1260,73 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
   rulings, everything else green — next unchecked non-BLOCKED item is
   B4.1 (first honest benchmark number; NOTE its ~35-40 min budget:
   reuse the B3.5 tmux-server pattern and the hedge-note-first rule).
+- 2026-07-27 B4.1 BLOCKED (budget rule — test NOT started; no command run,
+  no server started, GPUs 4-7 untouched, no code changed this session).
+  B3.2 + B3.5 remain BLOCKED (human rulings pending), so B4.1 was the
+  first non-BLOCKED unchecked item. The mandatory pre-start wall-time
+  estimate came out 4 orders of magnitude over the ~40-min ceiling, from
+  repo-recorded measurements only — no new measurement was needed:
+  (1) ENGINE SPEED (two independent committed sources): B3.5 gate = 3200
+  sequential tokens in 2016 s = 0.63 s/tok; B3.6 soak = 2625 tokens in
+  1800 s at conc 8 = 1.46 tok/s AGGREGATE (5.2 s/step at mean co-residency
+  7.65 = 0.68 s/seq-token). Concurrency does NOT multiply throughput:
+  B3.3's bitwise-invariance design executes each co-resident sequence's
+  step as batch-1 math serially — its own tick note predicted exactly this
+  iteration-0 shape and deferred the fix to Stage-3/D4 batched kernels.
+  (2) TEST VOLUME (configs/canonical_decode_heavy.json + benchmark.py
+  defaults --repeats 3): warmup 1024 + 3 x 2560 = 8704 requests x OSL 8192
+  under ignore_eos = 71,303,168 decode tokens, plus ~6.7M prefill tokens
+  (ISL uniform 512-1024, mean 768).
+  (3) ESTIMATE: 71.3M / ~1.5 tok/s ~ 4.8e7 s ~ 550 DAYS. The untimed
+  warmup block alone is 8.39M tokens ~ 65 days.
+  (4) MECHANICAL FAILURE MODE, worse than slowness: benchmark.py posts all
+  512 first-wave requests at t0 (ThreadPoolExecutor max_workers=conc) with
+  per-request timeout=3600 s (harness/benchmark.py:57). At current speed
+  the first co-resident batch of 8 would hold ~660 of 8192 tokens by
+  t=3600 s (each ~0.18 tok/s at the server's max_batch-8 FCFS cap,
+  server.py:404), so EVERY thread raises requests.Timeout during warmup,
+  pool.map propagates, and the harness aborts with zero output. The
+  mechanical completion floor is aggregate >= 512 x 8192 / 3600 ~ 1,165
+  tok/s just for the deepest-queued first-wave request to beat its clock
+  (~780x current); a full protocol run at case-study iteration-0 speed
+  (13.6% of the committed 13,409.5 decode baseline ~ 1,824 tok/s) is
+  71.3M/1824 ~ 10.9 h — a legitimate human-authorized overnight run, but
+  never a <40-min session task. The "~35-40 min budget" guess in the B3.6
+  tick note was wrong: it borrowed B3.5's 64-token-per-prompt gate shape,
+  not the 8192-token benchmark shape.
+  (5) SECOND, INDEPENDENT BLOCKER — the verbatim test command would
+  POISON THE LEDGER even if the run were feasible: it omits `--engine
+  pyengine`, and benchmark.py defaults --engine to "vllm" (line 142),
+  --label to "baseline", --mechanism to "vLLM pinned build, canonical
+  config". The appended row (append-only file, rule 3 — unremovable)
+  would claim engine=vllm / baseline_id=vllm_mtp_off / pct 100.0 for a
+  pyengine measurement, and the pct_vs_baseline scan takes the LAST
+  matching engine=vllm row as the denominator (benchmark.py:168-174), so
+  every future pyengine row would be computed against the poisoned row
+  instead of the real 13,409.5 baseline. The item's intent ("row for
+  engine=pyengine") needs the command amended by a human (e.g. `--engine
+  pyengine --label iteration0 --mechanism "pyengine bring-up,
+  per-sequence execution"`); the loop may not edit the test line.
+  FORECAST (info only, item untouched): B4.2 fails the same math — 8704 x
+  1024 = 8.9M decode tokens ~ 69 days at current speed, plus 8704 heavy
+  ~6K-token prefills, plus the same --engine omission in its test line.
+  HYPOTHESIS: not an engine bug — the expected consequence of B3.3's
+  honest per-sequence design; the canonical protocol cannot terminate
+  until decode is batched, i.e. the first D4 lever (batched/fused decode)
+  turns out to GATE the B4.1 iteration-0 row rather than follow it.
+  OPTIONS FOR THE HUMAN (loop may not add configs, weaken gates, or
+  reorder items): (a) insert a bring-up item (B4.0) for batched decode —
+  one fused forward across co-resident sequences; needs a human-specified
+  invariance gate, since t_batch's bitwise-identity gate is unattainable
+  for fused kernels in principle (B3.1/B3.3 row-count bf16 drift facts —
+  the same unattainability class already under adjudication in B3.2/B3.5);
+  targets: >= ~1,165 tok/s is the bare timeout floor, >= ~2,000 tok/s
+  makes the canonical run a ~10 h overnight; (b) add a reduced-scale
+  orientation config (configs/ is frozen to the loop) for an honest
+  interim ledger row explicitly marked non-canonical — mirrors the
+  existing "single-stream decode >= 170 tok/s on vLLM" orientation
+  convention; (c) once (a) lands, grant the canonical B4.1 run a >40-min
+  dispensation (human-run, or a human-specified multi-session tmux
+  protocol), with the amended --engine/--label/--mechanism flags from (5).
+  SESSION LEDGER: this PROGRESS.md edit is the only change, committed
+  alone per the BLOCKED rule.
