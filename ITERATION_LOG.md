@@ -11,3 +11,5 @@
 
 | iter | workload | label | mechanism | tok/s | vs vLLM | commit | log |
 |---|---|---|---|---|---|---|---|
+| 0 | decode_heavy | iteration 0 | per-sequence eager engine, Triton pending | 2 | 0.0% | 8c29167 |  |
+| 0 | prefill_heavy | iteration 0 | per-sequence eager engine, Triton pending | 2 | 0.0% | 759c5ac |  |
