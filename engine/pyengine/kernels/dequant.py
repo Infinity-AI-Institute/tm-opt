@@ -91,6 +91,9 @@ def dequant_nvfp4_triton(packed, scale, scale2, group_size,
     n_bytes = p.numel()
     BLOCK = 1024
     grid = ((n_bytes + BLOCK - 1) // BLOCK,)
-    _nvfp4_dequant_kernel[grid](p, s, out, n_bytes, pk, group_size // 2,
-                                BLOCK=BLOCK)
+    #4. launch on the pack's own device — layers live spread across the
+    #   4 GPUs and Triton launches on the CURRENT device, unlike eager ops
+    with torch.cuda.device(packed.device):
+        _nvfp4_dequant_kernel[grid](p, s, out, n_bytes, pk,
+                                    group_size // 2, BLOCK=BLOCK)
     return out.reshape(*lead, rows, k)
