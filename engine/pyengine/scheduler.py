@@ -2,22 +2,22 @@
 Orca/vLLM shape: requests join the running set at any step boundary, leave
 the moment they finish, every running sequence advances one token per step).
 
-Batch invariance is BY CONSTRUCTION, and that is the design decision this
-module encodes: a step advances each sequence through the exact batch-1 op
-sequence (model.layer_prefill / model.layer_decode on the sequence's OWN
-kv.LayerKV), so co-scheduled sequences share weights only — never a
-reduction — and generated tokens are bitwise those of a batch-1
-model.generate_greedy run regardless of arrival order, co-residents, or
-batch cap (the t_b3 batch gate). B3.1/B3.2 established WHY a fused
-alternative could not meet that gate: bf16 accumulation order is
-row-count-dependent (T=1 GEMV vs row-batched GEMM rows), so fused-batch
-kernels drift vs batch-1 exactly the way recompute drifts vs decode.
-Fusing co-resident sequences into batched kernels is Stage-3 experiment
-work (D4 scheduler specialization / grouped GEMM), refereed by this same
-invariance test plus the parity gate. Chunked prefill (splitting a long
-prompt across steps so an arrival cannot stall running decodes) is
-deferred with it — prefill here is one whole-prompt step, fine at
-bring-up lengths; the seam is Engine.prefill.
+DECODE IS BATCHED (Stage-3 exp-0001; supersedes B3.3's batch-1-bitwise
+design note): a step advances ALL decodable co-residents through ONE
+stack traversal (Engine.decode_batch / model.layer_decode_batch), so each
+layer's weights are read once per step, not once per sequence. Prefill is
+unchanged — whole-prompt, per-sequence, batch-1 exact (Engine.prefill,
+still bitwise generate_greedy's; the D13 gate's max_tokens=1 requests
+exercise exactly this path). Tokens from batched decode are NOT bitwise
+batch-1: bf16 accumulation order is row-count-dependent (B3.1/B3.3
+established this is unattainable in principle), so the binding gates are
+(a) the D13 teacher-forced envelope parity check and (b) same-schedule
+determinism — two runs of an identical schedule are bitwise identical,
+because batch composition per step is a pure function of the schedule
+(FCFS admission, admission-order rows, deterministic kernels). Engine
+.decode (per-sequence batch-1) is retained as the reference arm for
+that A/B (t_batched evidence script). Chunked prefill (an arrival not
+stalling running decodes) remains deferred; the seam is Engine.prefill.
 
 Scope: greedy only (canonical workloads are greedy, P1), ignore_eos
 semantics (no early exit — a request runs to its max_new, D6/P1), text
@@ -154,6 +154,39 @@ class Engine:
             req.capture.append(lg.cpu())
         return int(lg.argmax())
 
+    @torch.no_grad()
+    def decode_batch(self, reqs):
+        """One decode step for B co-resident sequences through ONE stack
+        traversal (model.layer_decode_batch): every layer's weights are
+        read once for the whole batch instead of once per sequence, and
+        the per-step Python/launch cost of the 66-layer walk is paid once.
+        Row order = the caller's list order (the scheduler passes running-
+        list order = admission order), fixed for a given schedule; per-row
+        results depend on the row COUNT through bf16 accumulation order
+        (B3.1/B3.3), which is exactly the drift D13's envelope covers.
+        Returns the B next greedy tokens in row order."""
+        mc = self.mc
+        #1. embed all previous tokens — one [B] lookup + rowwise norm
+        prev = torch.tensor([r.tokens[-1] for r in reqs],
+                            device=self.w_emb.device)
+        _, h = pmodel.embed(prev, self.w_emb, self.w_en, eps=mc.rms_eps)
+        pos = [r.ids.shape[0] - 1 + len(r.tokens) for r in reqs]
+        #2. 66 batched layers; the [B, hidden] rows hop devices together
+        for L in range(mc.num_layers):
+            h = pmodel.layer_decode_batch(
+                h.to(self.layers[L]["attn_norm"].device), self.layers[L],
+                [r.states[L] for r in reqs], pos, mc, L)
+        #3. one final-logits GEMM; per-row fp32 argmax + optional capture
+        rows = pmodel.final_logits(h, self.w_fn, self.w_un, mc.logits_mult,
+                                   mc.vocab_unpadded, eps=mc.rms_eps)
+        out = []
+        for i, req in enumerate(reqs):
+            lg = rows[i].float()
+            if req.capture is not None:
+                req.capture.append(lg.cpu())
+            out.append(int(lg.argmax()))
+        return out
+
 
 class Scheduler:
     """Iteration-level scheduler over one Engine. submit() queues a request
@@ -202,10 +235,14 @@ class Scheduler:
             self.running.append(req)
             req.tokens.append(self.engine.prefill(req))
         self.peak_running = max(self.peak_running, len(self.running))
-        #2. one decode token for every sequence admitted in a PRIOR step
-        for req in self.running:
-            if req.admit_step < self.step_count and not req.done:
-                req.tokens.append(self.engine.decode(req))
+        #2. one decode token for every sequence admitted in a PRIOR step —
+        #   all decodable co-residents advance through ONE batched stack
+        #   traversal; running-list (= admission) order fixes the row order
+        todo = [req for req in self.running
+                if req.admit_step < self.step_count and not req.done]
+        if todo:
+            for req, tok in zip(todo, self.engine.decode_batch(todo)):
+                req.tokens.append(tok)
         #3. retire finished sequences; free their KV after the callback
         still_running = []
         for req in self.running:

@@ -512,6 +512,110 @@ def layer_decode(x, w, state, pos, mc, layer_idx, trace=None):
     return x + h
 
 
+def sconv_decode_batch(x, weight, rings):
+    """Window-4 sconv, BATCHED decode form — x [B, C] carries the same
+    sconv site's raw input for B independent co-resident sequences;
+    rings[b] is row b's kv.SconvRing. Per-row math is sconv_decode's
+    exactly (fp32 module, own-input residual, weight[..., -1] taps the
+    current token) but the depthwise conv over all B windows is ONE
+    F.conv1d call instead of B. Ring rolls stay per-row (each ring is
+    per-sequence state). Row order is the caller's batch order; bf16
+    row-count invariance is NOT claimed (B3.1/B3.3) — the binding gates
+    are the D13 envelope and same-schedule determinism (scheduler.py)."""
+    #1. roll each row's ring; stack the full windows [B, k, C], oldest first
+    win = torch.stack([rings[b].step(x[b:b + 1])
+                       for b in range(x.shape[0])])
+    wf = weight.float()
+    #2. one depthwise conv over the batch: [B, C, k] -> [B, C, 1]
+    conv = torch.nn.functional.conv1d(
+        win.float().permute(0, 2, 1), wf, bias=None, padding=0,
+        groups=wf.shape[0])
+    #3. own-input residual in fp32, then downcast (sconv_decode #3)
+    return (conv[:, :, 0] + x.float()).to(x.dtype)
+
+
+def attn_decode_batch(x, wq, wk, wv, wr, wo, w_k_sconv, w_v_sconv, w_q_norm,
+                      w_k_norm, rel_proj, states, pos, head_dim, is_global,
+                      alpha=None, n_floor=None, eps=1e-6):
+    """One attention layer, BATCHED decode form — x [B, hidden] holds B
+    co-resident sequences' current tokens; states[b]/pos[b] are sequence
+    b's kv.LayerKV and absolute position. Weight-shared work (q/k/v/r
+    projections, k/v sconvs, per-head q/k rmsnorm, o_proj) runs as B-row
+    batches so each weight tensor is read ONCE per layer per step; the
+    KV-fed core (cache append/gather, rel bias, scores, softmax, @V) stays
+    per-sequence — co-residents sit at different cache lengths. Per-row op
+    order inside the core is attn_decode's exactly."""
+    F = torch.nn.functional
+    B = x.shape[0]
+    n_heads, n_kv = wq.shape[0] // head_dim, wk.shape[0] // head_dim
+    #1. shared-weight projections; k/v raw through their per-row rings
+    q = F.linear(x, wq)
+    k = sconv_decode_batch(F.linear(x, wk), w_k_sconv,
+                           [s.k_ring for s in states])
+    v = sconv_decode_batch(F.linear(x, wv), w_v_sconv,
+                           [s.v_ring for s in states])
+    r = F.linear(x, wr)
+    #2. per-head q/k rmsnorm across the whole batch (rowwise op)
+    q = rmsnorm(q.view(B, n_heads, head_dim), w_q_norm, eps)
+    k = rmsnorm(k.view(B, n_kv, head_dim), w_k_norm, eps)
+    v = v.view(B, n_kv, head_dim)
+    #3. per-sequence attention core, batch order (= admission order)
+    outs = []
+    for b in range(B):
+        st = states[b]
+        st.cache.append(k[b:b + 1], v[b:b + 1])
+        ck, cv, kv_pos = st.cache.gather()
+        qpos = torch.tensor([pos[b]], device=x.device)
+        bias = rel_bias(r[b].view(1, 1, n_heads, -1), rel_proj, qpos,
+                        kv_pos)
+        qh = q[b].view(1, 1, n_heads, head_dim).transpose(1, 2)
+        if is_global and n_floor is not None:
+            qh, bias = apply_log_scaling(qh, bias, qpos, alpha, n_floor)
+        N = ck.shape[0]
+        rep = n_heads // n_kv
+        kh = ck.transpose(0, 1)[None, :, None].expand(
+            1, n_kv, rep, N, head_dim).reshape(1, n_heads, N, head_dim)
+        vh = cv.transpose(0, 1)[None, :, None].expand(
+            1, n_kv, rep, N, head_dim).reshape(1, n_heads, N, head_dim)
+        attn = torch.matmul(qh, kh.transpose(2, 3)) * (1.0 / head_dim) + bias
+        attn = F.softmax(attn, dim=-1, dtype=torch.float32).to(qh.dtype)
+        outs.append(torch.matmul(attn, vh).transpose(1, 2).reshape(
+            1, n_heads * head_dim))
+    #4. one shared o_proj GEMM over the stacked rows
+    return F.linear(torch.cat(outs, dim=0), wo)
+
+
+def layer_decode_batch(x, w, states, pos, mc, layer_idx):
+    """One full decoder layer, BATCHED decode form — layer_decode's exact
+    op order with the layer's weights read ONCE for all B rows: norms,
+    projections and the MLP half run as B-row batches (dense_mlp / moe
+    already take a flattened [T, hidden] token batch — the rows ride
+    through natively, sharing expert weight reads across sequences); the
+    attention core and the four sconv ring updates stay per-sequence."""
+    is_global = layer_idx in mc.global_layers
+    #1. attention half: batched pre-norm + attention, batched attn_sconv
+    h = rmsnorm(x, w["attn_norm"], mc.rms_eps)
+    h = attn_decode_batch(h, w["wq"], w["wk"], w["wv"], w["wr"], w["wo"],
+                          w["ksc"], w["vsc"], w["qn"], w["kn"], w["proj"],
+                          states, pos, mc.head_dim, is_global,
+                          alpha=mc.log_alpha, n_floor=mc.log_floor,
+                          eps=mc.rms_eps)
+    h = sconv_decode_batch(h, w["attn_sconv"],
+                           [s.attn_ring for s in states])
+    x = x + h
+    #2. MLP half: dense MLP / MoE consume the [B, hidden] token batch
+    h = rmsnorm(x, w["mlp_norm"], mc.rms_eps)
+    if layer_idx < mc.dense_idx:
+        h = dense_mlp(h, w["mlp_gate"], w["mlp_up"], w["mlp_down"],
+                      w["mlp_gs"])
+    else:
+        h = moe(h, w["gate_w"], w["gate_b"], w["gate_gs"], w["gu"],
+                w["w2"], w["shg"], w["shu"], w["shd"], mc.topk,
+                mc.n_shared, mc.route_scale)
+    h = sconv_decode_batch(h, w["mlp_sconv"], [s.mlp_ring for s in states])
+    return x + h
+
+
 def generate_greedy(ids, n_new, layers, states, w_emb, w_en, w_fn, w_un, mc,
                     capture=None):
     """B3.2: batch-1 greedy decode loop. ids [T] int64 on w_emb's device;

@@ -225,8 +225,18 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
       — green: ids-prompt arm byte-identical to string forms 8/8
       (id/created nonces masked), all prior arms intact, 400 x15 incl.
       7 malformed-id-list arms, 17 retired, wall ~7.5 min (commit e8074c6)
-- [ ] BLOCKED: B3.5 PARITY GATE vs goldens — the milestone. HUMAN VERIFIES
+- [x] B3.5 PARITY GATE vs goldens — the milestone. HUMAN VERIFIES
       this tick.
+      RESOLVED (doc sync, exp-0001 session 2026-07-29): this checkbox was
+      stale against the superseding decision record — CONTEXT_AND_PLAN.md
+      D13 (human ruling) redefined the cross-implementation gate as the
+      teacher-forced envelope form and records the measured PASS (pyengine
+      95.87%/0.0453 vs envelope 95.0%/0.0466, beating the reference on
+      both arms), and the P4 heading is marked "B3.5 parity green under
+      D13, human-verified". Ticked here per CLAUDE.md rule 1 (fix the
+      older doc in the same commit). Original blocked note kept below for
+      the record; its free-run form is now DETERMINISTIC SELF-CONSISTENCY
+      only, per D13.
       BLOCKED 2026-07-27: gate RUN and FAILED honestly — parity_pass false,
       45/50 prompt token mismatches (first divergences at pos 1/5/25/17/1;
       pos 0 agreed), max logprob delta 2.88e-01 > 2e-2 on the 5 matched
