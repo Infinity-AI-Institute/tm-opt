@@ -44,7 +44,11 @@ def merge_if_accepted(spec_path: Path) -> None:
             ff-only (a non-ff candidate means the agent branched stale —
             reject loudly, human rebases).
     """
-    spec = json.load(open(spec_path))
+    try:
+        spec = json.load(open(spec_path))
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"[dispatcher] {spec_path.name}: unreadable spec ({e}) — skipping merge", flush=True)
+        return
     rows = [json.loads(l) for l in LEDGER.read_text().splitlines() if l.strip()] \
         if LEDGER.exists() else []
     mine = [r for r in rows if r.get("commit") == spec.get("commit")]
