@@ -1767,3 +1767,49 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
   is why exp-0001 was stranded) preserved at /workspace/logs/
   exp0001_spec_draft_prev_session_2026-07-29.json; its independent A/B
   measurement (1.61x decode speedup) cross-validates this session's 1.60x.
+
+- 2026-07-29 Stage-3 loop session (post-crash): NO submission — pipeline
+  down (worker sh() bug at HEAD unchanged, dispatcher alive PID 1756471
+  polling 15 s, so any spec dropped now is consumed straight into the same
+  crash; re-drop must WAIT for the human fix). Instead this session
+  RESOLVED the exp-0001 spec's flagged "unexplained 2.4×" gate-pace delta
+  and found the human fix as documented is INSUFFICIENT — full evidence in
+  the DEADENDS.md correction entry, summary:
+  (1) NO 2.4× delta exists. warmup-0000's "~2.3 s/req worker gate pace"
+      was a mis-derivation: worker.py stamps the ledger row's measured_at
+      BETWEEN gate and bench (row_common built right after run_parity,
+      worker.py:126-139), so warm-up's 03:06:13 is the GATE END, not the
+      bench end. True warm-up gate: 01:53→03:06 = 73 min = 5.5 s/req; the
+      reconstructed bench window (03:06→03:49) matches the worker log's
+      final-flush mtime to the minute. Every timestamped gate run agrees:
+      5.4 s/req main build (07-27, 72 min/800), 5.45 s/req exp-0001 build
+      (708-req trace), same at K=4. Pace is a property of the ENGINE's
+      per-request prefill latency, not of build or launcher — and the
+      exp-0001 diff cannot touch it (gate requests are max_tokens=1 =
+      per-sequence prefill, byte-identical to main; diff only adds
+      decode_batch functions). exp-0001 needs no engine-side action.
+  (2) CONSEQUENCE for the documented human fix: after the sh() timeout
+      param lands, run_parity's timeout=3600 fires at 60 min < the true
+      ~4,380 s full-gate wall — EVERY experiment (exp-0001's rerun first)
+      would die as bogus parity red with no ledger row. The 3600 s value
+      came from the erroneous 2.3 s/req anchor ("2× headroom"); at the
+      measured pace the SAME intent says ≥7200 s. HUMAN FIX v2, still one
+      edit site (harness/worker.py, frozen to the loop): (a) `def sh(...,
+      timeout=None)` passed through to subprocess.run [as already
+      documented in 604267d], AND (b) run_parity's timeout 3600 → 7200
+      (≥5400 minimum). THEN re-drop: `cp experiments/done/
+      exp-0001-batched-decode.json experiments/queue/` (dispatcher forks
+      worker.py fresh per spec — no restart; if restarting anyway, mind
+      the root-umask queue TODO). Branch state re-verified this session:
+      tip 55fb6f6 (the 604267d note's 3ecfd7f is the pre-rebase sha),
+      single commit over main, ff-mergeable; spec's commit field is the
+      branch name so the re-drop needs no spec edit.
+  (3) Planning number: worker wall per experiment is ~2 h (load 2 + gate
+      73 + bench 43 + teardown), not ~75 min — sets the honest queue
+      cadence for backpressure.
+  Session ran read-only (logs, git, frozen-harness reads; no GPU work, no
+  server launched); committed per the no-silent-iteration rule. NEXT
+  ITERATION: if worker.py still lacks both fixes, STOP after the
+  backpressure check (nothing useful can enter the queue; do NOT re-drop);
+  if both landed and the queue is empty, verify exp-0001's rerun reached
+  the ledger before proposing attack surface #2.
