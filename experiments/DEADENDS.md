@@ -58,3 +58,26 @@ rerun first) dies at 60 min with run_parity's "treat as parity red"
 RuntimeError and vanishes without a ledger row. Human package updated in
 the 2026-07-29 PROGRESS.md loop note: the worker.py fix needs a SECOND
 one-liner, timeout 3600 → ≥5400 s (7200 recommended).
+
+## exp-0002 abandoned variant: pair-bmm MoE dispatch (2026-07-29, in-session — never queued)
+Hypothesis was that moe_experts' per-hit-expert Python loop (~15 eager ops
+per expert + a unique().tolist() sync per MoE layer, ~44 hits at decode
+batch 8) was launch-bound; a pair-parallel bmm dispatch (one batched
+dequant + fixed ~30-kernel schedule per layer over all T*top_k pairs)
+would delete it. Implementation was numerically sound (synthetic vs loop:
+max|d| 2e-3 bf16 accumulation-drift class; PackedExperts.gather bitwise
+vs __getitem__; deterministic) but t_batched measured decode speedup
+DOWN, 1.60x -> 1.39x (decode wall 55.4 -> 64.0 s, log
+/workspace/logs/t_batched_exp0002_2026-07-29.log). Micro profile at real
+shapes explains it: the loop was never launch-bound — moe_experts at T=8
+costs 51.9 ms/layer of which ~49.8 ms is the on-demand NVFP4 dequant
+itself (eager dequant_nvfp4 materializes int64 LUT indices + fp32
+temporaries, ~750 MB traffic per expert w13 for a 75 MB result, 0.689
+ms/expert); pair-bmm keeps that dequant cost, adds pair-duplication and
+multi-GB transient allocations under real memory pressure. LESSON: the
+batched decode step wall (~2.9 s at B=8) is ~launch-amortized already;
+its limiter is dequant TRAFFIC (~44 hits x 64 layers x ~1.1 ms ~ 3.1 s).
+That insight became exp-0002-triton-dequant (bit-exact one-pass kernel,
+0.689 -> 0.089 ms/expert). A future grouped/fused dispatch should be
+re-tested only AFTER the dequant floor is gone — and measured against
+the then-current step profile, not launch-count intuition.
