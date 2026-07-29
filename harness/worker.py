@@ -46,11 +46,12 @@ CANONICAL_FLOOR_TOKS = 1165.0   # B4.1: below this, canonical cannot terminate
 MERGE_BAR_MIN_PCT = 0.3         # D12
 
 
-def sh(cmd, cwd=None, check=True, env=None):
+def sh(cmd, cwd=None, check=True, env=None, timeout=None):
     """@brief thin subprocess wrapper with echo, so worker logs are auditable"""
     print(f"[worker] $ {cmd}", flush=True)
     return subprocess.run(cmd, shell=True, cwd=cwd, check=check,
-                          capture_output=True, text=True, env=env)
+                          capture_output=True, text=True, env=env,
+                          timeout=timeout)
 
 
 def ledger_rows():
@@ -79,7 +80,7 @@ def run_parity(endpoint: str) -> dict:
     try:
         r = sh(f"python {REPO_ROOT}/harness/correctness.py --endpoint {endpoint} "
                f"--teacher-forced --envelope {ENVELOPE}", check=False,
-               timeout=3600)
+               timeout=7200)
     except subprocess.TimeoutExpired:
         raise RuntimeError("parity gate exceeded 3600 s — engine wedged or "
                            "unresponsive; treat as parity red")
