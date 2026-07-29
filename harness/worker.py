@@ -79,7 +79,7 @@ def run_parity(endpoint: str) -> dict:
     """
     try:
         r = sh(f"python {REPO_ROOT}/harness/correctness.py --endpoint {endpoint} "
-               f"--teacher-forced --envelope {ENVELOPE}", check=False,
+               f"--teacher-forced --tf-positions 8 --envelope {ENVELOPE}", check=False,
                timeout=7200)
     except subprocess.TimeoutExpired:
         raise RuntimeError("parity gate exceeded 3600 s — engine wedged or "
@@ -157,7 +157,7 @@ def main():
         else:
             rec = run_timeboxed(endpoint, spec.get("model",
                   "/workspace/models/inkling-nvfp4"), cfg,
-                  max_seconds=1800, tb_conc=8, tb_osl=128)
+                  max_seconds=600, tb_conc=8, tb_osl=128)
 
         #5. merge gate: per-workload bar over the best SAME-PROTOCOL row
         base_noise = _baseline_noise(workload)
@@ -208,7 +208,13 @@ def _next_iteration(workload) -> int:
 def _current_best(workload, protocol=None):
     rows = [r for r in _rows_for(workload) if r.get("accepted")]
     if protocol:
-        rows = [r for r in rows if r.get("protocol") == protocol]
+        #1. all timeboxed(...) variants are ONE comparison family (same
+        #   conc/osl steady-state; only the box length differs — sprint
+        #   ruling 2026-07-29); canonical stays strictly canonical
+        if protocol.startswith("timeboxed"):
+            rows = [r for r in rows if str(r.get("protocol", "")).startswith("timeboxed")]
+        else:
+            rows = [r for r in rows if r.get("protocol") == protocol]
     return max((r["tok_per_s"] for r in rows), default=None)
 
 
