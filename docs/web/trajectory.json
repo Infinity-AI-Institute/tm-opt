@@ -1,0 +1,73 @@
+{
+ "schema": 1,
+ "generated_at": "2026-07-29 01:18:55",
+ "cache_key": [
+  "8451a604a8849296"
+ ],
+ "workloads": {
+  "decode_heavy": {
+   "baseline": {
+    "tok_per_s": 13409.5,
+    "noise_floor_pct": 0.12,
+    "merge_bar_pct": 0.3,
+    "engine": "vllm",
+    "protocol": "canonical"
+   },
+   "series": [
+    {
+     "iteration": 0,
+     "tok_per_s": 1.6,
+     "pct_vs_baseline": 0.0,
+     "label": "iteration 0",
+     "mechanism": "per-sequence eager engine, Triton pending",
+     "accepted": true,
+     "protocol": "timeboxed(1800s, conc=8, osl_cap=128)",
+     "commit": "8c29167",
+     "measured_at": null,
+     "hypothesis": null,
+     "predicted_delta": null,
+     "log_path": ""
+    },
+    {
+     "iteration": 1,
+     "tok_per_s": 1.6,
+     "pct_vs_baseline": 0.012,
+     "label": "pipeline warm-up",
+     "mechanism": "unmodified engine through the full worker pipeline",
+     "accepted": false,
+     "protocol": "timeboxed(1800s, conc=8, osl_cap=128)",
+     "commit": "HEAD",
+     "measured_at": "2026-07-28 03:06:13",
+     "hypothesis": "an unmodified engine reproduces iteration-0 throughput and is REJECTED by the merge gate (no improvement)",
+     "predicted_delta": "+0%",
+     "log_path": "/workspace/tm-opt/experiments/queue/warmup-0000.log"
+    }
+   ]
+  },
+  "prefill_heavy": {
+   "baseline": {
+    "tok_per_s": 4999.3,
+    "noise_floor_pct": 0.82,
+    "merge_bar_pct": 1.64,
+    "engine": "vllm",
+    "protocol": "canonical"
+   },
+   "series": [
+    {
+     "iteration": 0,
+     "tok_per_s": 1.5,
+     "pct_vs_baseline": 0.0,
+     "label": "iteration 0",
+     "mechanism": "per-sequence eager engine, Triton pending",
+     "accepted": true,
+     "protocol": "timeboxed(1800s, conc=8, osl_cap=128)",
+     "commit": "759c5ac",
+     "measured_at": null,
+     "hypothesis": null,
+     "predicted_delta": null,
+     "log_path": ""
+    }
+   ]
+  }
+ }
+}
