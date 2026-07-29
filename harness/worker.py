@@ -25,6 +25,7 @@
 """
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -75,8 +76,13 @@ def run_parity(endpoint: str) -> dict:
     @brief  D13 teacher-forced envelope gate via the frozen harness CLI.
     @return the gate's verdict JSON (parity_pass, agree_rate, deltas, ...)
     """
-    r = sh(f"python {REPO_ROOT}/harness/correctness.py --endpoint {endpoint} "
-           f"--teacher-forced --envelope {ENVELOPE}", check=False)
+    try:
+        r = sh(f"python {REPO_ROOT}/harness/correctness.py --endpoint {endpoint} "
+               f"--teacher-forced --envelope {ENVELOPE}", check=False,
+               timeout=3600)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("parity gate exceeded 3600 s — engine wedged or "
+                           "unresponsive; treat as parity red")
     #1. last stdout line is the verdict JSON (progress lines precede it)
     for line in reversed(r.stdout.strip().splitlines()):
         if line.startswith("{"):
@@ -111,7 +117,7 @@ def main():
         serve_cmd = spec.get("serve_cmd",
                              f"python -m engine.pyengine.server --port {PORT}")
         engine_proc = subprocess.Popen(
-            serve_cmd, shell=True, cwd=wt, env=env,
+            serve_cmd, shell=True, cwd=wt, env=env, preexec_fn=os.setsid,
             stdout=open(wt / "serve.log", "w"), stderr=subprocess.STDOUT)
         if not wait_healthy(endpoint):
             raise RuntimeError("engine never became healthy; see serve.log")
@@ -176,11 +182,14 @@ def main():
                            "blocks": rec["blocks"]})
     finally:
         if engine_proc:
-            engine_proc.terminate()
             try:
+                os.killpg(engine_proc.pid, signal.SIGTERM)
                 engine_proc.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                engine_proc.kill()
+            except (subprocess.TimeoutExpired, ProcessLookupError):
+                try:
+                    os.killpg(engine_proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
         sh(f"git worktree remove --force {wt}", cwd=REPO_ROOT, check=False)
         print(json.dumps(verdict), flush=True)
 

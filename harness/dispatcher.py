@@ -81,6 +81,7 @@ def main():
             proc, spec_path = running
             if proc.poll() is not None:
                 merge_if_accepted(spec_path)
+                print(f"[dispatcher] {spec_path.name} finished — archived to done/", flush=True)
                 spec_path.rename(DONE_DIR / spec_path.name)
                 running = None
 
