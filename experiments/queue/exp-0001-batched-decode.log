@@ -1,0 +1,8 @@
+[worker] $ git log --format=%s -1 exp-0001-batched-decode
+[worker] $ git worktree add --detach /workspace/tm-opt/experiments/wtrun-exp-0001-batched-decode exp-0001-batched-decode
+[worker] $ python /workspace/tm-opt/harness/correctness.py --endpoint http://localhost:8200 --teacher-forced --envelope /workspace/tm-opt/experiments/tf_envelope.json
+[bench] TIMEBOXED warmup 8 reqs @ conc 8 osl 128
+[bench] timeboxed: 4.0 tok/s (7808 tok, 61 reqs, 1936s incl. drain)
+[bench] ledger row appended: iter=2 engine=pyengine workload=decode_heavy tok_per_s=4.0
+[worker] $ git worktree remove --force /workspace/tm-opt/experiments/wtrun-exp-0001-batched-decode
+{"experiment_id": "exp-0001-batched-decode", "accepted": true, "reason": null}

@@ -1,0 +1,9 @@
+[worker] $ git log --format=%s -1 HEAD
+[worker] WARNING: candidate commit HEAD lacks [ralph] prefix
+[worker] $ git worktree add --detach /workspace/tm-opt/experiments/wtrun-warmup-0000 HEAD
+[worker] $ python /workspace/tm-opt/harness/correctness.py --endpoint http://localhost:8200 --teacher-forced --envelope /workspace/tm-opt/experiments/tf_envelope.json
+[bench] TIMEBOXED warmup 8 reqs @ conc 8 osl 128
+[bench] timeboxed: 1.6 tok/s (3072 tok, 24 reqs, 1939s incl. drain)
+[bench] ledger row appended: iter=1 engine=pyengine workload=decode_heavy tok_per_s=1.6
+[worker] $ git worktree remove --force /workspace/tm-opt/experiments/wtrun-warmup-0000
+{"experiment_id": "warmup-0000", "accepted": false, "reason": "tok/s 1.6 <= threshold 1.6 (best 1.6 +0.3%)"}
