@@ -1688,3 +1688,31 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
   recipe in B4.1's session-3 note). SESSION LEDGER: staged ledger.jsonl
   (harness-appended row, append-only mechanism) + the docs/logs/ evidence
   log + PROGRESS.md; nothing else dirty.
+
+- 2026-07-29 Stage-3 exp-0001 completion session (loop note, hedge committed
+  BEFORE the pre-gate run per budget rule). Found IN-FLIGHT work: worktree
+  experiments/wt-exp-0001-batched-decode with a committed implementation
+  (e78591f, batched decode across co-resident sequences = attack surface #1)
+  but NO spec in queue — the prior session started the FULL 800-request D13
+  gate at 01:45 and died at 708/800 (~64 min, results lost with the client;
+  serve-log timestamps are the evidence). This session: (1) first-duty
+  post-mortem for the rejected warmup-0000 appended to experiments/
+  DEADENDS.md (new file); (2) t_batched run for the FIRST time (prior
+  session never executed it): C same-schedule determinism BITWISE PASS (the
+  adapted-t_b3 binding arm), decode speedup 1.60x (2.74 vs 1.71 tok/s agg
+  at batch<=8), A/B agreement 135/160 = 84.38% with divergences at near-tie
+  ref margins (0.0000/0.0000/0.1250) — the B3.1/B3.3 row-count-drift class
+  D13 exists to referee; log /workspace/logs/t_batched_exp0001_2026-07-29
+  .log; (3) gate pace MEASURED on this build's server: ~5.4 s/request
+  (probe, and 708 reqs @ 5.45 s avg in the prior session's trace), SAME
+  with taskset -c 86-171 pinning — NUMA is not the cause; the warm-up
+  worker's own launch achieved ~2.3 s/req on the identical gate code path
+  (75-min end-to-end window minus bench+load), unexplained 2.4x delta,
+  flagged in the spec because at 5.4 s/req the worker's full gate (~72 min)
+  would trip its 3600 s parity timeout; (4) local pre-gate budgeted at
+  K=4 (--tf-positions 4, 200 reqs ~18 min at measured pace; full K=16 =
+  72 min exceeds the 40-min budget rule) against the envelope referee
+  unchanged — running next as ONE foreground call; spec submission +
+  server teardown (worker needs port 8200 + GPUs 4-7) follow same session.
+  If this session dies mid-gate: rerun the K=4 pre-gate and submit — the
+  worktree commit e78591f is DONE and t_batched evidence is on disk.
