@@ -5,6 +5,8 @@ route_scale 8, +2 shared sink experts; layers 0-1 = dense MLP) -> sconv on
 moe-out -> residual. No RoPE anywhere."""
 import torch
 
+from engine.pyengine.kernels.moe_gemm import moe_experts_packed
+
 
 def rmsnorm(x, weight, eps=1e-6):
     """Torch-reference RMSNorm with exact InklingRMSNorm semantics
@@ -194,6 +196,13 @@ def moe_experts(x, w_gate_up, w_down, topk_indices, topk_weights):
     distinct experts (topk positions, B2.8), so within-expert order cannot
     matter. Grouped-GEMM Triton form is Stage-3 work (D4)."""
     F = torch.nn.functional
+    #0. NVFP4 layers (loader.PackedExperts): grouped GEMM directly on the
+    #   packed bytes — one launch per matrix for ALL (token, slot) pairs,
+    #   no per-expert bf16 materialization, no per-layer CPU sync
+    #   (exp-0003; D13-envelope semantics, kernels/moe_gemm.py docstring)
+    if hasattr(w_gate_up, "packed"):
+        return moe_experts_packed(x, w_gate_up, w_down, topk_indices,
+                                  topk_weights)
     #1. accumulator in the input dtype, like the ref (:321)
     out = torch.zeros_like(x)
     #2. hit experts in ascending id order (:323-327)
