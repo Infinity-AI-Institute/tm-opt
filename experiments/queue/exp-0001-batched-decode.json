@@ -1,0 +1,16 @@
+{
+  "experiment_id": "exp-0001-batched-decode",
+  "commit": "exp-0001-batched-decode",
+  "workload": "decode_heavy",
+  "label": "Batched decode",
+  "mechanism": "one stack traversal per step for all co-resident decodes",
+  "hypothesis": "decode serialization is the whole iteration-0 gap: advancing all co-resident sequences through ONE batched 66-layer traversal (weights read once per step, per-layer Python paid once) instead of one traversal per sequence multiplies aggregate decode throughput at conc 8",
+  "predicted_delta": "+50-60% timeboxed decode_heavy tok/s (1.6 -> ~2.5; t_batched measured 1.60x decode speedup at batch<=8)",
+  "baseline_id": "vllm_mtp_off",
+  "serve_cmd": "python -m engine.pyengine.server --port 8200",
+  "local_pregate": {
+    "tf_k4": {"parity_pass": true, "agree_rate": 0.95, "delta_mean": 0.054332, "delta_max": 0.481408, "n_comparisons": 200, "log": "/workspace/logs/tf_pyengine_exp0001_k4_2026-07-29.log"},
+    "t_batched": {"determinism_bitwise": "PASS", "decode_speedup": "1.60x", "ab_agreement": "135/160 (84.38%), divergences at near-tie ref margins 0.0000/0.0000/0.1250 (B3.1/B3.3 row-count drift class)", "log": "/workspace/logs/t_batched_exp0001_2026-07-29.log"},
+    "note": "commit field is the BRANCH NAME (worker + ff-merge both resolve refs; warmup precedent used HEAD) — branch rebased onto main post-submission so an accept fast-forwards; sha at submission e78591f. Full K=16 local gate infeasible under the 40-min budget at measured ~5.4 s/request on this server (two independent measurements; taskset NUMA pinning made no difference); K=4 subsample against the unchanged envelope referee. RISK FLAG for the worker: at 5.4 s/req the full 800-request parity gate takes ~72 min and would trip worker.py's 3600 s timeout; the warmup-0000 worker measured ~2.3 s/req on the identical gate code path (gate ~30 min), so the worker's own launch is expected to fit — if this experiment vanishes without a ledger row, the parity-timeout RuntimeError is the first suspect, and the gate path in this diff is byte-identical to warm-up's (max_tokens=1 requests never enter decode_batch)."
+  }
+}

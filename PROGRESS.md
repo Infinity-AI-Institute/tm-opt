@@ -1716,3 +1716,26 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
   server teardown (worker needs port 8200 + GPUs 4-7) follow same session.
   If this session dies mid-gate: rerun the K=4 pre-gate and submit — the
   worktree commit e78591f is DONE and t_batched evidence is on disk.
+
+- 2026-07-29 exp-0001 SUBMITTED (same session as the hedge note above).
+  Pre-gate K=4 GREEN: parity_pass true, agree 0.95 = 190/200 (floor 0.93),
+  delta_mean 0.0543 (cap 0.0583 — inside but near it; 5/10 sampled
+  disagreements are position-0 short-prompt cases, and the worker's full
+  K=16 gate runs the byte-identical prefill path that scored 0.9587/0.0453
+  on warm-up), log /workspace/logs/tf_pyengine_exp0001_k4_2026-07-29.log.
+  DEPLOYMENT BUG FOUND + WORKED AROUND: experiments/queue/ was created by
+  the root dispatcher as drwxr-xr-x root:root — the loop's DESIGNATED
+  submission interface (PROMPT step 6) was unwritable by ralph. Fixed by
+  dir swap (group-write on experiments/ permits the rename): old dir
+  preserved verbatim at experiments/queue.rootowned.bak/ (its root-owned
+  warmup-0000.log COPIED into the new ralph-owned queue/ so the warm-up
+  ledger row's log_path still resolves). HUMAN TODO: chown/umask the
+  dispatcher (or add to pod_init.sh) so the next dispatcher restart doesn't
+  recreate a root-owned queue; then delete queue.rootowned.bak/. Spec
+  experiments/queue/exp-0001-batched-decode.json references the BRANCH
+  NAME as its commit (worker's worktree-add and the dispatcher's ff-merge
+  both resolve refs; warmup precedent used HEAD) and the branch is rebased
+  onto main after this commit so an ACCEPT can fast-forward — sha at
+  submission e78591f. Server torn down (port 8200 + GPUs 4-7 free for the
+  worker); dispatcher confirmed alive (poll 15 s). Loop stops here per
+  protocol — worker runs the binding gates.
