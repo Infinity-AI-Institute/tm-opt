@@ -1739,3 +1739,31 @@ transformers(trust_remote_code) on the SAME checkpoint, tiny prompt, layers
   submission e78591f. Server torn down (port 8200 + GPUs 4-7 free for the
   worker); dispatcher confirmed alive (poll 15 s). Loop stops here per
   protocol — worker runs the binding gates.
+
+- 2026-07-29 exp-0001 WORKER CRASHED ON A HARNESS BUG (same session, ~10 min
+  after submission) — the experiment itself is fine and fully ready to rerun.
+  Evidence experiments/queue/exp-0001-batched-decode.log: the worker checked
+  out the branch, loaded the server (~103 s), then died at the parity step
+  with `TypeError: sh() got an unexpected keyword argument 'timeout'` —
+  harness/worker.py's run_parity passes timeout=3600 to sh(), but sh()'s
+  signature (cmd, cwd, check, env) never gained the parameter. Introduced
+  by 952c6f8 (2026-07-29 01:12, "parity gate 3600s timeout"); the warm-up
+  ran 2026-07-28, BEFORE it, so this submission was the first to exercise
+  the path. EVERY future spec crashes identically until it is fixed; the
+  loop may not touch harness/ (hard rule), so this is a HUMAN FIX:
+  one line — `def sh(cmd, cwd=None, check=True, env=None, timeout=None)`
+  and pass `timeout=timeout` through to subprocess.run. RECOVERY after the
+  fix: `cp experiments/done/exp-0001-batched-decode.json experiments/queue/`
+  — the dispatcher is alive (poll 15 s) and the worker reads worker.py
+  fresh per launch; no dispatcher restart needed (if restarting anyway,
+  note it recreates queue/ root-owned — see the umask TODO above). No
+  ledger row was written (crash preceded the gate), so the trajectory
+  chart is unaffected. State left ready: spec archived in done/, branch
+  exp-0001-batched-decode rebased ff-mergeable at 3ecfd7f, pre-gate green
+  (K=4 tf 0.95/0.0543 + t_batched C bitwise PASS / 1.60x, logs in
+  /workspace/logs/), GPUs 4-7 idle, port 8200 free. Also recovered this
+  session: the PRIOR session's lost spec draft (it wrote to the WORKTREE's
+  own experiments/queue/ — path confusion, dispatcher never saw it; that
+  is why exp-0001 was stranded) preserved at /workspace/logs/
+  exp0001_spec_draft_prev_session_2026-07-29.json; its independent A/B
+  measurement (1.61x decode speedup) cross-validates this session's 1.60x.
