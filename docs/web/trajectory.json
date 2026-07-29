@@ -1,6 +1,6 @@
 {
  "schema": 1,
- "generated_at": "2026-07-29 01:18:55",
+ "generated_at": "2026-07-29 14:43:45",
  "cache_key": [
   "8451a604a8849296"
  ],
@@ -41,6 +41,20 @@
      "hypothesis": "an unmodified engine reproduces iteration-0 throughput and is REJECTED by the merge gate (no improvement)",
      "predicted_delta": "+0%",
      "log_path": "/workspace/tm-opt/experiments/queue/warmup-0000.log"
+    },
+    {
+     "iteration": 2,
+     "tok_per_s": 4.0,
+     "pct_vs_baseline": 0.03,
+     "label": "Batched decode",
+     "mechanism": "one stack traversal per step for all co-resident decodes",
+     "accepted": true,
+     "protocol": "timeboxed(1800s, conc=8, osl_cap=128)",
+     "commit": "exp-0001-batched-decode",
+     "measured_at": "2026-07-29 06:35:03",
+     "hypothesis": "decode serialization is the whole iteration-0 gap: advancing all co-resident sequences through ONE batched 66-layer traversal (weights read once per step, per-layer Python paid once) instead of one traversal per sequence multiplies aggregate decode throughput at conc 8",
+     "predicted_delta": "+50-60% timeboxed decode_heavy tok/s (1.6 -> ~2.5; t_batched measured 1.60x decode speedup at batch<=8)",
+     "log_path": "/workspace/tm-opt/experiments/queue/exp-0001-batched-decode.log"
     }
    ]
   },
