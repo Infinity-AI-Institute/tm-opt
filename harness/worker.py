@@ -157,7 +157,7 @@ def main():
         else:
             rec = run_timeboxed(endpoint, spec.get("model",
                   "/workspace/models/inkling-nvfp4"), cfg,
-                  max_seconds=600, tb_conc=8, tb_osl=128)
+                  max_seconds=600, tb_conc=64, tb_osl=128)
 
         #5. merge gate: per-workload bar over the best SAME-PROTOCOL row
         base_noise = _baseline_noise(workload)
