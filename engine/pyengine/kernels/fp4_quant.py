@@ -21,6 +21,17 @@ row space (pad rows stay all-zero: zero packed bytes = +0.0 e2m1, zero
 scale bytes = 0.0 e4m3, contributing exactly 0 to any MMA that reads them;
 e4m3 NaN encodings can never appear).
 
+Silu variant (SILU, exp-0022) reads the w13 GEMM's OUTPUT rows instead of a
+materialized activation: columns are interleaved [g0,u0,g1,u1,..] (the
+checkpoint's w13 row interleave carried through the GEMM), so output column
+n is the pair (2n, 2n+1) and the inter-GEMM epilogue silu(g)*u fuses into
+this kernel's load. Rounding chain is the one BOTH other grouped GEMMs
+already use in their own epilogues (kernels/moe_gemm.py:183,
+kernels/moe_gemm_bf16.py:104): fp32 silu -> bf16 -> fp32 -> * u at fp32 ->
+bf16. Only the native-MMA W4A4 path (exp-0015a/b) lacked a fusable
+epilogue and fell back to an eager torch chain, which paid 9 passes over
+the 128-padded m_cap row space to serve the same values.
+
 Numerics: RTNE everywhere via the HARDWARE converts (fp32->e4m3 through
 Triton's native float8e4nv cast; e2m1 via inline asm cvt.rn.satfinite,
 pack=1, operand order $1=high/$2=low probe-verified). Deterministic: pure
@@ -35,13 +46,16 @@ import triton.language as tl
 @triton.jit
 def _nvfp4_quant_kernel(x_ptr, pk_ptr, sf_ptr, src_ptr, dst_ptr,
                         inv_gs, gs, K, NC,
-                        HAS_MAP: tl.constexpr, BLOCK_K: tl.constexpr):
+                        HAS_MAP: tl.constexpr, BLOCK_K: tl.constexpr,
+                        SILU: tl.constexpr = False):
     """One program per quantized row. K = row length (mult of 16), processed
     in BLOCK_K chunks (BLOCK_K mult of 16). Packed out [Mp, K/2]
     low-nibble-first; scales written straight into the 32_4_4 blocked
     swizzle (flat), NC = padded scale-column count / 4 (= ceil(K/16/4)).
     HAS_MAP: read x row src[i], write packed/scale row dst[i] (dst rows of
-    distinct programs are distinct -> each output written exactly once)."""
+    distinct programs are distinct -> each output written exactly once).
+    SILU: the source row is 2K wide with interleaved gate/up columns and
+    the quantized value is silu(gate)*up (module docstring)."""
     i = tl.program_id(0)
     if HAS_MAP:
         m_src = tl.load(src_ptr + i)
@@ -53,8 +67,20 @@ def _nvfp4_quant_kernel(x_ptr, pk_ptr, sf_ptr, src_ptr, dst_ptr,
     g4 = (m_dst % 128) // 32
     base_g = (m_dst // 128) * NC
     for k0 in range(0, K, BLOCK_K):
-        offs = k0 + tl.arange(0, BLOCK_K)
-        x = tl.load(x_ptr + m_src.to(tl.int64) * K + offs).to(tl.float32)
+        if SILU:
+            #1s. one contiguous 2*BLOCK_K load of the interleaved pairs;
+            #    tl.split takes the even lanes (gate) and odd (up), the
+            #    same even/odd split the packer below uses. Rounding chain
+            #    identical to the other two grouped GEMMs' epilogues.
+            gu = tl.load(x_ptr + m_src.to(tl.int64) * (2 * K) + 2 * k0
+                         + tl.arange(0, 2 * BLOCK_K))
+            g, u = tl.split(tl.reshape(gu, (BLOCK_K, 2)))
+            gf = g.to(tl.float32)
+            act = (gf * tl.sigmoid(gf)).to(tl.bfloat16).to(tl.float32)
+            x = (act * u.to(tl.float32)).to(tl.bfloat16).to(tl.float32)
+        else:
+            x = tl.load(x_ptr + m_src.to(tl.int64) * K + k0
+                        + tl.arange(0, BLOCK_K)).to(tl.float32)
         xg = tl.reshape(x, (BLOCK_K // 16, 16))
         amax = tl.max(tl.abs(xg), axis=1)
         # e4m3 scale through the global scale; hardware RTNE+satfinite cast
@@ -101,6 +127,33 @@ def nvfp4_quant(x, input_scale):
         _nvfp4_quant_kernel[(M,)](
             x, packed, sf, x, x, 1.0 / input_scale, input_scale, K, nc,
             HAS_MAP=False, BLOCK_K=_pick_block(K), num_warps=4)
+    return packed, sf
+
+
+def nvfp4_quant_silu(gu, ffn, input_scale):
+    """exp-0022: the routed-expert inter-GEMM epilogue as ONE kernel.
+    gu [M, 2*ffn] bf16 contiguous is the w13 grouped GEMM's output with
+    interleaved gate/up columns; returns the NVFP4 quantization of
+    silu(gate)*up exactly as nvfp4_quant would on that [M, ffn] activation,
+    without ever materializing it. The eager form it replaces
+    (kernels/moe_gemm_w4a4.py) ran 9 elementwise passes over the 128-padded
+    m_cap row space — ~6.7 GB/layer of HBM traffic at the graphed decode
+    step's m_cap = 32896, ~11 GB/layer at a canonical prefill cohort — to
+    produce values this kernel computes in registers between the load it
+    already had to do and the store it already had to make."""
+    M, two_ffn = gu.shape
+    assert two_ffn == 2 * ffn and ffn % 16 == 0
+    assert gu.stride(1) == 1 and gu.stride(0) == two_ffn
+    kg = ffn // 16
+    nr, nc = -(-M // 128), -(-kg // 4)
+    packed = torch.empty(M, ffn // 2, device=gu.device, dtype=torch.uint8)
+    #1. zero-init as nvfp4_quant: swizzle positions beyond (M, kg) unwritten
+    sf = torch.zeros(nr * 128 * nc * 4, device=gu.device,
+                     dtype=torch.float8_e4m3fn)
+    with torch.cuda.device(gu.device):
+        _nvfp4_quant_kernel[(M,)](
+            gu, packed, sf, gu, gu, 1.0 / input_scale, input_scale, ffn, nc,
+            HAS_MAP=False, BLOCK_K=_pick_block(ffn), SILU=True, num_warps=4)
     return packed, sf
 
 
