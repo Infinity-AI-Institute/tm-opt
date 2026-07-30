@@ -176,7 +176,8 @@ def moe_gate(x, w_gate, bias, global_scale, top_k, n_shared, route_scale):
     return routed_logits, topk_weights, topk_indices, shared_gammas
 
 
-def moe_experts(x, w_gate_up, w_down, topk_indices, topk_weights):
+def moe_experts(x, w_gate_up, w_down, topk_indices, topk_weights,
+                phase="decode"):
     """Routed expert GEMMs — exact InklingExperts.forward semantics
     (transformers models/inkling/modeling_inkling.py:315-339; the
     use_experts_implementation dispatch falls back to this original loop
@@ -201,6 +202,17 @@ def moe_experts(x, w_gate_up, w_down, topk_indices, topk_weights):
     #   no per-expert bf16 materialization, no per-layer CPU sync
     #   (exp-0003; D13-envelope semantics, kernels/moe_gemm.py docstring)
     if hasattr(w_gate_up, "packed"):
+        #0'. exp-0015a: PREFILL routes to the native-FP4-MMA W4A4 grouped
+        #    GEMM (the reference's own numeric recipe for these layers —
+        #    kernels/moe_gemm_w4a4.py docstring); decode paths — including
+        #    the CUDA-graph-captured batched step — keep the W4A16 Triton
+        #    kernels unchanged. Lazy import: the CUTLASS DSL stack loads
+        #    only when a prefill first needs it.
+        if phase == "prefill" and w_gate_up.input_amax is not None:
+            from engine.pyengine.kernels.moe_gemm_w4a4 import (
+                moe_experts_w4a4)
+            return moe_experts_w4a4(x, w_gate_up, w_down, topk_indices,
+                                    topk_weights)
         return moe_experts_packed(x, w_gate_up, w_down, topk_indices,
                                   topk_weights)
     #1. accumulator in the input dtype, like the ref (:321)
@@ -248,7 +260,7 @@ def moe_shared(x, w_gate, w_up, w_down, gammas):
 
 
 def moe(x, w_gate, bias, global_scale, w_gate_up, w_down, w_sh_gate,
-        w_sh_up, w_sh_down, top_k, n_shared, route_scale):
+        w_sh_up, w_sh_down, top_k, n_shared, route_scale, phase="decode"):
     """Full MoE block: router -> routed experts + shared sink experts —
     exact InklingMoE.forward semantics (modeling_inkling.py:418-425):
     gate on the unflattened input, routed experts on the flattened tokens,
@@ -260,7 +272,7 @@ def moe(x, w_gate, bias, global_scale, w_gate_up, w_down, w_sh_gate,
     flat = x.view(-1, x.shape[-1])
     #2. routed experts on flat tokens, back to the input shape (:423)
     routed = moe_experts(flat, w_gate_up, w_down, topk_indices,
-                         topk_weights).view(x.shape)
+                         topk_weights, phase=phase).view(x.shape)
     #3. + shared experts on the pre-flatten residuals (:424)
     return routed + moe_shared(x, w_sh_gate, w_sh_up, w_sh_down,
                                shared_gammas)
@@ -410,7 +422,7 @@ def layer_prefill(x, w, mask, pos, mc, layer_idx, state=None, trace=None):
     else:
         h = moe(h, w["gate_w"], w["gate_b"], w["gate_gs"], w["gu"],
                 w["w2"], w["shg"], w["shu"], w["shd"], mc.topk,
-                mc.n_shared, mc.route_scale)
+                mc.n_shared, mc.route_scale, phase="prefill")
     if state is not None:
         state.mlp_ring.seed(h[0])
     h = sconv_prefill(h, w["mlp_sconv"])

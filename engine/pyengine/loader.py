@@ -270,7 +270,8 @@ class PackedExperts:
     chunked load path's output (t_b2.load_layer_weights; pinned by t_b3
     decode). Real NVFP4 GEMM kernels are Stage-3 work (D4)."""
 
-    def __init__(self, packed, scale, scale2, group_size, deinterleave):
+    def __init__(self, packed, scale, scale2, group_size, deinterleave,
+                 input_amax=None):
         #1. keep the checkpoint-form pieces; same dtype contract dequant
         #   enforces per call
         assert packed.dtype == torch.uint8, packed.dtype
@@ -278,6 +279,11 @@ class PackedExperts:
         assert packed.dim() == 3 and packed.shape[0] == scale2.shape[0]
         self.packed, self.scale, self.scale2 = packed, scale, scale2
         self.group_size, self.deinterleave = group_size, deinterleave
+        #2. checkpoint activation-calibration amax (ModelOpt `.input_amax`,
+        #   bf16 scalar; None when the caller does not load it) — the W4A4
+        #   prefill path derives input_scale = amax/(448*6) from it
+        #   (kernels/moe_gemm_w4a4.py); the W4A16 paths ignore it
+        self.input_amax = None if input_amax is None else float(input_amax)
 
     def __getitem__(self, e):
         """Dequant expert e alone -> bf16 [rows, cols] on the pack's
