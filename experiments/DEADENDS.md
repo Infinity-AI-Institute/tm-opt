@@ -239,3 +239,31 @@ sm_103a (file-based only, no REPL), cutlass.utils.blockscaled_layout ships
 Sm103BlockScaledBasicChunk, and cute.nvgpu.tcgen05 exposes MmaMXF4NVF4Op /
 BlockScaledMmaOp — the grouped blockscaled decode kernel (exp-0015b) is
 toolchain-supported end to end.
+
+## exp-0014-batched-prefill (rejected 2026-07-30, 86.0 vs bar 90.0)
+Post-mortem: parity PASSED bit-identically (0.955/0.05065/0.600919 — the
+singleton fall-through preserved the gate path exactly as designed), but the
+mechanism delivered ~ZERO in situ: per-bench-thread pace was 7.05 reqs/600s
+(430 reqs / 61 live threads) vs exp-0013's 7.00 (448/64) — +0.7%, noise —
+and the whole -4.1% headline deficit is exactly the THREE bench worker
+threads that died at warmup (three ConnectionResetError tracebacks in the
+worker log; 89.7 x 61/64 = 85.5 ~ the measured 86.0). Two lessons. (1) The
+engine-level 1.30x / HTTP 1.15x grouping gains evaporate under the bench's
+real arrival pattern: replacement prefills arrive per-completion, spread
+over the retiring cohort's drain, so the 150 ms idle-edge window still saw
+mostly singleton groups — grouping must be triggered by the SCHEDULER'S OWN
+cohort-retire signal (it knows 64 seqs just freed), not by a wall-clock
+accumulation window racing HTTP arrivals; re-attack only as part of
+scheduler specialization (#8) AFTER the GEMM native port (exp-0015a/b),
+where prefill GEMM time shrinks ~4x and grouping matters less anyway.
+(2) The resets happened BEFORE any status line was written (client died in
+_read_status), i.e. accepted-then-killed in the handler or accept-backlog
+overflow (server.py uses ThreadingHTTPServer with the socketserver default
+request_queue_size=5) under the 64-simultaneous warmup blast; the server's
+own stderr is not captured by the worker anywhere we can read, so the
+server-side trace is LOST — any future engine change should raise
+request_queue_size alongside, and a worker-side server-log capture would
+have named the culprit (harness is read-only for the loop; noting, not
+fixing). The exp-0014 branch's measured engine-level 1.30x and its
+length-sorted packing survive as reusable groundwork on the
+exp-0014-batched-prefill ref.
