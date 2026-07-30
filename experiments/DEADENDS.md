@@ -222,3 +222,20 @@ queue/exp-0014-batched-prefill.log; server left wedged, next iteration
 likely owes that post-mortem once the ledger row lands) left no window for
 engine integration plus the ~25-min local TF pre-gate; per the budget rule
 the probe evidence is committed instead of a red or rushed spec.
+ADDENDUM (same iteration, arms J+K; logs t_fp4mma_realwt_exp0015_out.log,
+t_cutedsl_probe_exp0015_out.log in /workspace/logs): J — real-weight risk-(a)
+quantification on layer-3's real experts with the real input_amax (bf16
+scalar 4.375 -> input_scale 1.6276e-3; NOTE for the implementer: checkpoint
+`.scale` is ALREADY float8_e4m3fn [E,R,K/16], scale2 fp32 [256]): per-GEMM
+W4A4-vs-W4A16 delta rel_mean 9.5e-2, cos 0.9955, uniform 8/8 experts. This
+LOWERS the gate risk rather than raising it: the D11 goldens/D13 envelope
+come from vLLM running W4A4, so today's PASSING W4A16 engine (delta_mean
+0.05065 vs bar 0.0583) already carries the full A16-vs-A4 systematic
+difference through all 64 MoE layers — adopting the reference's A4 recipe
+moves the engine TOWARD the goldens, provided the quant recipe is
+vLLM-exact (block-16 e4m3 through input_scale = amax/(448*6), RTNE e2m1 via
+the hardware cvt). K — decode-port toolchain: CUTLASS DSL JITs AND runs on
+sm_103a (file-based only, no REPL), cutlass.utils.blockscaled_layout ships
+Sm103BlockScaledBasicChunk, and cute.nvgpu.tcgen05 exposes MmaMXF4NVF4Op /
+BlockScaledMmaOp — the grouped blockscaled decode kernel (exp-0015b) is
+toolchain-supported end to end.
