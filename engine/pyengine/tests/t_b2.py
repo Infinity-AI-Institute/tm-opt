@@ -2109,7 +2109,9 @@ def load_layer_weights(idx, hdr, dm, mc, L, dev=DEV, pack_moe=False):
                 w[key] = loader.PackedExperts(
                     pk, _disk(idx, eb + wname + ".scale").to(dev),
                     _disk(idx, eb + wname + ".scale2").to(dev),
-                    dm.group_size, deint)
+                    dm.group_size, deint,
+                    input_amax=_disk(
+                        idx, eb + wname + ".input_amax").float().max())
                 del pk
         else:
             gu = torch.empty(mc.n_experts, 2 * mc.expert_ffn, mc.hidden,
