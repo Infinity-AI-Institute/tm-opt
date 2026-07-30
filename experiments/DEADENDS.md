@@ -302,3 +302,37 @@ flagged in source for the integrator: divisibility_ab=32 for fp4 (K=6144,
 N=6144/3072 all satisfy); check per-group M handling ("scheduler handles
 fake dimensions by computing token_offset from offs") against ragged 1-2
 row decode segments early.
+
+## exp-0018-pipelined-prefill (rejected 2026-07-30 — INFRASTRUCTURE, not the
+## hypothesis; NO ledger row was written)
+Post-mortem (exp-0019's iteration, which found and cleared the cause). The
+worker never measured anything: its log stops after `git worktree add`, and
+600 s later `RuntimeError: engine never became healthy; see serve.log`. The
+engine server it launched died instantly — the worker's only child was an
+already-defunct `sh`, no CUDA context ever appeared on GPUs 4-7, and the
+verdict archived as `{"accepted": false, "reason": null}`. CAUSE: the
+PREVIOUS iteration's local D13 pre-gate server (PID 331687, `python -m
+engine.pyengine.server --port 8218`, started 16:45:21) was never killed when
+that iteration ended. It was reparented to init (PPID 1) and sat on GPUs 4-7
+holding 171-183 GiB of each of the four cards. The dispatcher handed
+exp-0018 to those same GPUs at 16:52 (worker pins CUDA_VISIBLE_DEVICES=
+4,5,6,7, harness/worker.py:43); the candidate server needs ~137 GiB/GPU of
+weights and got ~85-95 GiB of free memory, so it OOMed before writing a
+health endpoint. Killing the orphan at 16:56 returned all four cards to
+4 MiB, but wait_healthy's 600 s window had already been spent losing.
+THREE lessons, in order of cost. (1) A local pre-gate server is the loop's
+own property and MUST be killed inside the same foreground Bash call that
+starts it — a trap/kill pair, not a hope. exp-0019 ran its pre-gate that way
+and verified 4 MiB/GPU afterwards. Any iteration that leaks one silently
+destroys the NEXT experiment the dispatcher schedules, and the failure is
+maximally confusing because it appears as a fault in the innocent
+experiment's own code. (2) The failure mode is invisible from the queue log:
+serve.log lives inside the worker's root-owned worktree, which is removed by
+`git worktree remove --force` on the way out, so the OOM traceback is
+destroyed with it — exactly the "server-side trace is LOST" gap exp-0014's
+post-mortem already flagged. Diagnosis was only possible from live process
+state (PPID 1, zombie child, idle GPUs) because it was caught while running.
+(3) exp-0018's MECHANISM IS UNJUDGED and should be resubmitted unchanged:
+its D13 gate was green and bit-identical to the accepted rows, its serial-vs-
+pipelined token streams were exactly equal, and its two determinism arms
+passed — none of that was contradicted, and none of it was measured.
