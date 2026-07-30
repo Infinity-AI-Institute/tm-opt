@@ -521,3 +521,43 @@ CONSEQUENCES, in the order they bite.
     It is sequential by construction. Passing it says nothing about
     conc-64 group shapes, and two iterations in a row have read a green
     gate as "the tree runs".
+
+### exp-0027 addendum — the epilogue KERNEL is exonerated; look at the layer
+Written the same iteration, after the repro. `_moe_out_kernel` is the site
+the RuntimeError names, but a CUDA illegal access is sticky and asynchronous:
+`cuLaunchKernel` returns the error left by an EARLIER kernel, so the launch
+that reports it need not be the launch that caused it. Tested directly
+(engine/pyengine/tests/t_moe_out_cohort on the exp-0028 tree, GPU 7,
+CUDA_LAUNCH_BLOCKING=1, log /workspace/logs/t_moe_out_cohort_exp0029_out.log):
+the exact pair bookkeeping moe_experts_w4a4 builds, launched at every group
+shape the scheduler can form — B = min(64, PREFILL_SCORES_BUDGET/(128*Tmax^2))
+with Tmax over the canonical decode_heavy prompt range [512, 1536], i.e.
+T from 4,800 to 46,336, P to 278,016, m_cap to 310,528, c2 to 0.888 x 2^31
+elements, grids to (46336, 6). NO FAULT at any shape, and the fused-vs-eager
+value arm stays in the one-bf16-ulp class throughout (27 of 284,688,384 at
+the largest). So the kernel is clean at every shape the box can hand it, and
+the int32/int64 addressing worry is closed: it carries `row` in int64
+already, and the c2 element count peaks at 89% of 2^31 rather than over it.
+WHAT THAT LEAVES. The fault is upstream in the same MoE layer —
+nvfp4_quant_scatter, the two CUTE DSL grouped GEMMs, or nvfp4_quant_silu —
+and exp-0027 did not introduce it so much as EXPOSE it: the eager chain it
+deleted allocated ~26 GB of [P, K] fp32/bf16 transients per MoE layer, and
+removing them changes what the caching allocator hands out, so an
+out-of-bounds access that used to land inside a live cached block now lands
+on unmapped memory. That is a hypothesis, not a result; the arm that would
+settle it is `moe_experts_w4a4` end-to-end at cohort scale against real
+PackedExperts weights for ONE layer (~10 GB, one GPU, no server), with
+CUDA_LAUNCH_BLOCKING=1 and compute-sanitizer if the fault reproduces. It was
+not run here for budget: the session had ~20 minutes left and the exp-0028
+worker was squatting GPUs 4-7. NEXT ITERATION SHOULD RUN IT FIRST — it is
+cheap, it needs no model server, and until it lands there is a latent
+illegal access in the ACCEPTED tree that only the eager epilogue's
+allocation pressure is hiding.
+OPERATIONAL NOTE, verified live: when the engine thread dies the worker does
+NOT exit promptly — its 64 bench threads sit on requests the dead loop will
+never retire, so the worker hangs (exp-0027: 62 minutes wall against a
+~13-minute norm for exp-0024/0025/0026) while its server keeps ~175 GiB/GPU
+resident on GPUs 4-7. An iteration that finds the dispatcher "busy" for far
+longer than 13 minutes should read the worktree's serve.log BEFORE assuming
+the run is healthy; that file is the only copy of the trace and it dies with
+the worktree.
