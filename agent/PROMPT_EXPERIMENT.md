@@ -14,19 +14,37 @@ engines. If either is missing, write nothing and exit.
    write nothing, exit. The dispatcher is behind; more specs help nobody.
 3. Form ONE hypothesis: a single mechanism with a predicted effect on the
    canonical workload, grounded in a ledger observation or a roofline number,
-   not vibes. CURRENT STATE OF THE WORLD (2026-07-27): the engine runs
-   per-sequence batch-1 math (B3.3's honest bitwise design) at ~1.5 tok/s
-   aggregate; a 6145-token prefill takes 8.9 s — DECODE SERIALIZATION is the
-   entire iteration-0 gap. The ranked attack surface:
-     #1 batched/fused decode across co-resident sequences (bounded ≥780× just
-        to make the canonical protocol terminate; the invariance gate for
-        fused kernels is D13-style envelope, NOT bitwise — B3.1/B3.3 proved
-        bitwise unattainable across row counts),
-     #2 launch-overhead deletion (55×3 sconv launches/step, per-layer Python),
-     #3 skinny-expert MoE grouped-GEMM (N=3072, fused sigmoid/top6/norm),
-     #4 sconv fusion, #5 two-shape attention w/ fused rel-bias,
-     #6 scheduler specialization at conc 512, #7 Triton→CUDA ports,
-     #8 TP comm overlap, #9 topology A/B (2×TP=4 vs 8).
+   not vibes. CURRENT STATE OF THE WORLD (2026-07-30): decode_heavy best =
+   15.3 tok/s timeboxed(600s, conc=64) — 9.6x over start via batched decode
+   (iter 2), bit-exact Triton dequant (iter 3), conc-64 (iter 4), grouped
+   packed-NVFP4 MoE GEMM (iter 5, merged to main). Two findings BIND the
+   next hypotheses:
+   (a) conc 8->64 gained only +7% — per-step wall scales ~linearly with
+   tokens, so batch-amortizable work is nearly gone; (b) grouped GEMM
+   gained only +51% despite deleting the dominant MoE weight traffic —
+   the residual step wall is NOT weight traffic. Prime suspect: per-layer
+   Python + launch storm (66 layers x dozens of eager Triton/torch calls
+   per step) + the per-layer unique().tolist() device sync flagged in the
+   iter-5 hypothesis. The ranked attack surface (STEP B — kernel/dispatch
+   consolidation):
+     #1 PROFILE FIRST: one instrumentation-only experiment — time the
+        batched decode step's components at conc 64 (attention / sconv /
+        gate / expert GEMM / Python-between-kernels), write the breakdown
+        into the ledger row's hypothesis field; every later spec cites it.
+     #2 CUDA-graph or torch.compile the decode step (deletes Python
+        dispatch wholesale; likely the biggest single win),
+     #3 fused sconv (3 convs x 66 layers x step = launch storm),
+     #4 fused MoE gate (sigmoid+top6+norm in one kernel; kill the
+        unique().tolist() sync),
+     #5 two-shape attention w/ fused rel-bias,
+     #6 conc 64->128->256 re-pushes AFTER dispatch overhead falls
+        (they were blocked by per-token wall before; may not be after),
+     #7 chunked prefill, #8 scheduler specialization at conc 512,
+     #9 TP comm overlap, #10 topology A/B (2xTP=4 vs 8).
+   Determinism rule for CUDA graphs / compiled paths: same-schedule
+   bitwise repeatability still binds (D13 envelope + the t_b3 batch
+   determinism arm) — capture/compile must not introduce run-to-run
+   nondeterminism.
 4. Implement it in a worktree: `git worktree add experiments/wt-<id> main`,
    change the ONE thing, keep the diff minimal and inside engine/.
 5. Local pre-gate (cheap, GPUs 4-7): run the D13 teacher-forced parity check
@@ -40,7 +58,11 @@ engines. If either is missing, write nothing and exit.
    `experiments/example_spec.json`, with fields REQUIRED by
    docs/LEDGER_SCHEMA.md: `label` (2-4 words, chart hover title) and
    `mechanism` (one line, chart hover subtitle), plus hypothesis, predicted
-   delta, worktree ref, commit.
+   delta, worktree ref, commit. AUTHOR THE SPEC OUTSIDE queue/ AND mv IT IN
+   (atomic — the dispatcher polls every 15 s and must never see a
+   half-written file). Before writing the spec, verify your commit contains
+   current main: `git merge-base --is-ancestor main <your-commit>` must
+   succeed — a spec pinning a pre-merge ref measures a stale engine.
 7. Commit the worktree + spec:
    `git add <files> && git commit -m "[ralph] exp(<id>): <hypothesis in 5-8 words>"`
    — the [ralph] prefix is MANDATORY on every commit you make, and <id>
