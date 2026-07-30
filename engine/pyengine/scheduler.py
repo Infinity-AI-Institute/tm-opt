@@ -24,6 +24,8 @@ semantics (no early exit — a request runs to its max_new, D6/P1), text
 only. The B3.4 server maps wall-clock arrivals onto step boundaries via
 Scheduler.submit(arrival_step=...) and consumes completions through the
 on_retire callback."""
+import bisect
+
 import torch
 
 from engine.pyengine import kv as pkv
@@ -84,13 +86,58 @@ class Engine:
         self.mc = mc
         self.num_pages = num_pages
         self._masks = {}
+        self._pools = None       # per-layer batch pools (exp-0007)
+        self._pool_batch = None
 
-    def new_states(self):
-        """Fresh per-layer recurrent state on each layer's own device."""
+    def init_pools(self, max_batch):
+        """exp-0007: per-layer batch pools for the batched decode
+        attention core — kv.SwaPool (rings as rows) on the 55 SWA layers,
+        kv.GlobalPool (shared pages + device table mirror) on the 11
+        global layers. Total capacity equals max_batch per-seq LayerKVs,
+        so the KV footprint at full occupancy is unchanged; idempotent
+        per max_batch (the t_batched arms reuse one engine)."""
+        if self._pools is not None and self._pool_batch == max_batch:
+            return
+        mc = self.mc
+        self._pools = []
+        for L in range(mc.num_layers):
+            dev = self.layers[L]["attn_norm"].device
+            if L in mc.global_layers:
+                self._pools.append(pkv.GlobalPool(
+                    max_batch, self.num_pages, pkv.PAGE_SIZE, mc.g_kv_heads,
+                    mc.head_dim, dev))
+            else:
+                self._pools.append(pkv.SwaPool(
+                    max_batch, mc.window, mc.s_kv_heads, mc.head_dim, dev))
+        self._pool_batch = max_batch
+
+    def new_states(self, slot=None):
+        """Fresh per-layer recurrent state on each layer's own device.
+        `slot` (scheduler admission, exp-0007) backs the caches on the
+        batch pools so the batched decode core can index them — the
+        per-seq append/gather code paths are unchanged either way
+        (views over pool storage, kv.py)."""
         #1. LayerKV picks ring vs paged from the layer type (B3.1)
+        if slot is None:
+            return [pkv.LayerKV(self.mc, L,
+                                self.layers[L]["attn_norm"].device,
+                                num_pages=self.num_pages)
+                    for L in range(self.mc.num_layers)]
         return [pkv.LayerKV(self.mc, L, self.layers[L]["attn_norm"].device,
-                            num_pages=self.num_pages)
+                            num_pages=self.num_pages, pool=self._pools[L],
+                            slot=slot)
                 for L in range(self.mc.num_layers)]
+
+    def release_states(self, states):
+        """Return a retiring sequence's shared-pool pages (table order —
+        deterministic given the schedule). Ring/sconv rows need no
+        action: the next occupant overwrites them, and the batched core
+        masks dead slots (kv.SwaPool docstring)."""
+        #1. global layers hand their pages back to the shared free list
+        for st in states:
+            if st.is_global and st.cache.table_dev_row is not None:
+                st.cache.free.extend(st.cache.table)
+                st.cache.table = []
 
     def _mask_pos(self, dev, n):
         #1. (full, window, positions) per (device, length), built once —
@@ -171,12 +218,32 @@ class Engine:
                             device=self.w_emb.device)
         _, h = pmodel.embed(prev, self.w_emb, self.w_en, eps=mc.rms_eps)
         pos = [r.ids.shape[0] - 1 + len(r.tokens) for r in reqs]
-        #2. 66 batched layers; the [B, hidden] rows hop devices together
+        #2. pooled path (exp-0007): per-step per-device shared indexing,
+        #   built once and reused by every layer on that device; requests
+        #   admitted without a pool slot fall back to the per-row core
+        slots = [r.states[0].slot for r in reqs]
+        ctxs = {}
+        if self._pools is not None and None not in slots:
+            for L in range(mc.num_layers):
+                dev = self.layers[L]["attn_norm"].device
+                if dev not in ctxs:
+                    ctxs[dev] = pmodel.decode_batch_ctx(pos, slots, mc, dev,
+                                                        pkv.PAGE_SIZE)
+        #3. 66 batched layers; the [B, hidden] rows hop devices together
         for L in range(mc.num_layers):
+            dev = self.layers[L]["attn_norm"].device
             h = pmodel.layer_decode_batch(
-                h.to(self.layers[L]["attn_norm"].device), self.layers[L],
-                [r.states[L] for r in reqs], pos, mc, L)
-        #3. one final-logits GEMM; per-row fp32 argmax + optional capture
+                h.to(dev), self.layers[L],
+                [r.states[L] for r in reqs], pos, mc, L,
+                ctx=ctxs.get(dev),
+                pool=self._pools[L] if ctxs else None)
+        #4. pooled appends bypass RingKV/PagedKV.append — keep the host-
+        #   side per-seq token counters truthful (release/gather safety)
+        if ctxs:
+            for r in reqs:
+                for st in r.states:
+                    st.cache.n += 1
+        #5. one final-logits GEMM; per-row fp32 argmax + optional capture
         rows = pmodel.final_logits(h, self.w_fn, self.w_un, mc.logits_mult,
                                    mc.vocab_unpadded, eps=mc.rms_eps)
         out = []
@@ -211,6 +278,11 @@ class Scheduler:
         self.step_count = 0
         self.peak_running = 0
         self._seq = 0
+        #2. batch pools + slot free list (exp-0007): admission takes the
+        #   lowest free slot, retire returns it — deterministic; slot ids
+        #   only pick pool rows, never batch order (= admission order)
+        engine.init_pools(max_batch)
+        self._free_slots = list(range(max_batch))
 
     def submit(self, req, arrival_step=0):
         """Queue a request; it becomes admissible at `arrival_step`."""
@@ -230,7 +302,8 @@ class Scheduler:
                 break
             self.waiting.remove(entry)
             req = entry[2]
-            req.states = self.engine.new_states()
+            req.states = self.engine.new_states(
+                slot=self._free_slots.pop(0))
             req.admit_step = self.step_count
             self.running.append(req)
             req.tokens.append(self.engine.prefill(req))
@@ -244,12 +317,18 @@ class Scheduler:
             for req, tok in zip(todo, self.engine.decode_batch(todo)):
                 req.tokens.append(tok)
         #3. retire finished sequences; free their KV after the callback
+        #   (shared-pool pages + batch slot go back to their free lists —
+        #   insertion keeps the slot list sorted, so admission stays
+        #   lowest-slot-first deterministic)
         still_running = []
         for req in self.running:
             if req.done:
                 req.finish_step = self.step_count
                 if self.on_retire is not None:
                     self.on_retire(req)
+                if req.states[0].slot is not None:
+                    self.engine.release_states(req.states)
+                    bisect.insort(self._free_slots, req.states[0].slot)
                 req.states = None
                 self.finished.append(req)
             else:

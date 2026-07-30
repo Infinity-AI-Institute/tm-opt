@@ -594,21 +594,158 @@ def attn_decode_batch(x, wq, wk, wv, wr, wo, w_k_sconv, w_v_sconv, w_q_norm,
     return F.linear(torch.cat(outs, dim=0), wo)
 
 
-def layer_decode_batch(x, w, states, pos, mc, layer_idx):
+def decode_batch_ctx(pos, slots, mc, device, page_size):
+    """exp-0007: per-STEP, per-DEVICE indexing for the pooled batched
+    decode attention core (attn_decode_batch_pooled) — built once and
+    shared by every layer of a type on that device, so the per-layer
+    enqueue cost is ~20 batched ops instead of ~20 x B per-row chains
+    (exp-0005: attn_core = 1646 ms of the 1989 ms step at B=64, host-
+    enqueue-bound). pos/slots are host int lists in batch-row order
+    (= admission order); everything here is a pure function of the
+    schedule, so same-schedule bitwise determinism holds."""
+    B = len(pos)
+    pos_t = torch.tensor(pos, device=device)
+    n = pos_t + 1                        # post-append cache lengths
+    #1. SWA ring geometry (kv.RingKV slot rule: position p sits at
+    #   p % window): slot s holds p = base + ((s - base) mod window),
+    #   base = max(0, n - window); live iff p < n. dist = q_pos - p is in
+    #   [0, window) exactly on live slots, negative on dead ones.
+    s = torch.arange(mc.window, device=device)[None, :]
+    base = (n - mc.window).clamp_min(0)[:, None]
+    p = base + ((s - base) % mc.window)
+    #2. global padded-gather geometry: logical positions 0..Lg-1 with
+    #   rows shorter than Lg masked; per-layer flat slots come from each
+    #   layer's device page table (attn_decode_batch_pooled #3)
+    Lg = max(pos) + 1
+    j = torch.arange(Lg, device=device)
+    return {"B": B, "pos": pos_t,
+            "slots": torch.tensor(slots, device=device), "pos_host": pos,
+            "ring_slot": pos_t % mc.window, "swa_valid": p < n[:, None],
+            "swa_dist": pos_t[:, None] - p, "Lg": Lg,
+            "g_pageidx": j // page_size, "g_off": j % page_size,
+            "g_valid": j[None, :] < n[:, None],
+            "g_dist": pos_t[:, None] - j[None, :]}
+
+
+def attn_decode_batch_pooled(x, wq, wk, wv, wr, wo, w_k_sconv, w_v_sconv,
+                             w_q_norm, w_k_norm, rel_proj, states, pool,
+                             ctx, head_dim, is_global, alpha=None,
+                             n_floor=None, eps=1e-6):
+    """One attention layer, POOLED batched decode form (exp-0007) — the
+    per-row Python core of attn_decode_batch collapsed into per-layer
+    batched ops over the layer's batch pool (kv.SwaPool / kv.GlobalPool).
+    Per-row op ORDER is attn_decode's exactly (project -> k/v sconv ->
+    q/k rmsnorm -> append -> rel bias -> tau -> GQA scores -> fp32
+    softmax -> @V -> o_proj); what changes is HOW rows are traversed:
+    one broadcast matmul over [B, n_kv, rep, 1, L] instead of B loop
+    iterations, dead key slots excluded by SELECTION (masked_fill with
+    the eager mask constant — a stale pool row can hold any finite
+    stale value, so overwrite, never add) exactly where the per-seq
+    gather simply omitted them. bf16 kernel tiling differs from the
+    per-row form, so per-token bits may drift within the D13 envelope
+    (B3.1/B3.3 semantics); shapes and index tensors are pure functions
+    of the schedule, so same-schedule bitwise determinism holds."""
+    F = torch.nn.functional
+    B = ctx["B"]
+    n_heads, n_kv = wq.shape[0] // head_dim, wk.shape[0] // head_dim
+    #1. shared-weight projections; k/v raw through their per-row sconv
+    #   rings (ring rolls stay per-row — attack #3 is a separate spec)
+    q = F.linear(x, wq)
+    k = sconv_decode_batch(F.linear(x, wk), w_k_sconv,
+                           [s.k_ring for s in states])
+    v = sconv_decode_batch(F.linear(x, wv), w_v_sconv,
+                           [s.v_ring for s in states])
+    r = F.linear(x, wr)
+    #2. per-head q/k rmsnorm across the whole batch (rowwise op)
+    q = rmsnorm(q.view(B, n_heads, head_dim), w_q_norm, eps)
+    k = rmsnorm(k.view(B, n_kv, head_dim), w_k_norm, eps)
+    v = v.view(B, n_kv, head_dim)
+    slots = ctx["slots"]
+    #3. batched append + batched key-set fetch from the layer pool
+    if is_global:
+        #3a. page allocation is host-side (page tables + free list are
+        #    host state; ensure_pages mirrors new ids on-device), then
+        #    ONE index_put_ appends all rows, ONE gather fetches the
+        #    padded [B, Lg] key set — no .tolist() anywhere
+        ps = pool.page_size
+        for b, st in enumerate(states):
+            st.cache.ensure_pages(ctx["pos_host"][b] // ps)
+        table = pool.table_dev[slots]                      # [B, num_pages]
+        flat_new = (table.gather(1, (ctx["pos"] // ps)[:, None])[:, 0] * ps
+                    + ctx["pos"] % ps)
+        pool.kp.view(-1, n_kv, head_dim)[flat_new] = k
+        pool.vp.view(-1, n_kv, head_dim)[flat_new] = v
+        valid, dist, L = ctx["g_valid"], ctx["g_dist"], ctx["Lg"]
+        flat = table[:, ctx["g_pageidx"]] * ps + ctx["g_off"][None, :]
+        flat = torch.where(valid, flat, torch.zeros_like(flat))
+        K = pool.kp.view(-1, n_kv, head_dim)[flat]         # [B, L, H, D]
+        V = pool.vp.view(-1, n_kv, head_dim)[flat]
+    else:
+        pool.k[slots, ctx["ring_slot"]] = k
+        pool.v[slots, ctx["ring_slot"]] = v
+        valid, dist = ctx["swa_valid"], ctx["swa_dist"]
+        L = pool.k.shape[1]
+        K = pool.k[slots]                                  # [B, 512, H, D]
+        V = pool.v[slots]
+    #4. rel bias over the whole (row, key-slot) grid — rel_bias's exact
+    #   math batched: mix profiles, gather at the clamped backward
+    #   distance, zero out-of-band (dead slots have dist < 0)
+    extent = rel_proj.shape[1]
+    rel_logits = (r.view(B, 1, n_heads, -1) @ rel_proj).transpose(1, 2)
+    gidx = dist.clamp(0, extent - 1)[:, None, None, :].expand(
+        B, n_heads, 1, L)
+    bias = rel_logits.gather(-1, gidx).masked_fill(
+        ((dist < 0) | (dist >= extent))[:, None, None, :], 0.0)
+    #5. tau round-trip on global layers (== 1.0 below the 128000 floor,
+    #   applied unconditionally like the ref; apply_log_scaling's op
+    #   order with per-row scalars)
+    if is_global and n_floor is not None:
+        tau = log_scale_tau(ctx["pos"], alpha, n_floor)
+        q = (q.float() * tau[:, None, None]).to(q.dtype)
+        bias = (bias.float() * tau[:, None, None, None]).to(bias.dtype)
+    #6. GQA via views (head h -> kv group h // rep, the repeat_kv map):
+    #   ONE broadcast matmul for scores, bias added in attn_decode's
+    #   association order, dead slots overwritten with the eager mask
+    #   constant, fp32 softmax, @V, o_proj
+    rep = n_heads // n_kv
+    qh = q.view(B, n_kv, rep, 1, head_dim)
+    kh = K.permute(0, 2, 3, 1)[:, :, None]                 # [B,n_kv,1,D,L]
+    attn = torch.matmul(qh, kh) * (1.0 / head_dim)
+    attn = attn + bias.view(B, n_kv, rep, 1, L)
+    attn = attn.masked_fill(~valid[:, None, None, None, :],
+                            torch.finfo(attn.dtype).min)
+    attn = F.softmax(attn, dim=-1, dtype=torch.float32).to(qh.dtype)
+    vh = V.permute(0, 2, 1, 3)[:, :, None]                 # [B,n_kv,1,L,D]
+    out = torch.matmul(attn, vh).reshape(B, n_heads * head_dim)
+    return F.linear(out, wo)
+
+
+def layer_decode_batch(x, w, states, pos, mc, layer_idx, ctx=None,
+                       pool=None):
     """One full decoder layer, BATCHED decode form — layer_decode's exact
     op order with the layer's weights read ONCE for all B rows: norms,
     projections and the MLP half run as B-row batches (dense_mlp / moe
     already take a flattened [T, hidden] token batch — the rows ride
     through natively, sharing expert weight reads across sequences); the
-    attention core and the four sconv ring updates stay per-sequence."""
+    attention core and the four sconv ring updates stay per-sequence —
+    unless `ctx` + `pool` are given (exp-0007: the scheduler's pooled
+    states), which routes attention through the per-layer batched core
+    attn_decode_batch_pooled."""
     is_global = layer_idx in mc.global_layers
     #1. attention half: batched pre-norm + attention, batched attn_sconv
     h = rmsnorm(x, w["attn_norm"], mc.rms_eps)
-    h = attn_decode_batch(h, w["wq"], w["wk"], w["wv"], w["wr"], w["wo"],
-                          w["ksc"], w["vsc"], w["qn"], w["kn"], w["proj"],
-                          states, pos, mc.head_dim, is_global,
-                          alpha=mc.log_alpha, n_floor=mc.log_floor,
-                          eps=mc.rms_eps)
+    if ctx is not None:
+        h = attn_decode_batch_pooled(
+            h, w["wq"], w["wk"], w["wv"], w["wr"], w["wo"], w["ksc"],
+            w["vsc"], w["qn"], w["kn"], w["proj"], states, pool, ctx,
+            mc.head_dim, is_global, alpha=mc.log_alpha,
+            n_floor=mc.log_floor, eps=mc.rms_eps)
+    else:
+        h = attn_decode_batch(
+            h, w["wq"], w["wk"], w["wv"], w["wr"], w["wo"], w["ksc"],
+            w["vsc"], w["qn"], w["kn"], w["proj"], states, pos,
+            mc.head_dim, is_global, alpha=mc.log_alpha,
+            n_floor=mc.log_floor, eps=mc.rms_eps)
     h = sconv_decode_batch(h, w["attn_sconv"],
                            [s.attn_ring for s in states])
     x = x + h
