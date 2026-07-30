@@ -406,3 +406,40 @@ inside the grouped walk, not just the 66-layer loop. (2) The cheap lever,
 which exp-0021 submits, is to spend that idle device time on the OTHER
 traversal: issue the graphed decode step FIRST and read it back after the
 prefill Python.
+
+## exp-0021 REJECTED at 223.5 (bar 223.6) — the mixed-step share is real
+## but small, and the prefill host-bound reading is NOT established
+Ledger iter 22: 223.5 tok/s vs best 222.9 + 0.3% = 223.6. It missed by
+0.1 tok/s — 0.04% — so the mechanism is not wrong, it is thin: the +124 ms
+it measured on a MIXED step (t_decode_first, interleaved arms, repeats
+agreeing to 1 ms) bought +0.27% in the box instead of the predicted +3.7%,
+which prices the mixed-step share of the canonical box at roughly a tenth
+of the cohort model's ~180 steps. Two lessons, and the second is the
+load-bearing one.
+(1) Three consecutive experiments (exp-0018, exp-0020, exp-0021) have now
+    been rejected attacking the ORDER in which prefill and decode work is
+    handed to the GPUs. That line is closed: the box does not have enough
+    mixed steps for issue-order to pay. Do not re-open it.
+(2) The diagnosis those experiments leaned on — "the prefill traversal is
+    HOST-bound, the GPUs are idle for essentially all of it" (arm b of
+    t_traversal_sync_probe: 696 ms host enqueue, 0.1 ms device tail) — does
+    NOT follow from that arm. A host thread that outruns the CUDA launch
+    queue BLOCKS INSIDE cudaLaunchKernel, so "time from call to return"
+    counts device time it was waiting on, and a 0.1 ms tail only says the
+    LAST device in the layer-split pipeline had caught up by the end, which
+    is exactly what a serial 4-stage pipeline does. Counting the host ops a
+    prefill layer actually issues (~170 + 15 per row, ~14k per 3-row
+    traversal) puts pure dispatch at ~200-300 ms of that 696 ms, not 696.
+    The arm that would settle it is per-device GPU-BUSY time (CUDA events
+    bracketing each device's segment, or a profiler kernel-time total), and
+    it has still not been run. Until it is, "delete Python from the prefill
+    traversal" is an unsized lever, and the exp-0012 treatment applied to
+    prefill (CUDA-graphing a shape-bucketed traversal, a large and
+    memory-hungry change) should NOT be started on the strength of arm b
+    alone. exp-0022 goes at prefill and decode from the other side —
+    deleting DEVICE work that is there under either reading.
+Also killed cheaply this iteration, before it cost a submission: the CUTE
+DSL marshalling hypothesis (that _run_gemm's five cutlass_torch.from_dlpack
+conversions per GEMM were a large part of the per-layer host cost).
+Measured on CPU tensors of the prefill shapes: 5.7-6.8 us per conversion,
+i.e. ~60 us per layer, ~4 ms per traversal. Not the fat. Do not re-propose.
