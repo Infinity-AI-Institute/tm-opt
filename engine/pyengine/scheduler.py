@@ -22,18 +22,40 @@ because batch composition per step is a pure function of the schedule
 that A/B (t_batched evidence script). Chunked prefill (an arrival not
 stalling running decodes) remains deferred; the seam is Engine.prefill.
 
+TRAVERSALS PIPELINE ACROSS THE LAYER-SPLIT DEVICES (exp-0018). The model
+is sharded by contiguous layer segments over the 4 GPUs (server
+build_resident), so ONE traversal keeps exactly one GPU busy and idles the
+other three — measured as a marching 100/0/0/0 utilization wave under the
+live canonical bench (/workspace/logs/t_pipeline_bubble_exp0018_util.log).
+Every device->host sync inside a traversal pins the host to that device's
+progress and stops the NEXT traversal from being handed over, so the four
+segments could never overlap. This module deletes the syncs a step owns —
+device-side page lookup in kv.PagedKV._flat_slots, and the prefill
+readbacks deferred past the decode traversal below — so a step's prefill
+and decode traversals occupy different GPUs at the same time. Per-sequence
+numerics are UNCHANGED (identical kernels, shapes and op order; only host
+enqueue interleaving moves), so both D13 arms carry over as they stand.
+Kill switch: PYENGINE_PIPELINE_PREFILL=0.
+
 Scope: greedy only (canonical workloads are greedy, P1), ignore_eos
 semantics (no early exit — a request runs to its max_new, D6/P1), text
 only. The B3.4 server maps wall-clock arrivals onto step boundaries via
 Scheduler.submit(arrival_step=...) and consumes completions through the
 on_retire callback."""
 import bisect
+import os
 
 import torch
 
 from engine.pyengine import graphrun
 from engine.pyengine import kv as pkv
 from engine.pyengine import model as pmodel
+
+# exp-0018 kill switch: PYENGINE_PIPELINE_PREFILL=0 restores the serial
+# admit -> prefill -> readback loop unchanged. Read once at import, like
+# exp-0013's _FUSED_ATTN — it must be constant for the process lifetime so
+# every step of a run has the same scheduling shape.
+_PIPELINE = os.environ.get("PYENGINE_PIPELINE_PREFILL", "1") != "0"
 
 
 class Request:
@@ -165,9 +187,17 @@ class Engine:
         return self._masks[key]
 
     @torch.no_grad()
-    def prefill(self, req):
-        """Whole-prompt prefill populating req.states; returns the first
-        greedy token (generate_greedy's prefill form, model.py)."""
+    def prefill_enqueue(self, req):
+        """exp-0018: prefill()'s traversal with NO host readback — every op
+        below is prefill()'s, in prefill()'s order, and the fp32 last-
+        position logits row is returned STILL ON DEVICE. Nothing in here
+        syncs any more (the global layers' page lookups went device-side,
+        kv.PagedKV._flat_slots), so the host runs straight on to enqueue
+        the next traversal while device 0 is still executing this one and
+        devices 1-3 pick their segments up as the hidden state reaches
+        them. Per-sequence numerics are untouched: identical kernels,
+        identical shapes, identical op order — only when the HOST hands
+        the work over moves."""
         mc = self.mc
         #1. embed -> 66 x layer_prefill(state=...) across the layer devices
         _, h = pmodel.embed(req.ids[None], self.w_emb, self.w_en,
@@ -179,17 +209,32 @@ class Engine:
                 h.to(dev), self.layers[L],
                 full if L in mc.global_layers else win, p, mc, L,
                 state=req.states[L])
-        #2. last-position logits -> fp32 argmax over the unpadded vocab
-        #   (the B2.11 comparison form, generate_greedy's _pick); optional
-        #   fp32-row capture (B3.4 logprobs, generate_greedy's capture=
-        #   pattern — a read-only CPU copy, token math untouched)
+        #2. last-position logits over the unpadded vocab, fp32, on device
+        #   (the B2.11 comparison form, generate_greedy's _pick)
         row = pmodel.final_logits(h[:, -1], self.w_fn, self.w_un,
                                   mc.logits_mult, mc.vocab_unpadded,
                                   eps=mc.rms_eps)[0]
-        lg = row.float()
+        return row.float()
+
+    def prefill_pick(self, req, lg):
+        """The readback half of prefill_enqueue / prefill_batch_enqueue:
+        the first host sync that touches that traversal. Optional fp32-row
+        capture (B3.4 logprobs, generate_greedy's capture= pattern — a
+        read-only CPU copy, token math untouched)."""
+        #1. the same two host reads prefill() always did, in that order
         if req.capture is not None:
             req.capture.append(lg.cpu())
         return int(lg.argmax())
+
+    @torch.no_grad()
+    def prefill(self, req):
+        """Whole-prompt prefill populating req.states; returns the first
+        greedy token (generate_greedy's prefill form, model.py). Kept as
+        the enqueue+readback composition so every non-scheduler caller
+        (tests, the Engine.decode reference arm) keeps a synchronous,
+        bitwise-unchanged entry point."""
+        #1. traversal, then the readback that ends it
+        return self.prefill_pick(req, self.prefill_enqueue(req))
 
     # exp-0009: padded-scores budget for grouped prefill — bytes of the
     # bf16 [B, heads, Tmax, Tmax] attention-score tensor one layer
@@ -200,6 +245,20 @@ class Engine:
     # beside weights + pools, and sends long-ISL prompts (prefill_heavy,
     # 8K: any pair already exceeds the budget) down the unchanged path.
     PREFILL_SCORES_BUDGET = 4 << 30
+
+    @torch.no_grad()
+    def prefill_batch_enqueue(self, reqs):
+        """exp-0018: prefill_batch()'s traversal with NO host readback —
+        returns the per-row fp32 logits rows still on device (see
+        prefill_enqueue for why: the traversal must be handed over without
+        pinning the host, so the next traversal — this step's decode —
+        reaches the devices this one has already walked past). A group of
+        1 falls through to prefill_enqueue, exactly as prefill_batch falls
+        through to prefill."""
+        if len(reqs) == 1:
+            return [self.prefill_enqueue(reqs[0])]
+        #1. prefill_batch's own traversal, sliced before its readback
+        return list(self._prefill_batch_rows(reqs))
 
     @torch.no_grad()
     def prefill_batch(self, reqs):
@@ -216,9 +275,19 @@ class Engine:
         bitwise the existing path (the sequential D13 gate only ever
         forms singleton groups). Batched rows carry the row-count bf16
         accumulation drift class of decode_batch (B3.1/B3.3; D13
-        envelope + same-schedule determinism are the binding gates)."""
+        envelope + same-schedule determinism are the binding gates).
+        Kept as the enqueue+readback composition (exp-0018) so callers
+        outside the scheduler keep a synchronous entry point."""
         if len(reqs) == 1:
             return [self.prefill(reqs[0])]
+        #1. the traversal, then the per-row readbacks that ended it
+        return [self.prefill_pick(r, lg)
+                for r, lg in zip(reqs, self._prefill_batch_rows(reqs))]
+
+    @torch.no_grad()
+    def _prefill_batch_rows(self, reqs):
+        """prefill_batch's grouped traversal, up to but excluding its host
+        readbacks; returns the per-row fp32 logits rows on device."""
         mc = self.mc
         lens = [r.ids.shape[0] for r in reqs]
         B, Tmax = len(reqs), max(lens)
@@ -237,19 +306,12 @@ class Engine:
                 h.to(dev), self.layers[L],
                 full if L in mc.global_layers else win, p, mc, L,
                 states=[r.states[L] for r in reqs], lens=lens)
-        #3. per-row logits at the row's LAST REAL position -> fp32 argmax
-        #   + optional capture (prefill()'s form, per row)
+        #3. per-row logits at the row's LAST REAL position, fp32, on device
         last = torch.tensor([n - 1 for n in lens], device=h.device)
         rows = pmodel.final_logits(
             h[torch.arange(B, device=h.device), last], self.w_fn,
             self.w_un, mc.logits_mult, mc.vocab_unpadded, eps=mc.rms_eps)
-        out = []
-        for i, req in enumerate(reqs):
-            lg = rows[i].float()
-            if req.capture is not None:
-                req.capture.append(lg.cpu())
-            out.append(int(lg.argmax()))
-        return out
+        return [rows[i].float() for i in range(B)]
 
     @torch.no_grad()
     def decode(self, req):
@@ -394,19 +456,37 @@ class Scheduler:
                 slot=self._free_slots.pop(0))
             req.admit_step = self.step_count
             admits.append(req)
+        #1b. exp-0018: the groups' traversals are only ENQUEUED here; the
+        #   readbacks that end them are deferred to #2b, so no host sync
+        #   sits between them and the decode traversal below and the four
+        #   layer-split segments of successive traversals overlap
+        pending = []
         for group in self._prefill_groups(admits):
-            for req, tok in zip(group, self.engine.prefill_batch(group)):
-                req.tokens.append(tok)
+            if _PIPELINE:
+                pending.append(
+                    (group, self.engine.prefill_batch_enqueue(group)))
+            else:
+                for req, tok in zip(group, self.engine.prefill_batch(group)):
+                    req.tokens.append(tok)
         self.running.extend(admits)
         self.peak_running = max(self.peak_running, len(self.running))
         #2. one decode token for every sequence admitted in a PRIOR step —
         #   all decodable co-residents advance through ONE batched stack
         #   traversal; running-list (= admission) order fixes the row order
+        #   This step's admissions are excluded by construction
+        #   (admit_step == step_count), so the decode traversal reads none
+        #   of the tokens #2b is still holding, and it walks disjoint pool
+        #   slots — which is why it may be enqueued behind the prefills.
         todo = [req for req in self.running
                 if req.admit_step < self.step_count and not req.done]
         if todo:
             for req, tok in zip(todo, self.engine.decode_batch(todo)):
                 req.tokens.append(tok)
+        #2b. exp-0018: collect the deferred prefill tokens — group order
+        #   then row order, i.e. the admission order #1b appended in
+        for group, rows in pending:
+            for req, lg in zip(group, rows):
+                req.tokens.append(self.engine.prefill_pick(req, lg))
         #3. retire finished sequences; free their KV after the callback
         #   (shared-pool pages + batch slot go back to their free lists —
         #   insertion keeps the slot list sorted, so admission stays
