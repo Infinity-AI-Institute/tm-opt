@@ -65,6 +65,17 @@ def _mkreqs(eng, dev0, ids, slot0):
     return out
 
 
+class _ListFree(list):
+    """The PRE-exp-0024 free list: a plain Python list whose head-pop is
+    list.pop(0), i.e. the O(len) memmove. Exposed under the popleft() name
+    so kv.ensure_pages' single call site is the only thing that differs
+    between the arms (the extra bound-method call is ~0.1 us against the
+    7.7 us being measured)."""
+
+    def popleft(self):
+        return self.pop(0)
+
+
 def _sync_all():
     for d in range(torch.cuda.device_count()):
         torch.cuda.synchronize(d)
@@ -96,8 +107,8 @@ def main():
           flush=True)
     ids = _prompts(GROUP, 2024)
     npool = _reset_pools(eng, collections.deque)
-    print(f"[t0024] {npool} global pools, "
-          f"{eng._pools[0].kp.shape[0] - 1 if npool else 0} pages each; "
+    gp = next(p for p in eng._pools if hasattr(p, "free"))
+    print(f"[t0024] {npool} global pools, {len(gp.free)} free pages each; "
           f"group {GROUP} rows, lens {LENS[:GROUP]}", flush=True)
 
     #1. warm — JIT/autotune must not land inside a timed arm
@@ -112,7 +123,8 @@ def main():
     #   both arms see the canonical free-list length, not a drained one
     res = {"deque": [], "list": []}
     for rep in range(REPS):
-        for name, kind in (("deque", collections.deque), ("list", list)):
+        for name, kind in (("deque", collections.deque),
+                           ("list", _ListFree)):
             _reset_pools(eng, kind)
             g = _mkreqs(eng, dev0, ids, 8)
             _sync_all()
