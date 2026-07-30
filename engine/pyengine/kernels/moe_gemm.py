@@ -42,6 +42,22 @@ import triton.language as tl
 BLOCKS = (16, 128, 128)  # BLOCK_M, BLOCK_N, BLOCK_K
 NUM_WARPS = 4
 NUM_STAGES = 3
+#exp-0009: PREFILL-scale calls get BLOCK_M 32. The kernels re-dequantize
+#the full weight tile per (expert, n-tile, k-chunk, M-CHUNK), so total
+#in-register dequant ALU work per expert = ceil(rows/BLOCK_M) x the full
+#matrix — at prefill (~17-24 rows/expert, ~all 256 experts hit) that ALU
+#term is 93% of the whole per-seq prefill wall (exp-0009 profile,
+#/workspace/logs/t_prefill_profile_exp0009_2026-07-30.log) and BLOCK_M 16
+#pays it twice. Sweep on synthetic checkpoint-shape packs (t_moe_config_
+#sweep2 log, 10 reps): T=736 19.9 -> 13.5 ms, T=1018 25.0 -> 14.0 ms;
+#T=64 would REGRESS 10.1 -> 10.5 ms, and BLOCK_M 64 hits an LLVM
+#"Illegal shared layout" on sm_103a — hence conditional, not global.
+#The threshold is a pure function of the call shape (pair count P =
+#T*top_k): P >= 2048 <=> T >= 342 — every prefill (T >= 512) qualifies,
+#no decode batch can (B <= 256 co-residents -> P <= 1536), so decode-
+#scale calls keep the exp-0003 specialization BIT-IDENTICALLY.
+BLOCKS_PREFILL = (32, 128, 128)
+PREFILL_MIN_PAIRS = 2048
 
 
 @triton.jit
@@ -214,7 +230,7 @@ def moe_experts_packed(x, pack13, pack2, topk_indices, topk_weights):
     P = flat.shape[0]
     act = torch.empty(P, ffn, device=x.device, dtype=torch.bfloat16)
     out_pairs = torch.empty(P, K, device=x.device, dtype=torch.bfloat16)
-    BM, BN, BK = BLOCKS
+    BM, BN, BK = BLOCKS if P < PREFILL_MIN_PAIRS else BLOCKS_PREFILL
     #3. launch on the pack's own device — layers live spread across 4 GPUs
     #   and Triton launches on the CURRENT device (exp-0002 lesson)
     with torch.cuda.device(x.device):
