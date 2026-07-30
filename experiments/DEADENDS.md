@@ -267,3 +267,18 @@ have named the culprit (harness is read-only for the loop; noting, not
 fixing). The exp-0014 branch's measured engine-level 1.30x and its
 length-sorted packing survive as reusable groundwork on the
 exp-0014-batched-prefill ref.
+ADDENDUM 2 (arm L): the shared prerequisite for BOTH exp-0015a/b is built
+and validated — /workspace/logs/fp4_quant_groundwork_exp0015.py (self-test
+output fp4_quant_groundwork_exp0015_out.log): a Triton NVFP4
+activation-quant kernel (hardware cvt.rn.satfinite.e2m1x2.f32 with pack=1,
+asm operand order $1=high/$2=low probe-verified; fp32->e4m3 via Triton's
+native cast; scales written DIRECTLY in the cuBLAS 128x4 blocked swizzle,
+off = ((G*32 + (m%128)%32)*4 + (m%128)//32)*4 + kb%4, G = (m//128)*nc +
+kb//4). Bitwise-matches the torch reference on packed bytes AND swizzled
+scales at all tested shapes incl. partial 128-row blocks; _scaled_mm fed by
+kernel vs reference is bitwise identical; deterministic across reruns;
+25.5 us at 4416x6144 (2.7 TB/s) vs the 53 us GEMM it feeds. Constraint for
+the integrator: the k-loop is unmasked — BLOCK_K must divide K (engine
+shapes 6144/3072 are fine; the wrapper auto-picks). Copy into
+engine/pyengine/kernels/ in the exp-0015a worktree; do NOT land on main
+outside the dispatcher path.
