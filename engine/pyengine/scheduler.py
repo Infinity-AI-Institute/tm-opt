@@ -28,6 +28,7 @@ import bisect
 
 import torch
 
+from engine.pyengine import graphrun
 from engine.pyengine import kv as pkv
 from engine.pyengine import model as pmodel
 
@@ -88,6 +89,7 @@ class Engine:
         self._masks = {}
         self._pools = None       # per-layer batch pools (exp-0007)
         self._pool_batch = None
+        self._graphrun = None    # CUDA-graphed decode step (exp-0012)
 
     def init_pools(self, max_batch):
         """exp-0007: per-layer batch pools for the batched decode
@@ -220,15 +222,25 @@ class Engine:
         (B3.1/B3.3), which is exactly the drift D13's envelope covers.
         Returns the B next greedy tokens in row order."""
         mc = self.mc
+        pos = [r.ids.shape[0] - 1 + len(r.tokens) for r in reqs]
+        slots = [r.states[0].slot for r in reqs]
+        #0. CUDA-graphed step (exp-0012): the whole pooled traversal as
+        #   per-device graph replays on static buffers — same pools,
+        #   B padded to max_batch, key length padded to a 512 bucket
+        #   (graphrun module docstring; PYENGINE_CUDAGRAPH=0 disables)
+        if (self._pools is not None and None not in slots
+                and len(reqs) <= self._pool_batch and graphrun.enabled()):
+            if self._graphrun is None:
+                self._graphrun = graphrun.GraphRunner(self)
+            out = self._graphrun.step(reqs, pos, slots)
+            return out
         #1. embed all previous tokens — one [B] lookup + rowwise norm
         prev = torch.tensor([r.tokens[-1] for r in reqs],
                             device=self.w_emb.device)
         _, h = pmodel.embed(prev, self.w_emb, self.w_en, eps=mc.rms_eps)
-        pos = [r.ids.shape[0] - 1 + len(r.tokens) for r in reqs]
         #2. pooled path (exp-0007): per-step per-device shared indexing,
         #   built once and reused by every layer on that device; requests
         #   admitted without a pool slot fall back to the per-row core
-        slots = [r.states[0].slot for r in reqs]
         ctxs = {}
         if self._pools is not None and None not in slots:
             for L in range(mc.num_layers):

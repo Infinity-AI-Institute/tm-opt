@@ -31,8 +31,10 @@ established bitwise across execution shapes is unattainable in principle):
   in slot order vs the loop's sequential bf16 adds in expert-ascending
   order) — the same drift class the D13 envelope already covers.
 Determinism (the t_b3-adapted worker arm): stable sort, exact-integer
-bincount, fixed grids, no atomics, each output row written exactly once —
-two runs of the same schedule are bitwise identical."""
+searchsorted segment offsets, fixed grids, no atomics, each output row
+written exactly once — two runs of the same schedule are bitwise
+identical. Sync-free and fixed-shape at fixed T, so the whole call is
+legal inside CUDA-graph capture (exp-0012)."""
 import torch
 import triton
 import triton.language as tl
@@ -259,9 +261,14 @@ def moe_experts_packed(x, pack13, pack2, topk_indices, topk_weights):
     sorted_e, perm = torch.sort(flat, stable=True)
     perm32 = perm.to(torch.int32)
     tok32 = (perm // top_k).to(torch.int32)
-    offs = torch.zeros(E + 1, device=x.device, dtype=torch.int32)
-    offs[1:] = torch.cumsum(torch.bincount(sorted_e, minlength=E),
-                            0).to(torch.int32)
+    #   segment offsets via searchsorted on the sorted pair list — the
+    #   same integers cumsum(bincount) produced (offs[e] = first index
+    #   of expert e), but with no data-dependent output size: bincount
+    #   internally reduces max(input) to size its result, a hidden
+    #   device sync that is illegal inside CUDA-graph capture (exp-0012)
+    offs = torch.searchsorted(
+        sorted_e, torch.arange(E + 1, device=x.device,
+                               dtype=sorted_e.dtype)).to(torch.int32)
     wt = topk_weights.reshape(-1)[perm].contiguous()
 
     P = flat.shape[0]

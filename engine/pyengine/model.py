@@ -654,6 +654,36 @@ def decode_batch_ctx(pos, slots, mc, device, page_size):
             "g_dist": pos_t[:, None] - j[None, :]}
 
 
+def decode_batch_ctx_static(pos_t, slots_t, Lg, mc, page_size):
+    """exp-0012: decode_batch_ctx with STATIC shapes for CUDA-graph
+    capture — pos/slots arrive as device int64 tensors (the graph
+    runner's static input buffers, so replay sees fresh content at fixed
+    addresses) and Lg is the padded key length (a monotone 512-bucket
+    high-water mark, graphrun.GraphRunner), not max(pos)+1. Every entry
+    is the same arithmetic as decode_batch_ctx on the same values —
+    rows beyond a live position are dead by the SAME predicates (p < n /
+    j < n) the dynamic ctx uses for short rows, so the padded columns
+    are masked exactly like any other dead slot. Pure tensor ops on
+    device data: no host reads, no torch.tensor(host_list) — legal
+    inside stream capture. No "pos_host": the graph path hoists page
+    allocation out of the layer walk (attn_decode_batch_pooled #3a)."""
+    B = pos_t.shape[0]
+    device = pos_t.device
+    n = pos_t + 1
+    #1. SWA ring geometry (decode_batch_ctx #1, unchanged math)
+    s = torch.arange(mc.window, device=device)[None, :]
+    base = (n - mc.window).clamp_min(0)[:, None]
+    p = base + ((s - base) % mc.window)
+    #2. global padded-gather geometry at the FIXED bucket length
+    j = torch.arange(Lg, device=device)
+    return {"B": B, "pos": pos_t, "slots": slots_t,
+            "ring_slot": pos_t % mc.window, "swa_valid": p < n[:, None],
+            "swa_dist": pos_t[:, None] - p, "Lg": Lg,
+            "g_pageidx": j // page_size, "g_off": j % page_size,
+            "g_valid": j[None, :] < n[:, None],
+            "g_dist": pos_t[:, None] - j[None, :]}
+
+
 def attn_decode_batch_pooled(x, wq, wk, wv, wr, wo, w_k_sconv, w_v_sconv,
                              w_q_norm, w_k_norm, rel_proj, states, pool,
                              ctx, head_dim, is_global, alpha=None,
@@ -694,10 +724,14 @@ def attn_decode_batch_pooled(x, wq, wk, wv, wr, wo, w_k_sconv, w_v_sconv,
         #3a. page allocation is host-side (page tables + free list are
         #    host state; ensure_pages mirrors new ids on-device), then
         #    ONE index_put_ appends all rows, ONE gather fetches the
-        #    padded [B, Lg] key set — no .tolist() anywhere
+        #    padded [B, Lg] key set — no .tolist() anywhere. The CUDA-
+        #    graph path (exp-0012) passes states=None: it hoists page
+        #    allocation to before graph replay (graphrun.step #1), so
+        #    the captured region stays free of host-side work
         ps = pool.page_size
-        for b, st in enumerate(states):
-            st.cache.ensure_pages(ctx["pos_host"][b] // ps)
+        if states is not None:
+            for b, st in enumerate(states):
+                st.cache.ensure_pages(ctx["pos_host"][b] // ps)
         table = pool.table_dev[slots]                      # [B, num_pages]
         flat_new = (table.gather(1, (ctx["pos"] // ps)[:, None])[:, 0] * ps
                     + ctx["pos"] % ps)

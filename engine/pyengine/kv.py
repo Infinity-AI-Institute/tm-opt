@@ -193,12 +193,19 @@ class SwaPool:
     decode core appends all B rows with ONE index_put_ and fetches all
     rings with ONE index gather instead of B per-row op chains. LayerKV
     hands RingKV views of rows, so the per-seq prefill/append code path
-    is unchanged (and bitwise: same-shape tensors, same ops)."""
+    is unchanged (and bitwise: same-shape tensors, same ops).
+
+    Row max_batch is the SCRATCH slot (exp-0012): the CUDA-graphed decode
+    step always runs at B = max_batch, and rows without a live sequence
+    all point here. Dead rows are configured identically (prev token 0,
+    pos 0, this slot), so their colliding index_put_ writes carry
+    identical bytes — scratch content stays a pure function of the
+    schedule and never feeds a live row."""
 
     def __init__(self, max_batch, window, kv_heads, head_dim, device,
                  dtype=torch.bfloat16):
-        #1. [slot, ring_slot, H, D] — the same layout as max_batch RingKVs
-        self.k = torch.zeros(max_batch, window, kv_heads, head_dim,
+        #1. [slot, ring_slot, H, D] — max_batch live rows + 1 scratch row
+        self.k = torch.zeros(max_batch + 1, window, kv_heads, head_dim,
                              device=device, dtype=dtype)
         self.v = torch.zeros_like(self.k)
 
@@ -215,17 +222,22 @@ class GlobalPool:
 
     def __init__(self, max_batch, num_pages, page_size, kv_heads, head_dim,
                  device, dtype=torch.bfloat16):
-        #1. one pool; page ids span every slot's allocations
+        #1. one pool; page ids span every slot's allocations, plus ONE
+        #   scratch page (id `total`) for the graph path's dead rows
+        #   (exp-0012, SwaPool docstring) — never on the free list
         total = max_batch * num_pages
-        self.kp = torch.zeros(total, page_size, kv_heads, head_dim,
+        self.kp = torch.zeros(total + 1, page_size, kv_heads, head_dim,
                               device=device, dtype=dtype)
         self.vp = torch.zeros_like(self.kp)
         self.page_size = page_size
         self.free = list(range(total))
         #2. table mirror; entries beyond a sequence's live table are stale
-        #   — never read (flat-slot gather is masked to positions < n)
-        self.table_dev = torch.zeros(max_batch, num_pages,
+        #   — never read (flat-slot gather is masked to positions < n).
+        #   Row max_batch is the scratch slot: every entry points at the
+        #   scratch page, so any dead-row position lands there
+        self.table_dev = torch.zeros(max_batch + 1, num_pages,
                                      dtype=torch.long, device=device)
+        self.table_dev[max_batch].fill_(total)
 
 
 class SconvPool:
@@ -242,12 +254,13 @@ class SconvPool:
 
     def __init__(self, max_batch, kernel, kv_ch, hidden, device,
                  dtype=torch.bfloat16):
-        #1. [slot, kernel-1, C] per site — the layout of max_batch rings
-        self.kt = torch.zeros(max_batch, kernel - 1, kv_ch, device=device,
-                              dtype=dtype)
+        #1. [slot, kernel-1, C] per site — max_batch rings + the scratch
+        #   row (exp-0012, SwaPool docstring)
+        self.kt = torch.zeros(max_batch + 1, kernel - 1, kv_ch,
+                              device=device, dtype=dtype)
         self.vt = torch.zeros_like(self.kt)
-        self.at = torch.zeros(max_batch, kernel - 1, hidden, device=device,
-                              dtype=dtype)
+        self.at = torch.zeros(max_batch + 1, kernel - 1, hidden,
+                              device=device, dtype=dtype)
         self.mt = torch.zeros_like(self.at)
 
 
