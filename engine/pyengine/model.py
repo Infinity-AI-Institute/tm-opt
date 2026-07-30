@@ -3,9 +3,18 @@ SWA by layer id; rel-bias + log scaling pre-softmax; sconv on K,V,attn-out)
 -> residual -> rmsnorm -> MoE (sigmoid gate+bias, top-6, norm_after_topk,
 route_scale 8, +2 shared sink experts; layers 0-1 = dense MLP) -> sconv on
 moe-out -> residual. No RoPE anywhere."""
+import os
+
 import torch
 
+from engine.pyengine.kernels.attn_global import attn_global
+from engine.pyengine.kernels.attn_swa import attn_swa
 from engine.pyengine.kernels.moe_gemm import moe_experts_packed
+
+# exp-0013 kill switch: PYENGINE_FUSED_ATTN=0 restores the eager pooled
+# attention chain unchanged (read once at import — must be constant for
+# the life of the process so captured graphs match the eager warmups)
+_FUSED_ATTN = os.environ.get("PYENGINE_FUSED_ATTN", "1") != "0"
 
 
 def rmsnorm(x, weight, eps=1e-6):
@@ -687,7 +696,7 @@ def decode_batch_ctx_static(pos_t, slots_t, Lg, mc, page_size):
 def attn_decode_batch_pooled(x, wq, wk, wv, wr, wo, w_k_sconv, w_v_sconv,
                              w_q_norm, w_k_norm, rel_proj, states, pool,
                              ctx, head_dim, is_global, alpha=None,
-                             n_floor=None, eps=1e-6):
+                             n_floor=None, eps=1e-6, fused=None):
     """One attention layer, POOLED batched decode form (exp-0007) — the
     per-row Python core of attn_decode_batch collapsed into per-layer
     batched ops over the layer's batch pool (kv.SwaPool / kv.GlobalPool).
@@ -740,13 +749,42 @@ def attn_decode_batch_pooled(x, wq, wk, wv, wr, wo, w_k_sconv, w_v_sconv,
         valid, dist, L = ctx["g_valid"], ctx["g_dist"], ctx["Lg"]
         flat = table[:, ctx["g_pageidx"]] * ps + ctx["g_off"][None, :]
         flat = torch.where(valid, flat, torch.zeros_like(flat))
-        K = pool.kp.view(-1, n_kv, head_dim)[flat]         # [B, L, H, D]
-        V = pool.vp.view(-1, n_kv, head_dim)[flat]
     else:
         pool.k[slots, ctx["ring_slot"]] = k
         pool.v[slots, ctx["ring_slot"]] = v
         valid, dist = ctx["swa_valid"], ctx["swa_dist"]
         L = pool.k.shape[1]
+    if fused is None:
+        fused = _FUSED_ATTN
+    if fused:
+        #4f. fused two-shape kernel path (exp-0013): the rel-logit mix
+        #    (rel_bias #1) and the tau round-trip stay in torch — tiny,
+        #    and the per-row scalar tau multiply commutes with the
+        #    kernel's bias gather at identical rounding points (scale
+        #    then round then gather == gather then scale then round,
+        #    elementwise; masked lanes are 0 either way). ONE flash-
+        #    decode kernel per layer then reads K/V IN PLACE from the
+        #    pool — the [B, L, H, D] gather copies, matmul-contiguity
+        #    copies and [B, H, 1, L] score/bias intermediates of the
+        #    eager chain below are never materialized
+        #    (kernels/attn_swa.py has the numerics contract)
+        rl = torch.matmul(r.view(B, n_heads, -1), rel_proj)
+        if is_global and n_floor is not None:
+            tau = log_scale_tau(ctx["pos"], alpha, n_floor)
+            q = (q.float() * tau[:, None, None]).to(q.dtype)
+            rl = (rl.float() * tau[:, None, None]).to(rl.dtype)
+        if is_global:
+            out = attn_global(q.contiguous(), pool.kp, pool.vp,
+                              flat.contiguous(), ctx["pos"],
+                              rl.contiguous(), L)
+        else:
+            out = attn_swa(q.contiguous(), pool.k, pool.v, slots,
+                           ctx["pos"], rl.contiguous())
+        return F.linear(out.reshape(B, n_heads * head_dim), wo)
+    if is_global:
+        K = pool.kp.view(-1, n_kv, head_dim)[flat]         # [B, L, H, D]
+        V = pool.vp.view(-1, n_kv, head_dim)[flat]
+    else:
         K = pool.k[slots]                                  # [B, 512, H, D]
         V = pool.v[slots]
     #4. rel bias over the whole (row, key-slot) grid — rel_bias's exact
