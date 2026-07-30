@@ -443,3 +443,14 @@ DSL marshalling hypothesis (that _run_gemm's five cutlass_torch.from_dlpack
 conversions per GEMM were a large part of the per-layer host cost).
 Measured on CPU tensors of the prefill shapes: 5.7-6.8 us per conversion,
 i.e. ~60 us per layer, ~4 ms per traversal. Not the fat. Do not re-propose.
+
+## Process note (exp-0024): merge commits need the [ralph] prefix too
+The engine lineage lives on branches — main has carried only spec JSONs and
+docs since 99f6bbc — so every iteration since exp-0016 builds on the accepted
+tip and merges current main in to satisfy the spec's
+`git merge-base --is-ancestor main <commit>` rule. `git merge` writes its own
+default message ("Merge branch 'main' into HEAD"), and when that merge is the
+commit the spec pins, the worker logs `WARNING: candidate commit <sha> lacks
+[ralph] prefix` (seen on exp-0022's b1a28ba and exp-0024's b6f8831; it is
+non-blocking, both ran). Use `git merge --no-edit -m "[ralph] exp(<id>): merge
+main"` so the pinned commit carries the prefix like every other one.
