@@ -522,16 +522,16 @@ only of the rel mix (which comes from a matmul and has it). The same fact
 says the eager chain's matmul is paying a contiguity copy on K and V that
 the fused path deletes as well — the prefill twin of the 128 ms/step of
 `direct_copy` exp-0013 found on the decode side.
-NO SPEC WAS SUBMITTED THIS ITERATION, and the reason is budget, not doubt:
-the dispatcher started exp-0022 on GPUs 4-7 at 18:37 (queue log) and held
-203-213 GiB per device for the whole session, while GPUs 0-3 hold the
-frozen vLLM baseline server (254 GiB, 4-day resident) and are off-limits by
-the hard rule. No local D13 gate, no numerics arm and no timing arm was
-possible, and submitting a NEW Triton kernel with zero GPU evidence would
-have burned a canonical slot on a coin flip. What is committed instead is
-the kernel, its call-site wiring behind a kill switch
-(PYENGINE_FUSED_PREFILL_ATTN=0), and a validation script whose algebra arms
-run on CPU with no CUDA context at all. Those were run and are GREEN
+THE SESSION STARTED WITH NO GPU AT ALL — the dispatcher was running
+exp-0022 on GPUs 4-7 (203-213 GiB per device) and GPUs 0-3 hold the frozen
+vLLM baseline (254 GiB, 4-day resident, off-limits by the hard rule) — so
+the kernel was written and pre-gated on CPU first, and this section was
+originally written to say no spec would be submitted. GPUs 4-7 FREED AT
+18:58 when exp-0022 finished (accepted, 353.6 tok/s), and the GPU arms, the
+in-situ arm and the D13 gate all fit in the remaining budget, so exp-0023
+WAS submitted. The CPU-first order is worth keeping as a habit anyway: it
+caught a real bug before any GPU time was spent (below), and the CPU arms
+are GREEN
 (/workspace/logs/t_fused_prefill_attn_exp0023_sim.log): a literal torch
 transcription of the kernel — same block bounds, same distance/band/mask
 expressions, same online-softmax update — matches the engine's own eager
@@ -541,15 +541,15 @@ bit-exact against the same rows run alone with garbage pads left in place
 lowered so tau actually varies (arm d, 1.000-1.249), the kernel's mask
 predicate is bitwise additive_causal_mask's for both window forms (arm e),
 and the eager call site still runs end to end with the switch off (arm d2).
-What that does NOT cover, stated plainly: Triton codegen, register
-pressure/tile choice, the real bf16 drift against the D13 envelope, and
-every timing claim. NEXT ITERATION RUNBOOK, ~35 min total: (1)
-`python -m engine.pyengine.tests.t_fused_prefill_attn --gpu --dev 4`
-(~5 min; arm f numerics, arm g determinism, arm h sweeps BLOCK_M/BLOCK_N
-64x64 / 64x32 / 128x64 / 32x64 — pin the winner in the attn_prefill_fused
-call site, arm i peak memory), (2) the D13 teacher-forced gate on a loaded
-server (~20 min) — THIS patch moves prefill numerics, so unlike exp-0013
-the gate is genuinely at risk and must be run before submitting, (3)
-submit. If the gate goes red, the fallback that keeps most of the win is
-to reproduce the eager rounding chain inside the kernel (bf16-round the
-QK product, then scale/add bias in bf16) instead of carrying fp32.
+What the CPU arms could NOT cover — Triton codegen, tile choice, the real
+bf16 drift, every timing claim — the GPU arms then did, and all of it is in
+the exp-0023 spec: isolated 12.0x (SWA) / 3.5x (global) per layer, IN SITU
+1.32x on the mixed step, D13 gate green and CLOSER to the goldens than the
+accepted lineage (delta_mean 0.052153 vs 0.056637).
+ONE OPERATIONAL TRAP, recorded because exp-0018's post-mortem says a leaked
+server destroys the NEXT experiment: killing the shell job that launched
+`nohup python -m engine.pyengine.server` did NOT kill the server. The
+python process was reparented to PID 1 and sat on 165-177 GiB per device
+after the gate returned; `nvidia-smi --query-compute-apps` found it and a
+direct kill -9 on THAT pid took GPUs 4-7 back to 4 MiB. Always verify the
+4 MiB, never trust the job-control kill.

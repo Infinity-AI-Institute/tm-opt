@@ -313,18 +313,22 @@ def run_gpu(dev_id):
             (f"fused {bm}x{bn}", (lambda bm=bm, bn=bn: _fused(bm, bn)))
             for bm, bn in ((64, 64), (64, 32), (128, 64), (32, 64))]
         times = {tag: [] for tag, _ in arms}
-        for i in range(6):
-            for tag, fn in arms:
-                torch.cuda.synchronize(dev)
-                s, e = (torch.cuda.Event(enable_timing=True),
-                        torch.cuda.Event(enable_timing=True))
-                s.record()
-                out = fn()
-                e.record()
-                torch.cuda.synchronize(dev)
-                if i >= 2:                      # discard warm-ups (JIT)
-                    times[tag].append(s.elapsed_time(e))
-                del out
+        #   events must be recorded on the LAYER'S device — recording them
+        #   on the default device's stream times an idle stream (it reads
+        #   host launch gaps, not GPU work)
+        with torch.cuda.device(dev):
+            for i in range(6):
+                for tag, fn in arms:
+                    torch.cuda.synchronize(dev)
+                    s, e = (torch.cuda.Event(enable_timing=True),
+                            torch.cuda.Event(enable_timing=True))
+                    s.record()
+                    out = fn()
+                    e.record()
+                    torch.cuda.synchronize(dev)
+                    if i >= 2:                  # discard warm-ups (JIT)
+                        times[tag].append(s.elapsed_time(e))
+                    del out
         me = sum(times["eager"]) / len(times["eager"])
         for tag, _ in arms[1:]:
             mf = sum(times[tag]) / len(times[tag])
