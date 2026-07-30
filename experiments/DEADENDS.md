@@ -336,3 +336,73 @@ state (PPID 1, zombie child, idle GPUs) because it was caught while running.
 its D13 gate was green and bit-identical to the accepted rows, its serial-vs-
 pipelined token streams were exactly equal, and its two determinism arms
 passed — none of that was contradicted, and none of it was measured.
+
+## exp-0020-pipelined-prefill-rerun (rejected 2026-07-30, 222.6 vs bar 223.6)
+Post-mortem, written by exp-0021's iteration, which then measured the cause.
+The resubmission worked as infrastructure — the run completed, the ledger row
+exists (iter 21), and the mechanism was finally judged: exp-0018's
+sync-elimination is worth NOTHING in situ (222.6 against a 222.9 best, i.e.
+-0.13%, inside noise). Its own isolated arm was honest (a mixed step went
+1.409 -> 1.373 s, and 36 ms x ~180 mixed steps is ~6 s of a 620 s box = 1%,
+which is simply too thin to clear a 0.3% bar reliably); what was wrong was
+the MODEL underneath it, and the model was wrong in a way that mattered for
+the two experiments queued behind it. exp-0018 assumed the traversal was
+GPU-bound and merely sync-pinned, so that deleting the 23 device->host syncs
+would let successive traversals overlap across the layer-split GPUs. The
+syncs really were deleted (verified below), but no overlap followed, because
+a prefill traversal is not GPU-bound at all. LESSON, and it is the useful
+one: "I removed the thing that blocks overlap" is not evidence of overlap.
+The arm that would have caught it costs one line — time the enqueue call's
+RETURN separately from the sync that follows it — and exp-0018 never ran it.
+Its sync-free traversal is still in the tree (exp-0021 builds on it and needs
+it) and its kill switch still works; it just is not, by itself, worth a row.
+
+## exp-0021 arm 1: prefill MICROBATCHING (measured, negative, not submitted)
+The hypothesis this iteration started with: now that the traversal is
+sync-free (exp-0018), feed the layer-split pipeline more traversals by
+cutting a released cohort into consecutive sub-groups, since exp-0017's
+two-point fit (per-group wall = A + B*G, A = 183.7 ms flat, B = 196.8 ms/seq)
+says (N+3)/4 * (A + 6B/N) beats 4*(A+6B)/4 for N = 2..6 at any overlap
+efficiency above ~32%. Implemented as a scheduler-only knob
+(_prefill_groups cuts each budget-packed group to _MICROBATCH rows) and
+measured on the real resident model, interleaved arms, one load
+(engine/pyengine/tests/t_microbatch_prefill.py; log
+/workspace/logs/t_microbatch_prefill_exp0021_out.log). RESULT, mixed step
+(6-prompt cohort landing on 8 already-decoding residents): one group
+1.354 s -> two groups of 3 1.544 s -> three groups of 2 1.710 s; the
+prefill-only step moves the same way (1.529 -> 1.859 -> 2.091 s). The cost
+of each extra traversal is ~180 ms, flat, and it is EXACTLY the model's A
+term with ZERO of the pipeline gain: overlap efficiency measured 0, not
+0.32, not 0.29. Kept in the tree at _MICROBATCH=0 (a no-op branch) with its
+evidence script, so the negative result stays reproducible. Nobody should
+re-propose splitting a traversal to fill the layer-split pipeline until the
+finding below is fixed.
+
+## exp-0021 arm 2: WHY nothing overlaps — the prefill traversal is HOST-BOUND
+The measurement both exp-0018 and the microbatch arm needed
+(engine/pyengine/tests/t_traversal_sync_probe.py; log
+/workspace/logs/t_traversal_sync_probe_exp0021_out.log), on the real
+resident model, after warm-up, with every implicit device->host sync entry
+point (Tensor.item/tolist/cpu/numpy/nonzero, torch.nonzero/unique/bincount,
+cuda.synchronize) counted by monkeypatch:
+  arm a  syncs inside one grouped 3-row prefill traversal: **NONE**. exp-0018
+         did exactly what it claimed.
+  arm b  that traversal costs **696 ms of HOST time and 0.1 ms of device
+         tail** (call -> return, then sync). The four GPUs finish everything
+         the instant the host stops issuing. Repeated: 695 ms / 0.3 ms.
+  arm c  two 3-row traversals back to back cost 1355 ms whether or not a
+         full device sync is placed between them (1368 / 1355 / 1355 / 1355).
+         There is no run-ahead to give away.
+So prefill is PYTHON-limited, not pipeline-limited, and the whole
+"traversals should overlap across the layer split" family (exp-0018,
+exp-0020, the microbatch arm above) was attacking a bubble that is not the
+binding constraint. The prefill term is ~40% of the canonical box and its
+GPUs are idle for essentially all of it. Two consequences for the ranking.
+(1) The BIG prefill lever is deleting Python from the traversal — the
+exp-0012 treatment (CUDA-graphed, tensorized per-row state handling) applied
+to prefill; note the host cost scales with rows as well as traversals
+(A + B*G with both terms host-side), which points at the per-row Python
+inside the grouped walk, not just the 66-layer loop. (2) The cheap lever,
+which exp-0021 submits, is to spend that idle device time on the OTHER
+traversal: issue the graphed decode step FIRST and read it back after the
+prefill Python.
