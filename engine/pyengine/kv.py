@@ -22,11 +22,23 @@ class SconvRing:
     so a fresh ring is exactly "before t=0" (model.sconv_prefill semantics,
     modeling_inkling.py:461-481)."""
 
-    def __init__(self, channels, kernel, device, dtype=torch.bfloat16):
+    def __init__(self, channels, kernel, device, dtype=torch.bfloat16,
+                 backing=None):
         #1. tail[i] = raw input at backward distance kernel-1-i (tail[-1]
-        #   is the most recent token); zeros = implicit conv padding
-        self.tail = torch.zeros(kernel - 1, channels, device=device,
-                                dtype=dtype)
+        #   is the most recent token); zeros = implicit conv padding.
+        #   `backing` = a [kernel-1, channels] view of one SconvPool row
+        #   (exp-0008): the conv window READS every tail row, so unlike
+        #   the KV pools a prior occupant's stale values cannot be masked
+        #   away — the row is erased here so a fresh ring is zeros either
+        #   way; step/seed then write THROUGH the view, keeping the pool
+        #   and the per-seq code paths on one storage
+        self._backed = backing is not None
+        if self._backed:
+            self.tail = backing
+            self.tail.zero_()
+        else:
+            self.tail = torch.zeros(kernel - 1, channels, device=device,
+                                    dtype=dtype)
 
     def seed(self, x):
         """Load the tail from a prefill's raw input stream x [T, C]; keeps
@@ -40,8 +52,12 @@ class SconvRing:
         """One decode token: x [1, C] raw input -> the full conv window
         [kernel, C] (oldest first, x last), rolling the tail forward."""
         #1. window = kept tail + the new token; new tail drops the oldest
+        #   (in place when pool-backed — a rebind would detach the view)
         win = torch.cat([self.tail, x], dim=0)
-        self.tail = win[1:]
+        if self._backed:
+            self.tail.copy_(win[1:])
+        else:
+            self.tail = win[1:]
         return win
 
 
@@ -212,6 +228,29 @@ class GlobalPool:
                                      dtype=torch.long, device=device)
 
 
+class SconvPool:
+    """exp-0008: batch-slot pool for one layer's four sconv-site tails —
+    row s holds the tails of the sequence in scheduler slot s, so the
+    batched decode step rolls all B windows with ONE gather + ONE
+    index_put_ per site (model.sconv_decode_batch_pooled) instead of B
+    per-row cat/rebind chains — the copy_/cat storm exp-0005 counted
+    (34,361 copy_ + 17,290 cat per step at B=64). SconvRing views of
+    rows keep the per-seq prefill seed/step code on the same storage;
+    rows are zeroed when (re)bound (SconvRing.__init__) because the conv
+    window reads every tail row — stale occupants must be erased, not
+    masked."""
+
+    def __init__(self, max_batch, kernel, kv_ch, hidden, device,
+                 dtype=torch.bfloat16):
+        #1. [slot, kernel-1, C] per site — the layout of max_batch rings
+        self.kt = torch.zeros(max_batch, kernel - 1, kv_ch, device=device,
+                              dtype=dtype)
+        self.vt = torch.zeros_like(self.kt)
+        self.at = torch.zeros(max_batch, kernel - 1, hidden, device=device,
+                              dtype=dtype)
+        self.mt = torch.zeros_like(self.at)
+
+
 class LayerKV:
     """One decoder layer's full recurrent state: the KV cache (PagedKV on
     the 11 global layers, RingKV(window) on the 55 SWA layers) + the four
@@ -246,9 +285,21 @@ class LayerKV:
             self.cache = RingKV(mc.window, kv_heads, mc.head_dim, device,
                                 dtype)
         #2. sconv raw-input tails (B2.7: the 3 raw inputs are state the
-        #   post-conv KV entries do NOT carry)
+        #   post-conv KV entries do NOT carry); pool-backed when the KV
+        #   pool carries a SconvPool (exp-0008: scheduler.init_pools)
         kvd = kv_heads * mc.head_dim
-        self.k_ring = SconvRing(kvd, mc.sconv_k, device, dtype)
-        self.v_ring = SconvRing(kvd, mc.sconv_k, device, dtype)
-        self.attn_ring = SconvRing(mc.hidden, mc.sconv_k, device, dtype)
-        self.mlp_ring = SconvRing(mc.hidden, mc.sconv_k, device, dtype)
+        sp = getattr(pool, "sconv", None) if pool is not None else None
+        if sp is not None:
+            self.k_ring = SconvRing(kvd, mc.sconv_k, device, dtype,
+                                    backing=sp.kt[slot])
+            self.v_ring = SconvRing(kvd, mc.sconv_k, device, dtype,
+                                    backing=sp.vt[slot])
+            self.attn_ring = SconvRing(mc.hidden, mc.sconv_k, device, dtype,
+                                       backing=sp.at[slot])
+            self.mlp_ring = SconvRing(mc.hidden, mc.sconv_k, device, dtype,
+                                      backing=sp.mt[slot])
+        else:
+            self.k_ring = SconvRing(kvd, mc.sconv_k, device, dtype)
+            self.v_ring = SconvRing(kvd, mc.sconv_k, device, dtype)
+            self.attn_ring = SconvRing(mc.hidden, mc.sconv_k, device, dtype)
+            self.mlp_ring = SconvRing(mc.hidden, mc.sconv_k, device, dtype)

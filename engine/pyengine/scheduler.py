@@ -103,12 +103,19 @@ class Engine:
         for L in range(mc.num_layers):
             dev = self.layers[L]["attn_norm"].device
             if L in mc.global_layers:
-                self._pools.append(pkv.GlobalPool(
-                    max_batch, self.num_pages, pkv.PAGE_SIZE, mc.g_kv_heads,
-                    mc.head_dim, dev))
+                kv_heads = mc.g_kv_heads
+                pool = pkv.GlobalPool(max_batch, self.num_pages,
+                                      pkv.PAGE_SIZE, kv_heads, mc.head_dim,
+                                      dev)
             else:
-                self._pools.append(pkv.SwaPool(
-                    max_batch, mc.window, mc.s_kv_heads, mc.head_dim, dev))
+                kv_heads = mc.s_kv_heads
+                pool = pkv.SwaPool(max_batch, mc.window, kv_heads,
+                                   mc.head_dim, dev)
+            #2. exp-0008: the layer's sconv tails ride the same slot ids
+            pool.sconv = pkv.SconvPool(max_batch, mc.sconv_k,
+                                       kv_heads * mc.head_dim, mc.hidden,
+                                       dev)
+            self._pools.append(pool)
         self._pool_batch = max_batch
 
     def new_states(self, slot=None):
