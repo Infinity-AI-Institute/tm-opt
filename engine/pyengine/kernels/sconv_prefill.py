@@ -101,10 +101,15 @@ def sconv_prefill_fused(x, weight):
     #   6144/2048/1024-wide sites whole-warp rows (swept in t_fused_sconv)
     block_t, block_c = 64, 256
     grid = (B, triton.cdiv(T, block_t), triton.cdiv(C, block_c))
-    _sconv_prefill_kernel[grid](
-        x, weight, out, T, C,
-        x.stride(0), x.stride(1), x.stride(2),
-        out.stride(0), out.stride(1), out.stride(2),
-        weight.stride(0), weight.stride(2),
-        K=k, BLOCK_T=block_t, BLOCK_C=block_c, num_warps=4)
+    #2. the layer walk hops devices (loader splits the 66 layers over 4
+    #   GPUs) while the ambient CUDA context stays on device 0, so the
+    #   launch is pinned to the tensors' device like every other kernel
+    #   in engine/pyengine/kernels
+    with torch.cuda.device(x.device):
+        _sconv_prefill_kernel[grid](
+            x, weight, out, T, C,
+            x.stride(0), x.stride(1), x.stride(2),
+            out.stride(0), out.stride(1), out.stride(2),
+            weight.stride(0), weight.stride(2),
+            K=k, BLOCK_T=block_t, BLOCK_C=block_c, num_warps=4)
     return out

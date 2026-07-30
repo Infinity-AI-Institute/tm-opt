@@ -135,6 +135,29 @@ def main():
         ta = _time(lambda: res + o)
         print(f"[t0025] arm d  consumer on {tag}: per-head rmsnorm "
               f"{tn:.3f} ms, residual add {ta:.3f} ms", flush=True)
+    #5. arm f — WHERE the engine's numerics move. The kernel is bitwise
+    #   (arm a), so any downstream token change must come from the LAYOUT:
+    #   the eager chain hands its consumers a channel-major tensor, and a
+    #   GEMM on a channel-major operand is a different cuBLAS kernel with a
+    #   different accumulation order than the same VALUES contiguous. This
+    #   arm isolates that with identical values in both layouts — it is the
+    #   B3.1/B3.3 drift class the D13 envelope gates, not an arithmetic
+    #   change (t_fused_sconv_insitu arm b sees it end to end).
+    cm = of.transpose(1, 2).contiguous().transpose(1, 2)
+    cm.copy_(of)
+    same_vals = torch.equal(cm.float(), of.float())
+    wq = (torch.randn((C, C), generator=g, device=dev,
+                      dtype=torch.float32) * 0.02).to(torch.bfloat16)
+    lin_cm = torch.nn.functional.linear(cm, wq)
+    lin_ct = torch.nn.functional.linear(of, wq)
+    n_ct = pmodel.rmsnorm(cm.view(B, T, C // 128, 128), nw)
+    n_cm = pmodel.rmsnorm(of.view(B, T, C // 128, 128), nw)
+    print(f"[t0025] arm f  same values in both layouts: {same_vals} | "
+          f"GEMM bitwise across layouts: "
+          f"{torch.equal(lin_cm, lin_ct)} (max|d| "
+          f"{(lin_cm.float() - lin_ct.float()).abs().max().item():.3e}) | "
+          f"rmsnorm bitwise across layouts: {torch.equal(n_cm, n_ct)}",
+          flush=True)
     print(f"[t0025] {'ALL OK' if bad == 0 else f'{bad} ARM(S) FAILED'}",
           flush=True)
     return bad
