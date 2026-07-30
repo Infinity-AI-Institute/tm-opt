@@ -8,6 +8,7 @@ import os
 import torch
 
 from engine.pyengine.kernels.attn_global import attn_global
+from engine.pyengine.kernels.attn_prefill import attn_prefill_fused
 from engine.pyengine.kernels.attn_swa import attn_swa
 from engine.pyengine.kernels.moe_gemm import moe_experts_packed
 
@@ -28,6 +29,14 @@ _W4A4_DECODE = os.environ.get("PYENGINE_W4A4_DECODE", "1") != "0"
 # once at import for the same reason as above: it must be constant for the
 # life of the process so captured graphs match the eager warmups.
 _BF16_GROUPED = os.environ.get("PYENGINE_BF16_GROUPED", "1") != "0"
+
+# exp-0023 kill switch: PYENGINE_FUSED_PREFILL_ATTN=0 restores attn_prefill's
+# eager materialized-score chain unchanged. Read once at import for the same
+# reason as above (and prefill is not captured, but the two paths must not
+# alternate within a process: their reduction orders differ, so mixing them
+# would break same-schedule bitwise determinism).
+_FUSED_PREFILL_ATTN = os.environ.get("PYENGINE_FUSED_PREFILL_ATTN",
+                                     "1") != "0"
 
 
 def experts_capturable(w_gate_up):
@@ -372,7 +381,7 @@ def dense_mlp(x, w_gate, w_up, w_down, global_scale):
 def attn_prefill(x, wq, wk, wv, wr, wo, w_k_sconv, w_v_sconv, w_q_norm,
                  w_k_norm, rel_proj, attn_mask, q_positions, kv_positions,
                  head_dim, is_global, alpha=None, n_floor=None, eps=1e-6,
-                 state=None, states=None, lens=None):
+                 state=None, states=None, lens=None, window=None):
     """One attention layer, PREFILL (no-cache) form — exact InklingAttention
     semantics (transformers models/inkling/modeling_inkling.py:217-282 with
     eager_attention_forward :157-182). Both layer shapes run through here:
@@ -385,8 +394,22 @@ def attn_prefill(x, wq, wk, wv, wr, wo, w_k_sconv, w_v_sconv, w_q_norm,
     makes prefill POPULATE the layer's recurrent state — post-norm K +
     post-sconv V into the cache, raw pre-conv k/v tails into the sconv
     rings — with numerics untouched (same ops either way; B3.1).
-    attn_decode is the cached single-token form; fused kernels are Stage-3
-    work (D4). `states` + `lens` (exp-0009 batched group prefill) is the
+    attn_decode is the cached single-token form.
+
+    exp-0023: with PYENGINE_FUSED_PREFILL_ATTN=1 (default) and a mask
+    present, #3-#8 run as ONE Triton kernel (kernels/attn_prefill.py) that
+    never materializes a [B,H,T,T] tensor. It reproduces the mask from the
+    POSITIONS — causal, plus `window` on SWA layers — so the caller's mask
+    must be additive_causal_mask(q_positions, kv_positions, dtype, window),
+    which is what layer_prefill already requires of it and what both
+    in-tree builders construct; `window` comes down from mc.window (a
+    caller that omits it falls back to the rel extent, which IS the window
+    on SWA layers per rel_bias's docstring, and the kernel asserts the two
+    agree). Numerics move by reduction order only — fp32 flash accumulation
+    instead of a bf16-rounded score tensor, the B3.1/B3.3 class exp-0013
+    established on the decode side, gated by the D13 envelope.
+
+    `states` + `lens` (exp-0009 batched group prefill) is the
     multi-row form of `state`: rows are RIGHT-padded to a common T, so with
     the causal mask a real position never attends a pad (pads sit at future
     key positions) and row i's live values are exactly the [:lens[i]]
@@ -422,6 +445,23 @@ def attn_prefill(x, wq, wk, wv, wr, wo, w_k_sconv, w_v_sconv, w_q_norm,
             st.k_ring.seed(k_raw[i, : lens[i]])
             st.v_ring.seed(v_raw[i, : lens[i]])
             st.cache.append(kn[i, : lens[i]], vv[i, : lens[i]])
+    #3f. exp-0023 fused form: the rel-bias MIX (rel_bias #1) is all the
+    #    kernel needs — it gathers by distance and applies the band, the
+    #    causal/window mask, the softmax and the PV product itself, so
+    #    nothing [B,H,T,T]-shaped is ever materialized and repeat_kv's
+    #    copies disappear. tau rides on the mix instead of the gathered
+    #    bias: the gather is a pure copy, so scaling before it is the same
+    #    per-element fp32 multiply + bf16 round on every live pair, and 0
+    #    stays 0 on the dead ones (apply_log_scaling's shapes are generic
+    #    over the last two axes, [B,H,T,E] here instead of [B,H,T,K]).
+    if _FUSED_PREFILL_ATTN and attn_mask is not None:
+        rel = (r.view(B, T, n_heads, -1) @ rel_proj).transpose(1, 2)
+        if is_global and n_floor is not None:
+            q, rel = apply_log_scaling(q, rel, q_positions, alpha, n_floor)
+        out = attn_prefill_fused(
+            q, k, v, rel, q_positions, kv_positions,
+            None if is_global else (window or rel_proj.shape[1]))
+        return F.linear(out.reshape(B, T, n_heads * head_dim), wo)
     #3. rel-pos bias from the relative states (:248-251)
     bias = rel_bias(r.view(B, T, n_heads, -1), rel_proj, q_positions,
                     kv_positions)
@@ -484,7 +524,8 @@ def layer_prefill(x, w, mask, pos, mc, layer_idx, state=None, trace=None,
                      w["ksc"], w["vsc"], w["qn"], w["kn"], w["proj"],
                      mask, pos, pos, mc.head_dim, is_global,
                      alpha=mc.log_alpha, n_floor=mc.log_floor,
-                     eps=mc.rms_eps, state=state, states=states, lens=lens)
+                     eps=mc.rms_eps, state=state, states=states, lens=lens,
+                     window=mc.window)
     if state is not None:
         state.attn_ring.seed(h[0])
     elif states is not None:
