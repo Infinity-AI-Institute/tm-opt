@@ -75,19 +75,30 @@ def main():
     print(f"a  {'PASS' if ok_a else 'FAIL'} — prefill path bit-identical to "
           f"exp-0016's gated tree")
 
-    # ---- arm b: decode-shape numerics vs W4A16 ----------------------
-    x = (torch.randn(MB, K, device=DEV) * 0.4).to(torch.bfloat16)
-    tki, tkw = make_routing(MB, E, TOPK)
-    out4 = moe_experts_w4a4(x, p13, p2, tki, tkw)
-    out16 = moe_experts_packed(x, p13, p2, tki, tkw)
-    d = (out4.float() - out16.float()).abs()
-    rel = (d / out16.float().abs().clamp(min=1e-3)).mean().item()
-    cos = torch.nn.functional.cosine_similarity(
-        out4.float().flatten(), out16.float().flatten(), dim=0).item()
-    nz = int((torch.bincount(tki.reshape(-1), minlength=E) > 0).sum())
-    print(f"b  decode T={MB}: {nz}/{E} experts hit, W4A4 vs W4A16 "
-          f"rel_mean {rel:.3e} cos {cos:.5f} finite {bool(torch.isfinite(out4).all())} "
-          f"(arm-J expectation ~1e-1 / ~0.995)")
+    # ---- arm b: numerics vs W4A16, decode shape AND the prefill-shape
+    #      CONTROL. The control is the whole argument: prefill W4A4 is
+    #      already accepted (exp-0015a, 93.0) and its TF gate moved TOWARD
+    #      the goldens, so decode W4A4 is safe iff its distance to W4A16 is
+    #      the same class as prefill's, not larger.
+    def _delta(T):
+        xx = (torch.randn(T, K, device=DEV) * 0.4).to(torch.bfloat16)
+        ti, tw = make_routing(T, E, TOPK)
+        o4 = moe_experts_w4a4(xx, p13, p2, ti, tw)
+        o16 = moe_experts_packed(xx, p13, p2, ti, tw)
+        d = (o4.float() - o16.float()).abs()
+        rel = (d / o16.float().abs().clamp(min=1e-3)).mean().item()
+        cos = torch.nn.functional.cosine_similarity(
+            o4.float().flatten(), o16.float().flatten(), dim=0).item()
+        nz = int((torch.bincount(ti.reshape(-1), minlength=E) > 0).sum())
+        fin = bool(torch.isfinite(o4).all())
+        print(f"b  T={T:5d} ({nz:3d}/{E} experts hit): W4A4 vs W4A16 "
+              f"rel_mean {rel:.3e} cos {cos:.5f} finite {fin}")
+        return xx, ti, tw, cos
+
+    _, _, _, cos_pf = _delta(736)          # PREFILL shape = the control
+    x, tki, tkw, cos_dec = _delta(MB)      # decode shape
+    print(f"b  decode-vs-prefill cos ratio {cos_dec / cos_pf:.4f} "
+          f"(>=1 means decode is no further from W4A16 than accepted prefill)")
 
     # ---- arm c: decode-shape per-layer wall -------------------------
     walls = {}
@@ -139,8 +150,53 @@ def main():
     ok_b2 = torch.equal(gout, ref2)
     print(f"d  capture+replay vs eager bitwise={ok_b1}; same-schedule "
           f"determinism={ok_det}; different-routing replay bitwise={ok_b2}")
-    print(f"d  one captured decode MoE layer costs "
-          f"{(free0 - free1) / 2**20:.0f} MiB of graph pool")
+    print(f"d  capture reserved {(free0 - free1) / 2**20:+.0f} MiB "
+          f"(free-mem delta; caching allocator makes this a loose bound)")
+
+    # ---- arm e: the honest per-layer number — CAPTURED REPLAY wall.
+    #      The eager walls of arm c still carry host dispatch (the very
+    #      cost exp-0012's graph deleted); in the serving engine both paths
+    #      run inside a graph, so replay-vs-replay is the comparison that
+    #      predicts the step.
+    def _replay_ms(fn, label):
+        sx2, si2, sw2 = x.clone(), tki.clone(), tkw.clone()
+        st = torch.cuda.Stream()
+        st.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(st):
+            for _ in range(2):
+                fn(sx2, p13, p2, si2, sw2)
+        torch.cuda.current_stream().wait_stream(st)
+        torch.cuda.synchronize()
+        gg = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(gg, pool=torch.cuda.graph_pool_handle()):
+            fn(sx2, p13, p2, si2, sw2)
+        for _ in range(3):
+            gg.replay()
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(20):
+            gg.replay()
+        torch.cuda.synchronize()
+        ms = (time.perf_counter() - t0) / 20 * 1e3
+        print(f"e  {label} CAPTURED decode MoE layer replay: {ms:.3f} ms")
+        return ms
+
+    r4 = _replay_ms(moe_experts_w4a4, "w4a4 ")
+    r16 = _replay_ms(moe_experts_packed, "w4a16")
+    #      NB: the ABSOLUTE walls here are on UNIFORM-RANDOM routing, which
+    #      hits ~201 of 256 experts at T=64; both kernels are dominated by
+    #      per-hit-expert weight traffic, so the trained router's
+    #      concentration makes both sides smaller in situ (w4a16 measures
+    #      {r16} ms/layer here vs the exp-0012 in-situ table's 266.4/63 =
+    #      4.23 ms). The RATIO is what transfers: it is measured on matched
+    #      routing, both sides captured, same weights.
+    frac = r4 / r16
+    print(f"e  graphed layer speedup {r16 / r4:.2f}x on matched routing "
+          f"(absolute walls are uniform-random-routing upper bounds, not "
+          f"in-situ times)")
+    print(f"e  ratio applied to the exp-0012 in-situ table: routed-expert "
+          f"term 266.4 -> {266.4 * frac:.0f} ms, graphed step 322.7 -> "
+          f"{322.7 - 266.4 * (1 - frac):.0f} ms")
 
     ok = ok_a and ok_b1 and ok_det and ok_b2
     print(f"RESULT: {'PASS' if ok else 'FAIL'}")
