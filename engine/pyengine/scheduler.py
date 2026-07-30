@@ -37,6 +37,34 @@ numerics are UNCHANGED (identical kernels, shapes and op order; only host
 enqueue interleaving moves), so both D13 arms carry over as they stand.
 Kill switch: PYENGINE_PIPELINE_PREFILL=0.
 
+THE PREFILL TRAVERSAL IS HOST-BOUND, SO THE DECODE STEP IS ENQUEUED FIRST
+(exp-0021). exp-0018 left the traversal sync-free but bought nothing in
+situ (exp-0020 rejected, 222.6 vs 222.9), and cutting a cohort into
+several sub-group traversals to give the layer split more to overlap made
+things WORSE, by exactly the flat term of each extra traversal and not a
+millisecond less (t_microbatch_prefill: 1.354 s -> 1.710 s at 3 sub-groups
+of 2, -> 1.544 s at 2 sub-groups of 3; _MICROBATCH is kept at 0 because of
+that measurement). t_traversal_sync_probe says why: ZERO device->host
+syncs are left in a grouped traversal (arm a) and yet its host enqueue
+takes 696 ms against a 0.1 ms DEVICE TAIL (arm b) — the four GPUs finish
+everything the moment the host stops issuing. Prefill is not
+pipeline-limited, it is PYTHON-limited, and there is no run-ahead to give
+away; two traversals back to back cost the same whether or not they are
+allowed to overlap (arm c).
+
+What that idle device time is good for is the OTHER traversal. The graphed
+decode step (exp-0012) is the opposite shape — a few ms of host work
+driving ~170 ms of GPU work — so a step that owns both should hand the
+decode replays over FIRST and then spend its prefill Python while the
+devices work through them, instead of issuing ~1.2 s of Python and only
+then giving the GPUs the decode step. That is the one thing this module
+changes: the decode traversal moves ahead of the prefill enqueue and its
+single argmax readback is deferred behind it, so a mixed step costs
+max(prefill host, decode GPU + prefill GPU) instead of the sum. Nothing
+numeric moves — identical kernels, shapes and per-row op order, only the
+order in which the host hands two independent traversals over.
+Kill switch: PYENGINE_DECODE_FIRST=0.
+
 Scope: greedy only (canonical workloads are greedy, P1), ignore_eos
 semantics (no early exit — a request runs to its max_new, D6/P1), text
 only. The B3.4 server maps wall-clock arrivals onto step boundaries via
@@ -56,6 +84,17 @@ from engine.pyengine import model as pmodel
 # exp-0013's _FUSED_ATTN — it must be constant for the process lifetime so
 # every step of a run has the same scheduling shape.
 _PIPELINE = os.environ.get("PYENGINE_PIPELINE_PREFILL", "1") != "0"
+
+# exp-0021: rows per prefill sub-group (microbatch). DEFAULT 0 = OFF =
+# exp-0017's one-group-per-admission packing, because the arms measured it
+# a straight loss (module docstring); the knob and its evidence script
+# stay so the negative result is reproducible, not so it ships.
+_MICROBATCH = int(os.environ.get("PYENGINE_PREFILL_MICROBATCH", "0"))
+
+# exp-0021 kill switch: PYENGINE_DECODE_FIRST=0 restores exp-0018's
+# prefill-then-decode issue order. Read once at import, like _PIPELINE —
+# every step of a run must have the same scheduling shape.
+_DECODE_FIRST = os.environ.get("PYENGINE_DECODE_FIRST", "1") != "0"
 
 
 class Request:
@@ -345,7 +384,22 @@ class Engine:
         list order = admission order), fixed for a given schedule; per-row
         results depend on the row COUNT through bf16 accumulation order
         (B3.1/B3.3), which is exactly the drift D13's envelope covers.
-        Returns the B next greedy tokens in row order."""
+        Returns the B next greedy tokens in row order. Kept as the
+        enqueue+readback composition (exp-0021) so every caller outside
+        the scheduler keeps a synchronous entry point."""
+        return self.decode_batch_pick(reqs, self.decode_batch_enqueue(reqs))
+
+    @torch.no_grad()
+    def decode_batch_enqueue(self, reqs):
+        """decode_batch's traversal with NO host readback; returns the
+        handle decode_batch_pick turns into tokens. exp-0021: the
+        scheduler issues this BEFORE its prefill traversal, because a
+        prefill traversal is ~700-1200 ms of HOST time with a 0.1 ms
+        device tail (no syncs are left in it — t_traversal_sync_probe
+        arms a/b), i.e. the devices are idle for all of it. Handing the
+        graphed step over first puts its GPU work under that Python
+        instead of after it. Nothing numeric moves: identical kernels,
+        identical shapes, identical per-row op order."""
         mc = self.mc
         pos = [r.ids.shape[0] - 1 + len(r.tokens) for r in reqs]
         slots = [r.states[0].slot for r in reqs]
@@ -357,8 +411,8 @@ class Engine:
                 and len(reqs) <= self._pool_batch and graphrun.enabled()):
             if self._graphrun is None:
                 self._graphrun = graphrun.GraphRunner(self)
-            out = self._graphrun.step(reqs, pos, slots)
-            return out
+            self._graphrun.step_enqueue(reqs, pos, slots)
+            return ("graph", len(reqs))
         #1. embed all previous tokens — one [B] lookup + rowwise norm
         prev = torch.tensor([r.tokens[-1] for r in reqs],
                             device=self.w_emb.device)
@@ -387,12 +441,22 @@ class Engine:
             for r in reqs:
                 for st in r.states:
                     st.cache.n += 1
-        #5. one final-logits GEMM; per-row fp32 argmax + optional capture
+        #5. one final-logits GEMM; the per-row fp32 rows stay on device
         rows = pmodel.final_logits(h, self.w_fn, self.w_un, mc.logits_mult,
                                    mc.vocab_unpadded, eps=mc.rms_eps)
+        return ("eager", [rows[i].float() for i in range(len(reqs))])
+
+    def decode_batch_pick(self, reqs, handle):
+        """The readback half of decode_batch_enqueue — the first host sync
+        that touches that traversal. Same two host reads, same order, on
+        both cores."""
+        #1. the graphed core reads its own static buffers (graphrun)
+        kind, payload = handle
+        if kind == "graph":
+            return self._graphrun.step_pick(reqs, payload)
+        #2. eager core: per-row fp32 argmax + optional capture
         out = []
-        for i, req in enumerate(reqs):
-            lg = rows[i].float()
+        for req, lg in zip(reqs, payload):
             if req.capture is not None:
                 req.capture.append(lg.cpu())
             out.append(int(lg.argmax()))
@@ -456,9 +520,30 @@ class Scheduler:
                 slot=self._free_slots.pop(0))
             req.admit_step = self.step_count
             admits.append(req)
+        #2. one decode token for every sequence admitted in a PRIOR step —
+        #   all decodable co-residents advance through ONE batched stack
+        #   traversal; running-list (= admission) order fixes the row order
+        #   This step's admissions are excluded by construction
+        #   (admit_step == step_count), so the decode traversal reads none
+        #   of the tokens the readbacks below are still holding, and it
+        #   walks disjoint pool slots.
+        #   exp-0021: it is ENQUEUED FIRST, ahead of the prefill
+        #   traversals, and only read back at #2b. A prefill traversal is
+        #   ~700-1200 ms of pure HOST time with a 0.1 ms device tail
+        #   (t_traversal_sync_probe arm b: zero syncs remain in it after
+        #   exp-0018, and the devices finish everything the instant the
+        #   host stops issuing), so with the old order the graphed decode
+        #   step's GPU work could only start after all that Python had
+        #   run. Issued first, it executes underneath it.
+        #   Kill switch PYENGINE_DECODE_FIRST=0 restores exp-0018's order.
+        todo = [req for req in self.running
+                if req.admit_step < self.step_count and not req.done]
+        dec = None
+        if todo and _DECODE_FIRST:
+            dec = self.engine.decode_batch_enqueue(todo)
         #1b. exp-0018: the groups' traversals are only ENQUEUED here; the
-        #   readbacks that end them are deferred to #2b, so no host sync
-        #   sits between them and the decode traversal below and the four
+        #   readbacks that end them are deferred to #2c, so no host sync
+        #   sits between them and the decode traversal and the four
         #   layer-split segments of successive traversals overlap
         pending = []
         for group in self._prefill_groups(admits):
@@ -470,19 +555,15 @@ class Scheduler:
                     req.tokens.append(tok)
         self.running.extend(admits)
         self.peak_running = max(self.peak_running, len(self.running))
-        #2. one decode token for every sequence admitted in a PRIOR step —
-        #   all decodable co-residents advance through ONE batched stack
-        #   traversal; running-list (= admission) order fixes the row order
-        #   This step's admissions are excluded by construction
-        #   (admit_step == step_count), so the decode traversal reads none
-        #   of the tokens #2b is still holding, and it walks disjoint pool
-        #   slots — which is why it may be enqueued behind the prefills.
-        todo = [req for req in self.running
-                if req.admit_step < self.step_count and not req.done]
+        #2b. the decode tokens — enqueued above (or, with the kill switch
+        #   thrown, run right here in exp-0018's order)
         if todo:
-            for req, tok in zip(todo, self.engine.decode_batch(todo)):
+            if dec is None:
+                dec = self.engine.decode_batch_enqueue(todo)
+            for req, tok in zip(todo,
+                                self.engine.decode_batch_pick(todo, dec)):
                 req.tokens.append(tok)
-        #2b. exp-0018: collect the deferred prefill tokens — group order
+        #2c. exp-0018: collect the deferred prefill tokens — group order
         #   then row order, i.e. the admission order #1b appended in
         for group, rows in pending:
             for req, lg in zip(group, rows):
@@ -519,7 +600,16 @@ class Scheduler:
         order) and the schedule are untouched. Stable sort on the int
         length keeps the whole partition a pure function of the admitted
         (length, order) list — deterministic — and a group of one always
-        fits (it takes the per-seq path)."""
+        fits (it takes the per-seq path).
+
+        exp-0021: each budget-packed group is then cut into consecutive
+        sub-groups of at most _MICROBATCH rows, which is what gives the
+        layer-split pipeline more than one prefill traversal to overlap
+        (module docstring). The cut is taken AFTER the length sort, so
+        sub-groups stay length-consecutive and pad rows do not grow; it
+        is a pure function of the same (length, order) list, so
+        same-schedule determinism is untouched, and it never merges rows
+        that the budget separated."""
         #1. shortest-first stable order, then greedy consecutive packing;
         #   heads = 64 on both layer shapes
         heads = self.engine.mc.g_q_heads
@@ -534,7 +624,11 @@ class Scheduler:
             tmax = t
         if cur:
             groups.append(cur)
-        return groups
+        #2. exp-0021: cut each packed group into pipeline microbatches
+        if not (_PIPELINE and _MICROBATCH >= 1):
+            return groups
+        return [g[i:i + _MICROBATCH]
+                for g in groups for i in range(0, len(g), _MICROBATCH)]
 
     def run(self, max_steps=1 << 20):
         """Drain the queues; returns {req_id: token list}."""
