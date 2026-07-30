@@ -3,9 +3,18 @@ SWA by layer id; rel-bias + log scaling pre-softmax; sconv on K,V,attn-out)
 -> residual -> rmsnorm -> MoE (sigmoid gate+bias, top-6, norm_after_topk,
 route_scale 8, +2 shared sink experts; layers 0-1 = dense MLP) -> sconv on
 moe-out -> residual. No RoPE anywhere."""
+import os
+
 import torch
 
+from engine.pyengine.kernels.attn_global import attn_global
+from engine.pyengine.kernels.attn_swa import attn_swa
 from engine.pyengine.kernels.moe_gemm import moe_experts_packed
+
+# exp-0013 kill switch: PYENGINE_FUSED_ATTN=0 restores the eager pooled
+# attention chain unchanged (read once at import — must be constant for
+# the life of the process so captured graphs match the eager warmups)
+_FUSED_ATTN = os.environ.get("PYENGINE_FUSED_ATTN", "1") != "0"
 
 
 def rmsnorm(x, weight, eps=1e-6):
@@ -543,6 +552,33 @@ def sconv_decode_batch(x, weight, rings):
     return (conv[:, :, 0] + x.float()).to(x.dtype)
 
 
+def sconv_decode_batch_pooled(x, weight, tails, slots):
+    """Window-4 sconv, POOLED batched decode form (exp-0008) — x [B, C]
+    as sconv_decode_batch; tails [S, kernel-1, C] is the site's slot pool
+    (kv.SconvPool), slots [B] the co-resident rows' slot ids. BITWISE
+    equal to sconv_decode_batch on the same state: the [B, kernel, C]
+    window holds the same values whether assembled by ONE gather + ONE
+    cat (here) or B per-row cat/stack chains (there) — assembly is
+    copying — and the depthwise conv + fp32 residual are the same ops on
+    the same shapes in the same order. The rolled tails written back by
+    ONE index_put_ are the same win[:, 1:] rows the per-ring rebind kept,
+    through the storage the per-seq ring views alias (kv.SconvRing
+    backing), so per-seq prefill/decode interleave stays coherent. slots
+    are distinct by construction (one scheduler slot per sequence) and
+    every index is a pure function of the schedule — same-schedule
+    bitwise determinism holds."""
+    #1. all B windows in one gather+cat; roll all tails in one write
+    win = torch.cat([tails[slots], x[:, None, :]], dim=1)  # [B, k, C]
+    tails[slots] = win[:, 1:]
+    wf = weight.float()
+    #2. one depthwise conv over the batch (sconv_decode_batch #2)
+    conv = torch.nn.functional.conv1d(
+        win.float().permute(0, 2, 1), wf, bias=None, padding=0,
+        groups=wf.shape[0])
+    #3. own-input residual in fp32, then downcast (sconv_decode #3)
+    return (conv[:, :, 0] + x.float()).to(x.dtype)
+
+
 def attn_decode_batch(x, wq, wk, wv, wr, wo, w_k_sconv, w_v_sconv, w_q_norm,
                       w_k_norm, rel_proj, states, pos, head_dim, is_global,
                       alpha=None, n_floor=None, eps=1e-6):
@@ -627,10 +663,40 @@ def decode_batch_ctx(pos, slots, mc, device, page_size):
             "g_dist": pos_t[:, None] - j[None, :]}
 
 
+def decode_batch_ctx_static(pos_t, slots_t, Lg, mc, page_size):
+    """exp-0012: decode_batch_ctx with STATIC shapes for CUDA-graph
+    capture — pos/slots arrive as device int64 tensors (the graph
+    runner's static input buffers, so replay sees fresh content at fixed
+    addresses) and Lg is the padded key length (a monotone 512-bucket
+    high-water mark, graphrun.GraphRunner), not max(pos)+1. Every entry
+    is the same arithmetic as decode_batch_ctx on the same values —
+    rows beyond a live position are dead by the SAME predicates (p < n /
+    j < n) the dynamic ctx uses for short rows, so the padded columns
+    are masked exactly like any other dead slot. Pure tensor ops on
+    device data: no host reads, no torch.tensor(host_list) — legal
+    inside stream capture. No "pos_host": the graph path hoists page
+    allocation out of the layer walk (attn_decode_batch_pooled #3a)."""
+    B = pos_t.shape[0]
+    device = pos_t.device
+    n = pos_t + 1
+    #1. SWA ring geometry (decode_batch_ctx #1, unchanged math)
+    s = torch.arange(mc.window, device=device)[None, :]
+    base = (n - mc.window).clamp_min(0)[:, None]
+    p = base + ((s - base) % mc.window)
+    #2. global padded-gather geometry at the FIXED bucket length
+    j = torch.arange(Lg, device=device)
+    return {"B": B, "pos": pos_t, "slots": slots_t,
+            "ring_slot": pos_t % mc.window, "swa_valid": p < n[:, None],
+            "swa_dist": pos_t[:, None] - p, "Lg": Lg,
+            "g_pageidx": j // page_size, "g_off": j % page_size,
+            "g_valid": j[None, :] < n[:, None],
+            "g_dist": pos_t[:, None] - j[None, :]}
+
+
 def attn_decode_batch_pooled(x, wq, wk, wv, wr, wo, w_k_sconv, w_v_sconv,
                              w_q_norm, w_k_norm, rel_proj, states, pool,
                              ctx, head_dim, is_global, alpha=None,
-                             n_floor=None, eps=1e-6):
+                             n_floor=None, eps=1e-6, fused=None):
     """One attention layer, POOLED batched decode form (exp-0007) — the
     per-row Python core of attn_decode_batch collapsed into per-layer
     batched ops over the layer's batch pool (kv.SwaPool / kv.GlobalPool).
@@ -648,13 +714,14 @@ def attn_decode_batch_pooled(x, wq, wk, wv, wr, wo, w_k_sconv, w_v_sconv,
     F = torch.nn.functional
     B = ctx["B"]
     n_heads, n_kv = wq.shape[0] // head_dim, wk.shape[0] // head_dim
-    #1. shared-weight projections; k/v raw through their per-row sconv
-    #   rings (ring rolls stay per-row — attack #3 is a separate spec)
+    #1. shared-weight projections; k/v raw through the pooled sconv step
+    #   (exp-0008, attack #3: one gather+cat+conv per site instead of B
+    #   per-row ring chains — bitwise equal, sconv_decode_batch_pooled)
     q = F.linear(x, wq)
-    k = sconv_decode_batch(F.linear(x, wk), w_k_sconv,
-                           [s.k_ring for s in states])
-    v = sconv_decode_batch(F.linear(x, wv), w_v_sconv,
-                           [s.v_ring for s in states])
+    k = sconv_decode_batch_pooled(F.linear(x, wk), w_k_sconv,
+                                  pool.sconv.kt, ctx["slots"])
+    v = sconv_decode_batch_pooled(F.linear(x, wv), w_v_sconv,
+                                  pool.sconv.vt, ctx["slots"])
     r = F.linear(x, wr)
     #2. per-head q/k rmsnorm across the whole batch (rowwise op)
     q = rmsnorm(q.view(B, n_heads, head_dim), w_q_norm, eps)
@@ -666,10 +733,14 @@ def attn_decode_batch_pooled(x, wq, wk, wv, wr, wo, w_k_sconv, w_v_sconv,
         #3a. page allocation is host-side (page tables + free list are
         #    host state; ensure_pages mirrors new ids on-device), then
         #    ONE index_put_ appends all rows, ONE gather fetches the
-        #    padded [B, Lg] key set — no .tolist() anywhere
+        #    padded [B, Lg] key set — no .tolist() anywhere. The CUDA-
+        #    graph path (exp-0012) passes states=None: it hoists page
+        #    allocation to before graph replay (graphrun.step #1), so
+        #    the captured region stays free of host-side work
         ps = pool.page_size
-        for b, st in enumerate(states):
-            st.cache.ensure_pages(ctx["pos_host"][b] // ps)
+        if states is not None:
+            for b, st in enumerate(states):
+                st.cache.ensure_pages(ctx["pos_host"][b] // ps)
         table = pool.table_dev[slots]                      # [B, num_pages]
         flat_new = (table.gather(1, (ctx["pos"] // ps)[:, None])[:, 0] * ps
                     + ctx["pos"] % ps)
@@ -678,13 +749,42 @@ def attn_decode_batch_pooled(x, wq, wk, wv, wr, wo, w_k_sconv, w_v_sconv,
         valid, dist, L = ctx["g_valid"], ctx["g_dist"], ctx["Lg"]
         flat = table[:, ctx["g_pageidx"]] * ps + ctx["g_off"][None, :]
         flat = torch.where(valid, flat, torch.zeros_like(flat))
-        K = pool.kp.view(-1, n_kv, head_dim)[flat]         # [B, L, H, D]
-        V = pool.vp.view(-1, n_kv, head_dim)[flat]
     else:
         pool.k[slots, ctx["ring_slot"]] = k
         pool.v[slots, ctx["ring_slot"]] = v
         valid, dist = ctx["swa_valid"], ctx["swa_dist"]
         L = pool.k.shape[1]
+    if fused is None:
+        fused = _FUSED_ATTN
+    if fused:
+        #4f. fused two-shape kernel path (exp-0013): the rel-logit mix
+        #    (rel_bias #1) and the tau round-trip stay in torch — tiny,
+        #    and the per-row scalar tau multiply commutes with the
+        #    kernel's bias gather at identical rounding points (scale
+        #    then round then gather == gather then scale then round,
+        #    elementwise; masked lanes are 0 either way). ONE flash-
+        #    decode kernel per layer then reads K/V IN PLACE from the
+        #    pool — the [B, L, H, D] gather copies, matmul-contiguity
+        #    copies and [B, H, 1, L] score/bias intermediates of the
+        #    eager chain below are never materialized
+        #    (kernels/attn_swa.py has the numerics contract)
+        rl = torch.matmul(r.view(B, n_heads, -1), rel_proj)
+        if is_global and n_floor is not None:
+            tau = log_scale_tau(ctx["pos"], alpha, n_floor)
+            q = (q.float() * tau[:, None, None]).to(q.dtype)
+            rl = (rl.float() * tau[:, None, None]).to(rl.dtype)
+        if is_global:
+            out = attn_global(q.contiguous(), pool.kp, pool.vp,
+                              flat.contiguous(), ctx["pos"],
+                              rl.contiguous(), L)
+        else:
+            out = attn_swa(q.contiguous(), pool.k, pool.v, slots,
+                           ctx["pos"], rl.contiguous())
+        return F.linear(out.reshape(B, n_heads * head_dim), wo)
+    if is_global:
+        K = pool.kp.view(-1, n_kv, head_dim)[flat]         # [B, L, H, D]
+        V = pool.vp.view(-1, n_kv, head_dim)[flat]
+    else:
         K = pool.k[slots]                                  # [B, 512, H, D]
         V = pool.v[slots]
     #4. rel bias over the whole (row, key-slot) grid — rel_bias's exact
@@ -740,14 +840,16 @@ def layer_decode_batch(x, w, states, pos, mc, layer_idx, ctx=None,
             w["vsc"], w["qn"], w["kn"], w["proj"], states, pool, ctx,
             mc.head_dim, is_global, alpha=mc.log_alpha,
             n_floor=mc.log_floor, eps=mc.rms_eps)
+        h = sconv_decode_batch_pooled(h, w["attn_sconv"], pool.sconv.at,
+                                      ctx["slots"])
     else:
         h = attn_decode_batch(
             h, w["wq"], w["wk"], w["wv"], w["wr"], w["wo"], w["ksc"],
             w["vsc"], w["qn"], w["kn"], w["proj"], states, pos,
             mc.head_dim, is_global, alpha=mc.log_alpha,
             n_floor=mc.log_floor, eps=mc.rms_eps)
-    h = sconv_decode_batch(h, w["attn_sconv"],
-                           [s.attn_ring for s in states])
+        h = sconv_decode_batch(h, w["attn_sconv"],
+                               [s.attn_ring for s in states])
     x = x + h
     #2. MLP half: dense MLP / MoE consume the [B, hidden] token batch
     h = rmsnorm(x, w["mlp_norm"], mc.rms_eps)
@@ -758,7 +860,12 @@ def layer_decode_batch(x, w, states, pos, mc, layer_idx, ctx=None,
         h = moe(h, w["gate_w"], w["gate_b"], w["gate_gs"], w["gu"],
                 w["w2"], w["shg"], w["shu"], w["shd"], mc.topk,
                 mc.n_shared, mc.route_scale)
-    h = sconv_decode_batch(h, w["mlp_sconv"], [s.mlp_ring for s in states])
+    if ctx is not None:
+        h = sconv_decode_batch_pooled(h, w["mlp_sconv"], pool.sconv.mt,
+                                      ctx["slots"])
+    else:
+        h = sconv_decode_batch(h, w["mlp_sconv"],
+                               [s.mlp_ring for s in states])
     return x + h
 
 
