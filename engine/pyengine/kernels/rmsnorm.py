@@ -50,8 +50,15 @@ def rmsnorm(x, weight, eps=1e-6):
     out = torch.empty_like(x2)
     BLOCK_N = triton.next_power_of_2(n)
     assert BLOCK_N <= 16384, f"row width {n} exceeds single-block rmsnorm"
+    #3. launch in the TENSOR's device context, like every other kernel
+    #   wrapper here (attn_*, sconv_prefill, moe_gemm*, fp4_quant): the
+    #   engine splits the 66 layers over 4 GPUs, so x rarely lives on the
+    #   current device and Triton validates its pointers against the
+    #   current context ("cannot be accessed from Triton"). Launch
+    #   configuration only — no numerics, so B2.3's gate is untouched.
     if x2.shape[0]:
-        _rmsnorm_kernel[(x2.shape[0],)](
-            x2, weight.contiguous(), out, n, x2.stride(0), eps,
-            BLOCK_N=BLOCK_N, num_warps=8 if BLOCK_N >= 2048 else 4)
+        with torch.cuda.device(x.device):
+            _rmsnorm_kernel[(x2.shape[0],)](
+                x2, weight.contiguous(), out, n, x2.stride(0), eps,
+                BLOCK_N=BLOCK_N, num_warps=8 if BLOCK_N >= 2048 else 4)
     return out.view(x.shape)
