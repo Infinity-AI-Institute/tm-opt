@@ -454,3 +454,70 @@ commit the spec pins, the worker logs `WARNING: candidate commit <sha> lacks
 [ralph] prefix` (seen on exp-0022's b1a28ba and exp-0024's b6f8831; it is
 non-blocking, both ran). Use `git merge --no-edit -m "[ralph] exp(<id>): merge
 main"` so the pinned commit carries the prefix like every other one.
+
+## exp-0027-fused-moe-out REJECTED 2026-07-30 — the kernel takes an ILLEGAL
+## MEMORY ACCESS on the first conc-64 prefill group; the trace is captured
+Post-mortem written by exp-0029's iteration. There is NO ledger row: the
+worker died before it could write one, so `experiments/queue/
+exp-0027-fused-moe-out.log` is the whole record. Its sequence is
+worktree(691c6a6) -> D13 teacher-forced gate (GREEN, the worker printed no
+failure) -> `[bench] TIMEBOXED warmup 64 reqs @ conc 64 osl 128` ->
+`HTTPError: 500` out of /v1/completions -> `accepted: false, reason: null`.
+A 500 from this server means the ENGINE THREAD died (server.py:193-198
+records the traceback, wakes every waiter; handlers then answer
+`engine died:\n<traceback>`, :390-398), and that traceback goes to stderr ->
+serve.log INSIDE the worker's worktree -> destroyed by `git worktree remove
+--force` on the way out. That is exp-0020's lesson 2 verbatim, unaddressed,
+costing its second experiment.
+
+WHAT THE TRACE SAYS. It was recoverable this time only because exp-0028's
+pinned commit e14d829 has 691c6a6 as an ancestor (`git merge-base
+--is-ancestor` YES), so the dispatcher was re-running the same code while
+this iteration was reading; the live worktree's serve.log was snapshotted
+before the worker exited and is committed evidence at
+`/workspace/logs/serve_exp0028_WORKER_CRASH.log`. It reproduces exactly:
+
+    server.py:257 sched.step
+    scheduler.py:552  engine.prefill_batch_enqueue(group)
+    scheduler.py:344  pmodel.layer_prefill(...)
+    model.py:634 -> :435 moe_experts -> :339 moe_experts_w4a4
+    moe_gemm_w4a4.py:283  moe_out_reduce(c2, rows, topk_weights, K)
+    moe_out.py:111  _moe_out_kernel[(T, K // block)](...)
+    RuntimeError: Triton Error [CUDA]: an illegal memory access
+
+So: PREFILL, not decode; the GROUPED cohort path (`_prefill_batch_rows`),
+not the singleton path; and it fires on the FIRST bench group — the server
+came ready at 22:23:30, served the gate's 402 requests clean, and died at
+22:24:52, ~80 s later. Both engines' D13 gates pass because the gate is
+teacher-forced and SEQUENTIAL: it only ever forms singleton prefill groups
+(scheduler.prefill_batch's own docstring says so), so the shape that fails
+is one the gate cannot construct. exp-0027's isolated arm validated
+T=4,800 (a 6-row cohort) and its in-situ arm ran 8-row groups; the bench's
+first group is up to max_batch=64 length-sorted rows, i.e. T = B*Tmax
+~= 51,200 tokens and P = T*6 ~= 307,200 pair rows — 10.7x the largest
+shape either arm ever launched. NOTHING in the evidence chain covered it.
+
+CONSEQUENCES, in the order they bite.
+(1) exp-0028 IS ALREADY LOST — it pins e14d829, which contains the faulting
+    kernel, and it died the same way at 22:24:52. Its own mechanism (the
+    fused shared-expert epilogues) is UNJUDGED and, like exp-0018 before
+    it, should be resubmitted once the base is fixed: its arms were bitwise
+    (0 of 29.5M / 0 of 393K), its gate was green and its in-situ deltas
+    were measured against everything else fixed.
+(2) The accepted lineage tip is 94f81e5 (exp-0026, 514.2 tok/s). 691c6a6
+    and e14d829 are NOT accepted bases. Do not build on them until the
+    illegal access is fixed and reproduced-green at cohort scale.
+(3) LESSON, and it generalizes past this kernel: an experiment's local
+    evidence must include the shape the CANONICAL BOX will hand it, not
+    the shape that was convenient to test. The canonical config is conc 64
+    and the scheduler packs one length-sorted prefill group per step, so
+    the prefill shape any prefill-path kernel must survive is B up to 64,
+    T = B*Tmax, P = 6*T — not the 6-8 row cohort the in-situ harness
+    builds. Every fused-prefill kernel merged since exp-0022 was validated
+    only at 6-8 rows; they have all SURVIVED the box, so this is a gap in
+    the evidence, not a claim about them, but exp-0027 is proof the gap is
+    load-bearing.
+(4) The D13 teacher-forced gate is NOT a crash gate for grouped prefill.
+    It is sequential by construction. Passing it says nothing about
+    conc-64 group shapes, and two iterations in a row have read a green
+    gate as "the tree runs".
