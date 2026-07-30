@@ -131,8 +131,11 @@ def attn_swa(q, pool_k, pool_v, slots, pos, rel):
     assert rel.shape == (B, HQ, W), (rel.shape, (B, HQ, W))
     assert slots.dtype == torch.int64 and pos.dtype == torch.int64
     out = torch.empty_like(q)
-    _attn_decode_kernel[(B, HK)](
-        q, out, pool_k, pool_v, rel, pos, slots, pos, W, 1.0 / D,
-        E=W, HK=HK, REP=HQ // HK, HQ=HQ, D=D, W=W, IS_SWA=True,
-        BLOCK_L=128, REP_PAD=16, num_warps=4)
+    #2. launch on the layer's device (layers are split across devices;
+    #   Triton launches on the CURRENT device — moe_gemm.py precedent)
+    with torch.cuda.device(q.device):
+        _attn_decode_kernel[(B, HK)](
+            q, out, pool_k, pool_v, rel, pos, slots, pos, W, 1.0 / D,
+            E=W, HK=HK, REP=HQ // HK, HQ=HQ, D=D, W=W, IS_SWA=True,
+            BLOCK_L=128, REP_PAD=16, num_warps=4)
     return out
