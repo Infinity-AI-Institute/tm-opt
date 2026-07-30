@@ -139,3 +139,31 @@ One trap for the record: tl.inline_asm_elementwise with pack=4 on uint8
 inputs SILENTLY mispacks whenever a thread owns fewer than 4 elements
 (passthrough probe in /workspace/logs/t_asm_map_probe2.py) — use pack=1
 with a widened b32 input, or guard with a full-tile bitwise check.
+
+## exp-0011-insitu-phase-profile (rejected 2026-07-30, 61.4 vs bar 70.2 — by design)
+Post-mortem (control row, rejection expected): the experiment delivered its
+deliverable — /workspace/logs/insitu_phase_exp0011_2026-07-30.log, in-situ at
+conc 64 on the exp-0009 engine: dec_enq 107.1 s of dec_wall 108.4 s over 256
+steps (host enqueue 98.8% of step wall, exposed GPU tail 1.2%), glue+idle
+small — which adjudicated fork option (a): host-dispatch deletion. The
+INTERPRETIVE LESSON that must outlive it: host-enqueue share of WALL cannot
+distinguish "host-bound with idle GPU" from "host and GPU near-parity" —
+when the GPU trails the enqueue closely, deleting dispatch yields ~nothing.
+exp-0012's A/B resolved exactly this: the graphed step (host ~free) ran
+473 ms vs eager 476.6 ms — the decode step was ALREADY GPU-bound (58% grouped
+NVFP4 GEMMs, 28% attention gather copies; t_graph_profile_exp0012 log). A
+phase profiler that wants to rank dispatch-deletion must also measure GPU
+busy time per phase (CUPTI/events), not just host walls and sync tails.
+
+## exp-0012 implementation note: multi-GPU torch.cuda.graph capture
+torch.cuda.graph without an explicit `stream=` uses a CLASS-LEVEL
+default_capture_stream created on whichever device is current at the FIRST
+capture in the process (torch/cuda/graphs.py). Every later capture on a
+DIFFERENT device then records on the wrong device's stream: small probes
+"succeed" with an EMPTY graph (UserWarning "graph is empty ... wrong device
+or stream"), real segments die with cudaErrorStreamCaptureInvalidated. Fix:
+keep one torch.cuda.Stream() per device and pass it explicitly (pool sharing
+also wants the same stream per pool). Also for the record: torch.bincount is
+capture-illegal (data-dependent output size -> hidden device sync);
+torch.searchsorted on the pre-sorted list yields bit-identical segment
+offsets and is capture-safe.
