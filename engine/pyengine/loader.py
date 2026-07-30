@@ -10,6 +10,8 @@ from dataclasses import dataclass
 import torch
 from safetensors import safe_open
 
+from .kernels.dequant import dequant_nvfp4_triton
+
 N_MODEL_SHARDS = 33            # model-XXXXX-of-00033.safetensors (CLAUDE.md model facts)
 MTP_SHARD = "mtp.safetensors"  # MTP draft layers, separate file, listed in the index
 
@@ -279,10 +281,16 @@ class PackedExperts:
 
     def __getitem__(self, e):
         """Dequant expert e alone -> bf16 [rows, cols] on the pack's
-        device (bit-equal to any chunked dequant of the same bytes)."""
-        #1. one-expert slice through the proven B1.4 dequant
-        deq = dequant_nvfp4(self.packed[e:e + 1], self.scale[e:e + 1],
-                            self.scale2[e:e + 1], self.group_size)[0]
+        device (bit-equal to any chunked dequant of the same bytes).
+        exp-0002: routed through the one-pass Triton kernel — bit-equal
+        to dequant_nvfp4 (verified over all 256 byte patterns + random
+        expert-shaped packs) at ~7x less HBM traffic; the eager form's
+        per-element int64/fp32 temporaries made on-demand dequant the
+        measured majority of the batched decode step wall."""
+        #1. one-expert slice through the bit-equal Triton port of the
+        #   proven B1.4 dequant (kernels/dequant.py)
+        deq = dequant_nvfp4_triton(self.packed[e:e + 1], self.scale[e:e + 1],
+                                   self.scale2[e:e + 1], self.group_size)[0]
         #2. w13 rows are stored interleaved [g0,u0,g1,u1,..]: de-interleave
         #   into [gates;ups] halves — exact mirror of transformers'
         #   Interleave conversion (proven bit-exact vs HF's own op, B2.1)
