@@ -69,11 +69,50 @@ def _e2m1(n):
     m * 0x3F000000. Sign = nibble bit 3 -> fp32 bit 31 (m=0 gives -0.0,
     exactly like the reference's -v of +0.0). Bit patterns ARE the exact
     constants {0,.5,1,1.5,2,3,4,6} — bitwise-checked against
-    loader.dequant_nvfp4 over all 256 byte patterns (t_moe_grouped arm 0)."""
+    loader.dequant_nvfp4 over all 256 byte patterns (t_moe_grouped arm 0).
+    exp-0010: retained as the reference/test anchor; the kernels' hot path
+    now uses _fp4_pair's hardware convert, bit-identical to this chain."""
     m = n & 7
     bits = tl.where(m < 2, m * 0x3F000000,
                     ((126 + (m >> 1)) << 23) | ((m & 1) << 22))
     return (bits | ((n & 8) << 28)).to(tl.float32, bitcast=True)
+
+
+#exp-0010: one packed-nibble byte (widened to b32) -> one uint32 f16x2
+#pair, BOTH e2m1 values converted by ONE hardware instruction
+#(cvt.rn.f16x2.e2m1x2, PTX 8.6, sm_100a+ — the exact asm form of CUDA
+#13.0's __nv_cvt_fp4x2_to_halfraw2, cuda_fp4.hpp:360). Low nibble lands
+#in the low f16, signs and -0.0 preserved: bitwise vs the _e2m1 chain
+#over all 256 bytes x 18 scales AND full-kernel-output bitwise vs the
+#_e2m1 kernels at T=8/512 (t_moe_cvt_exp0010 log). pack=1 keeps one
+#element per register — pack=4 silently mispacks whenever a thread owns
+#fewer than 4 elements (passthrough probe, same log), so it is BANNED
+#here even though it would save the mov.
+_FP4_ASM = tl.constexpr("""
+{
+.reg .b8 t0, t1, t2, t3;
+mov.b32 {t0, t1, t2, t3}, $1;
+cvt.rn.f16x2.e2m1x2 $0, t0;
+}
+""")
+
+
+@triton.jit
+def _fp4_pair(b):
+    """4-bit-pair byte tensor -> (low-nibble f16, high-nibble f16), exact
+    e2m1 values via the Blackwell hardware convert. e2m1 -> f16 is exact
+    (all 8 magnitudes representable) and f16 -> fp32 widening is exact,
+    so fp32(value) * fp32(scale) -> RTNE bf16 downstream is BIT-IDENTICAL
+    to the _e2m1 reference chain — but skips its ~10 integer-ALU ops per
+    element (exp-0005 kernel table: these two kernels are 179 ms GPU of
+    the B=64 decode step; exp-0009 profile: 93% of prefill CUDA; measured
+    1.21x whole-kernel at both operating points, t_moe_cvt log)."""
+    pair = tl.inline_asm_elementwise(
+        asm=_FP4_ASM, constraints="=r,r", args=[b.to(tl.uint32)],
+        dtype=tl.uint32, is_pure=True, pack=1)
+    lo = (pair & 0xFFFF).to(tl.uint16).to(tl.float16, bitcast=True)
+    hi = (pair >> 16).to(tl.uint16).to(tl.float16, bitcast=True)
+    return lo, hi
 
 
 @triton.jit
@@ -122,21 +161,19 @@ def _gate_up_silu_kernel(x_ptr, pk_ptr, sc_ptr, s2_ptr, tok_ptr, offs_ptr,
             pb = k0 // 2 + tl.arange(0, HALF)
             g_rows = 2 * n_offs
             u_rows = 2 * n_offs + 1
-            bg = tl.load(pk_e + g_rows[:, None] * stride_pr
-                         + pb[None, :]).to(tl.int32)
+            bg = tl.load(pk_e + g_rows[:, None] * stride_pr + pb[None, :])
             sg = tl.load(sc_e + g_rows[:, None] * stride_sr
                          + (pb // 8)[None, :]).to(tl.float32) * s2
-            wg = tl.interleave((_e2m1(bg & 0x0F) * sg).to(tl.bfloat16),
-                               (_e2m1((bg >> 4) & 0x0F) * sg)
-                               .to(tl.bfloat16))
+            glo, ghi = _fp4_pair(bg)
+            wg = tl.interleave((glo.to(tl.float32) * sg).to(tl.bfloat16),
+                               (ghi.to(tl.float32) * sg).to(tl.bfloat16))
             acc_g += tl.dot(xt, tl.trans(wg))
-            bu = tl.load(pk_e + u_rows[:, None] * stride_pr
-                         + pb[None, :]).to(tl.int32)
+            bu = tl.load(pk_e + u_rows[:, None] * stride_pr + pb[None, :])
             su = tl.load(sc_e + u_rows[:, None] * stride_sr
                          + (pb // 8)[None, :]).to(tl.float32) * s2
-            wu = tl.interleave((_e2m1(bu & 0x0F) * su).to(tl.bfloat16),
-                               (_e2m1((bu >> 4) & 0x0F) * su)
-                               .to(tl.bfloat16))
+            ulo, uhi = _fp4_pair(bu)
+            wu = tl.interleave((ulo.to(tl.float32) * su).to(tl.bfloat16),
+                               (uhi.to(tl.float32) * su).to(tl.bfloat16))
             acc_u += tl.dot(xt, tl.trans(wu))
         #3. epilogue mirrors the eager rounding chain exactly
         g = acc_g.to(tl.bfloat16).to(tl.float32)
@@ -180,12 +217,12 @@ def _down_scale_kernel(act_ptr, pk_ptr, sc_ptr, s2_ptr, wt_ptr, perm_ptr,
                          + (k0 + tl.arange(0, BLOCK_K))[None, :],
                          mask=m_mask[:, None], other=0.0)
             pb = k0 // 2 + tl.arange(0, HALF)
-            b = tl.load(pk_e + n_offs[:, None] * stride_pr
-                        + pb[None, :]).to(tl.int32)
+            b = tl.load(pk_e + n_offs[:, None] * stride_pr + pb[None, :])
             s = tl.load(sc_e + n_offs[:, None] * stride_sr
                         + (pb // 8)[None, :]).to(tl.float32) * s2
-            w = tl.interleave((_e2m1(b & 0x0F) * s).to(tl.bfloat16),
-                              (_e2m1((b >> 4) & 0x0F) * s).to(tl.bfloat16))
+            blo, bhi = _fp4_pair(b)
+            w = tl.interleave((blo.to(tl.float32) * s).to(tl.bfloat16),
+                              (bhi.to(tl.float32) * s).to(tl.bfloat16))
             acc += tl.dot(at, tl.trans(w))
         #1. epilogue: bf16 GEMM store, then * routing weight (fp32 opmath,
         #   one round) — eager's (h * w).to(bf16); scatter to original row
