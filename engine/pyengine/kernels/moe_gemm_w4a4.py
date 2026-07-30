@@ -138,23 +138,28 @@ class _Prep:
         self.gs2 = float(pack2.input_amax) / (F8_MAX * 6.0)
         dev = pack13.packed.device
         E = pack13.packed.shape[0]
-        #keep the torch views alive for the cute tensors' lifetime
-        self._b13_t = pack13.packed.view(torch.float4_e2m1fn_x2).transpose(1, 2)
-        self._b2_t = pack2.packed.view(torch.float4_e2m1fn_x2).transpose(1, 2)
-        self.b13 = _to_cute(self._b13_t)
-        self.b2 = _to_cute(self._b2_t)
-        self.sfb13 = _sfb_blocked(pack13.scale)
-        self.sfb2 = _sfb_blocked(pack2.scale)
-        self.sfb13_c = _to_cute(self.sfb13)
-        self.sfb2_c = _to_cute(self.sfb2)
-        self.gsa13 = torch.full((E,), self.gs13, dtype=torch.float32,
-                                device=dev)
-        self.gsa2 = torch.full((E,), self.gs2, dtype=torch.float32,
-                               device=dev)
-        self.gsa13_c = _to_cute(self.gsa13)
-        self.gsa2_c = _to_cute(self.gsa2)
-        self.gsb13_c = _to_cute(pack13.scale2)
-        self.gsb2_c = _to_cute(pack2.scale2)
+        #dlpack export requires the CURRENT device to be the tensors' one
+        #(layers live spread across 4 GPUs, exp-0002 lesson)
+        with torch.cuda.device(dev):
+            #keep the torch views alive for the cute tensors' lifetime
+            self._b13_t = pack13.packed.view(
+                torch.float4_e2m1fn_x2).transpose(1, 2)
+            self._b2_t = pack2.packed.view(
+                torch.float4_e2m1fn_x2).transpose(1, 2)
+            self.b13 = _to_cute(self._b13_t)
+            self.b2 = _to_cute(self._b2_t)
+            self.sfb13 = _sfb_blocked(pack13.scale)
+            self.sfb2 = _sfb_blocked(pack2.scale)
+            self.sfb13_c = _to_cute(self.sfb13)
+            self.sfb2_c = _to_cute(self.sfb2)
+            self.gsa13 = torch.full((E,), self.gs13, dtype=torch.float32,
+                                    device=dev)
+            self.gsa2 = torch.full((E,), self.gs2, dtype=torch.float32,
+                                   device=dev)
+            self.gsa13_c = _to_cute(self.gsa13)
+            self.gsa2_c = _to_cute(self.gsa2)
+            self.gsb13_c = _to_cute(pack13.scale2)
+            self.gsb2_c = _to_cute(pack2.scale2)
 
 
 def _prep(pack13, pack2):
