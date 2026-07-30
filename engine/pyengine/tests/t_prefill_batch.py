@@ -140,6 +140,28 @@ def main():
     print(f"[t_prefill_batch] RATIO serial/grouped = {wall_s / wall_g:.2f}x",
           flush=True)
 
+    #6. arm S2 (exp-0017) — the serial arm RE-RUN on the now-warm engine.
+    #   Arm S runs first and pays every first-call cost the steady-state
+    #   bench never sees again (the CUTE DSL grouped-GEMM compiles per
+    #   device x shape, Triton autotune, cuBLAS heuristics), so S/G
+    #   overstates the ratio the cycle model needs. S2/G is the honest
+    #   one; S2 must reproduce S's tokens exactly (same path, same
+    #   states, deterministic kernels).
+    reqs = fresh(eng, ids_list)
+    torch.cuda.synchronize()
+    t0 = time.time()
+    tok_s2 = [eng.prefill(r) for r in reqs]
+    for d in range(torch.cuda.device_count()):
+        torch.cuda.synchronize(d)
+    wall_s2 = time.time() - t0
+    assert tok_s2 == tok_s, "warm serial arm changed the per-seq tokens"
+    release(eng, reqs)
+    print(f"[t_prefill_batch] S2 serial  {wall_s2:8.2f} s "
+          f"({wall_s2 / N_REQ * 1e3:6.1f} ms/seq), JIT share of S "
+          f"{(wall_s - wall_s2) / wall_s * 100:.0f}%", flush=True)
+    print(f"[t_prefill_batch] RATIO warm serial/grouped = "
+          f"{wall_s2 / wall_g:.2f}x", flush=True)
+
 
 if __name__ == "__main__":
     main()
