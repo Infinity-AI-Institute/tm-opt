@@ -116,3 +116,26 @@ validated, bitwise gate path preserved via singleton fall-through) is
 saved at /workspace/logs/prefill_batch_groundwork_exp0009.diff against
 tree eab6676. The endgame for the dequant ALU floor itself is native-FP4
 tensor-core MMA (tl.dot_scaled) — a separate, larger experiment.
+
+## 2026-07-30 — tl.dot_scaled native-NVFP4 MMA: dead on Triton 3.6 / sm_103a (exp-0010 iteration)
+The exp-0009 ranked-next attack "native-FP4 tensor-core MMA to delete the
+dequant ALU floor" was tried first this iteration and is unimplementable on
+the installed toolchain: Triton 3.6's dot_scaled API accepts NVFP4 exactly
+(e2m1 operand + float8_e4m3fn scales at group 16 — semantic.py
+verify_scaled_shape), but EVERY bf16-lhs x e2m1+e4m3-scale-rhs shape tried
+((16..128) x (64..128) x (64..128)) dies in the same place: an MLIR
+internal assert (`isIntOrIndex` in DenseElementsAttr::get) inside the
+TritonGPUAccelerateMatmul pass — a compiler bug in the cuda:103 backend,
+same family as the BLOCK_M-64 shared-layout crash exp-0009 logged. Repro
+scripts + full dumps: /workspace/logs/t_ds_probe_exp0010.py,
+/workspace/logs/t_moe_ds_exp0010.py. Do NOT re-try dot_scaled on Triton
+3.6; the attack stays live only as (a) a Triton-upgrade experiment in a
+separate venv or (b) the CUTLASS/CUDA port of moe_gemm (D5 roadmap). What
+IS available on this toolchain — the hardware convert instruction
+cvt.rn.f16x2.e2m1x2 via inline asm, bit-identical to the _e2m1 chain —
+shipped as exp-0010 (1.21x both kernels; the residual floor is now the
+convert pipe at ~2.5 cvt-class ops/element, which only native MMA removes).
+One trap for the record: tl.inline_asm_elementwise with pack=4 on uint8
+inputs SILENTLY mispacks whenever a thread owns fewer than 4 elements
+(passthrough probe in /workspace/logs/t_asm_map_probe2.py) — use pack=1
+with a widened b32 input, or guard with a full-tile bitwise check.
