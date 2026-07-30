@@ -134,13 +134,45 @@ class EngineLoop:
     """The single CUDA thread: drains wall-clock arrivals into the B3.3
     Scheduler at step boundaries and steps while work exists. HTTP threads
     talk to it only through submit() (thread-safe queue) and the
-    per-request done_event set by the retire callback."""
+    per-request done_event set by the retire callback.
+
+    COHORT-FORMING ADMISSION (exp-0017). Arrivals land in a pool, not
+    straight in the scheduler: the scheduler admits every due arrival the
+    moment a slot frees, so under the bench's per-completion arrival
+    pattern prompts reach Scheduler._prefill_groups ONE AT A TIME and
+    every batched prefill group degenerates to a singleton (the measured
+    exp-0014 failure — DEADENDS post-mortem: 'grouping must be triggered
+    by the scheduler's own cohort-retire signal, not by a wall-clock
+    accumulation window racing HTTP arrivals'). The pool releases when
+    (a) nothing is generating — a sequential singleton stream, the D13
+    gate and cold start keep the batch-1-exact per-seq path and never
+    stall; (b) PREFILL_COHORT prompts have gathered AND that many slots
+    are free, i.e. a retiring cohort has actually freed room for them —
+    released together they prefill as ONE group, then run and retire in
+    lockstep, so their replacements co-arrive and the cohort structure
+    is self-sustaining after the first round; or (c) COHORT_HOLD_S has
+    passed (safety valve — bootstrap and ragged tails admit what fits).
+    Only the number of free slots and the pool size gate the release;
+    wall clock enters solely through the valve. Scheduler.step() stays a
+    pure function of its input schedule (the t_b3 determinism arm pins
+    arrival steps and drives the scheduler directly), so same-schedule
+    bitwise repeatability is untouched."""
+
+    #1. cohort target: 6 co-prefilled canonical prompts put ~124
+    #   (token, expert) rows on each of the 256 experts (6 x T=736 x
+    #   top6 / 256), i.e. ONE 128-row native-MMA M tile per expert —
+    #   the tile the W4A4 grouped GEMM (exp-0015a/0016/0015b) already
+    #   pays in full for the ~17 rows a single sequence routes there
+    PREFILL_COHORT = 6
+    COHORT_HOLD_S = 4.0
 
     def __init__(self, engine, max_batch):
-        #1. scheduler + inbox + lifecycle state
+        #1. scheduler + inbox + cohort pool + lifecycle state
         self.sched = psched.Scheduler(engine, max_batch,
                                       on_retire=self._retire)
         self.inbox = queue.Queue()
+        self._pend = []
+        self._pend_since = 0.0
         self.error = None
         self._stop = threading.Event()
         self.thread = threading.Thread(target=self._run,
@@ -173,21 +205,59 @@ class EngineLoop:
         req.ids = req.ids.to(self.sched.engine.w_emb.device)
         self.sched.submit(req, arrival_step=self.sched.step_count)
 
+    def _pool(self, req):
+        #1. hold an arrival for cohort formation; the wait clock starts on
+        #   the pool's first member
+        if not self._pend:
+            self._pend_since = time.time()
+        self._pend.append(req)
+
+    def _release_count(self):
+        """How many pooled arrivals to hand the scheduler this iteration —
+        the class docstring's (a)/(b)/(c). Never more than the free slots:
+        a request the scheduler cannot admit now would sit in its waiting
+        list and be admitted alone later, which is the fragmentation this
+        pool exists to prevent."""
+        #1. (a) nothing is generating -> admit everything, never stall
+        if not self.sched.running and not self.sched.waiting:
+            return len(self._pend)
+        free = (self.sched.max_batch - len(self.sched.running)
+                - len(self.sched.waiting))
+        if free <= 0:
+            return 0
+        #2. (b) a cohort has gathered and a retiring cohort's slots are
+        #   free for it -> release (the excess over PREFILL_COHORT rides
+        #   along; Scheduler._prefill_groups repartitions under its own
+        #   padded-scores budget)
+        if len(self._pend) >= self.PREFILL_COHORT >= 1 and \
+                free >= self.PREFILL_COHORT:
+            return min(len(self._pend), free)
+        #3. (c) safety valve
+        if time.time() - self._pend_since >= self.COHORT_HOLD_S:
+            return min(len(self._pend), free)
+        return 0
+
     def _run(self):
-        #1. drain arrivals + step while work exists; when idle, block
-        #   briefly on the inbox instead of spinning
+        #1. drain arrivals into the cohort pool + step while work exists;
+        #   when idle, block briefly on the inbox instead of spinning
         try:
             while not self._stop.is_set():
                 while True:
                     try:
-                        self._admit(self.inbox.get_nowait())
+                        self._pool(self.inbox.get_nowait())
                     except queue.Empty:
                         break
+                n = self._release_count() if self._pend else 0
+                if n:
+                    for req in self._pend[:n]:
+                        self._admit(req)
+                    del self._pend[:n]
+                    self._pend_since = time.time()
                 if self.sched.waiting or self.sched.running:
                     self.sched.step()
                     continue
                 try:
-                    self._admit(self.inbox.get(timeout=0.05))
+                    self._pool(self.inbox.get(timeout=0.05))
                 except queue.Empty:
                     pass
         except Exception:
@@ -195,6 +265,8 @@ class EngineLoop:
             #   waiter (their handlers answer 500 — finish_step is None)
             self.error = traceback.format_exc()
             sys.stderr.write(self.error)
+            for r in self._pend:
+                r.done_event.set()
             for _, _, r in self.sched.waiting:
                 r.done_event.set()
             for r in self.sched.running:
@@ -409,6 +481,11 @@ class Handler(BaseHTTPRequestHandler):
                 pass
 
 
+class _BacklogHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer with a deep listen backlog (see serve())."""
+    request_queue_size = 256
+
+
 def serve(eng, tok, host="127.0.0.1", port=8200, max_batch=64,
           model_name=MODEL_DIR):
     """Start the engine-loop thread and build the HTTP server (bound, not
@@ -417,8 +494,15 @@ def serve(eng, tok, host="127.0.0.1", port=8200, max_batch=64,
     #1. engine loop thread — all CUDA work lives there
     loop = EngineLoop(eng, max_batch)
     loop.start()
-    #2. threaded HTTP server sharing one context
-    httpd = ThreadingHTTPServer((host, port), Handler)
+    #2. threaded HTTP server sharing one context. Listen backlog raised
+    #   off socketserver's default 5: the bench opens its whole
+    #   concurrency at warmup in one blast, and a 5-deep accept queue
+    #   dropped three of exp-0014's 64 bench threads before they wrote a
+    #   status line (-4% headline on a run whose engine was fine) — the
+    #   exp-0014 post-mortem asks every later engine change to carry
+    #   this. Measurement hygiene only: the backlog is the kernel's
+    #   pre-accept queue depth and cannot make a served request faster.
+    httpd = _BacklogHTTPServer((host, port), Handler)
     httpd.daemon_threads = True
     httpd.ctx = _Ctx(tok, loop, eng.mc, model_name,
                      eng.num_pages * pkv.PAGE_SIZE)

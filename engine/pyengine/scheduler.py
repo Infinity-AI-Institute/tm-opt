@@ -6,9 +6,12 @@ DECODE IS BATCHED (Stage-3 exp-0001; supersedes B3.3's batch-1-bitwise
 design note): a step advances ALL decodable co-residents through ONE
 stack traversal (Engine.decode_batch / model.layer_decode_batch), so each
 layer's weights are read once per step, not once per sequence. Prefill is
-unchanged — whole-prompt, per-sequence, batch-1 exact (Engine.prefill,
-still bitwise generate_greedy's; the D13 gate's max_tokens=1 requests
-exercise exactly this path). Tokens from batched decode are NOT bitwise
+whole-prompt; SINGLETON admissions run the per-sequence batch-1-exact path
+(Engine.prefill, still bitwise generate_greedy's; the D13 gate's sequential
+max_tokens=1 requests exercise exactly this path), while co-admitted
+prompts prefill as right-padded batched groups (Engine.prefill_batch,
+exp-0009 — same drift class as batched decode). Tokens from batched decode
+are NOT bitwise
 batch-1: bf16 accumulation order is row-count-dependent (B3.1/B3.3
 established this is unattainable in principle), so the binding gates are
 (a) the D13 teacher-forced envelope parity check and (b) same-schedule
@@ -188,6 +191,66 @@ class Engine:
             req.capture.append(lg.cpu())
         return int(lg.argmax())
 
+    # exp-0009: padded-scores budget for grouped prefill — bytes of the
+    # bf16 [B, heads, Tmax, Tmax] attention-score tensor one layer
+    # materializes; admission groups are partitioned so no group exceeds
+    # it (a group of one always fits: it takes the per-seq path). 4 GiB
+    # caps the peak per-layer prefill transient at roughly 4-5x this
+    # (bias/mask/fp32-softmax copies) against the ~115 GiB headroom left
+    # beside weights + pools, and sends long-ISL prompts (prefill_heavy,
+    # 8K: any pair already exceeds the budget) down the unchanged path.
+    PREFILL_SCORES_BUDGET = 4 << 30
+
+    @torch.no_grad()
+    def prefill_batch(self, reqs):
+        """Whole-prompt prefill for a GROUP of co-admitted requests in ONE
+        right-padded batched 66-layer traversal (exp-0009): the per-layer
+        Python/launch cost of the walk — what the 1.92 s/seq prefill wall
+        actually is (exp-0005: host enqueue = 100% of step wall, GPU busy
+        31-33%) — is paid once for the group instead of once per sequence.
+        Row order = caller order = admission order. Real rows are isolated
+        from pads by causality (attn_prefill docstring); each row seeds
+        its own states via the same per-seq append/seed calls, sliced to
+        its real length, and its first token comes from its last REAL
+        position's logits. A group of 1 falls through to prefill() —
+        bitwise the existing path (the sequential D13 gate only ever
+        forms singleton groups). Batched rows carry the row-count bf16
+        accumulation drift class of decode_batch (B3.1/B3.3; D13
+        envelope + same-schedule determinism are the binding gates)."""
+        if len(reqs) == 1:
+            return [self.prefill(reqs[0])]
+        mc = self.mc
+        lens = [r.ids.shape[0] for r in reqs]
+        B, Tmax = len(reqs), max(lens)
+        #1. right-pad prompts into one [B, Tmax] id batch (pad id 0 — its
+        #   rows compute garbage that no real position ever attends)
+        ids = torch.zeros(B, Tmax, dtype=torch.long,
+                          device=self.w_emb.device)
+        for i, r in enumerate(reqs):
+            ids[i, : lens[i]] = r.ids
+        _, h = pmodel.embed(ids, self.w_emb, self.w_en, eps=mc.rms_eps)
+        #2. one 66-layer batched walk; per-row state seeding inside
+        for L in range(mc.num_layers):
+            dev = self.layers[L]["attn_norm"].device
+            full, win, p = self._mask_pos(dev, Tmax)
+            h = pmodel.layer_prefill(
+                h.to(dev), self.layers[L],
+                full if L in mc.global_layers else win, p, mc, L,
+                states=[r.states[L] for r in reqs], lens=lens)
+        #3. per-row logits at the row's LAST REAL position -> fp32 argmax
+        #   + optional capture (prefill()'s form, per row)
+        last = torch.tensor([n - 1 for n in lens], device=h.device)
+        rows = pmodel.final_logits(
+            h[torch.arange(B, device=h.device), last], self.w_fn,
+            self.w_un, mc.logits_mult, mc.vocab_unpadded, eps=mc.rms_eps)
+        out = []
+        for i, req in enumerate(reqs):
+            lg = rows[i].float()
+            if req.capture is not None:
+                req.capture.append(lg.cpu())
+            out.append(int(lg.argmax()))
+        return out
+
     @torch.no_grad()
     def decode(self, req):
         """One decode step: embed the previous token, run the 66 cached-
@@ -314,18 +377,27 @@ class Scheduler:
         retire. Per-sequence forwards are batch-1 exact (Engine), so the
         schedule changes only WHEN work happens, never its numerics."""
         #1. admit due arrivals FCFS while slots are free; prefill is the
-        #   arrival's token for this step
+        #   arrival's token for this step. Co-admitted prompts prefill as
+        #   batched GROUPS (exp-0009) — FCFS-consecutive, partitioned
+        #   under Engine.PREFILL_SCORES_BUDGET — instead of one serial
+        #   per-seq traversal each; admission order, row order and the
+        #   schedule are unchanged (grouping is a pure function of the
+        #   admitted lengths, so same-schedule determinism holds)
+        admits = []
         for entry in sorted(w for w in self.waiting
                             if w[0] <= self.step_count):
-            if len(self.running) >= self.max_batch:
+            if len(self.running) + len(admits) >= self.max_batch:
                 break
             self.waiting.remove(entry)
             req = entry[2]
             req.states = self.engine.new_states(
                 slot=self._free_slots.pop(0))
             req.admit_step = self.step_count
-            self.running.append(req)
-            req.tokens.append(self.engine.prefill(req))
+            admits.append(req)
+        for group in self._prefill_groups(admits):
+            for req, tok in zip(group, self.engine.prefill_batch(group)):
+                req.tokens.append(tok)
+        self.running.extend(admits)
         self.peak_running = max(self.peak_running, len(self.running))
         #2. one decode token for every sequence admitted in a PRIOR step —
         #   all decodable co-residents advance through ONE batched stack
@@ -354,6 +426,35 @@ class Scheduler:
                 still_running.append(req)
         self.running = still_running
         self.step_count += 1
+
+    def _prefill_groups(self, admits):
+        """Partition this step's admits into LENGTH-SORTED consecutive
+        prefill groups whose padded bf16 score tensor stays under
+        Engine.PREFILL_SCORES_BUDGET: cost(group + row) =
+        (B+1) * heads * Tmax'^2 * 2 bytes with Tmax' the running padded
+        length. Sorting by prompt length before packing minimizes pad
+        rows (unsorted FCFS packing measured ~33% pad tokens through
+        every per-token op, t_prefill_batch); it reorders only which
+        rows share a padded traversal — running-list order (= admission
+        order) and the schedule are untouched. Stable sort on the int
+        length keeps the whole partition a pure function of the admitted
+        (length, order) list — deterministic — and a group of one always
+        fits (it takes the per-seq path)."""
+        #1. shortest-first stable order, then greedy consecutive packing;
+        #   heads = 64 on both layer shapes
+        heads = self.engine.mc.g_q_heads
+        groups, cur, tmax = [], [], 0
+        for req in sorted(admits, key=lambda r: int(r.ids.shape[0])):
+            t = max(tmax, req.ids.shape[0])
+            if cur and (len(cur) + 1) * heads * t * t * 2 > \
+                    Engine.PREFILL_SCORES_BUDGET:
+                groups.append(cur)
+                cur, t = [], req.ids.shape[0]
+            cur.append(req)
+            tmax = t
+        if cur:
+            groups.append(cur)
+        return groups
 
     def run(self, max_steps=1 << 20):
         """Drain the queues; returns {req_id: token list}."""
