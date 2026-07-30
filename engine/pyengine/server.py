@@ -409,7 +409,7 @@ class Handler(BaseHTTPRequestHandler):
                 pass
 
 
-def serve(eng, tok, host="127.0.0.1", port=8200, max_batch=8,
+def serve(eng, tok, host="127.0.0.1", port=8200, max_batch=64,
           model_name=MODEL_DIR):
     """Start the engine-loop thread and build the HTTP server (bound, not
     yet serving). Caller runs httpd.serve_forever() — the CLI blocks on
@@ -434,7 +434,7 @@ def main():
     ap.add_argument("--model", default=MODEL_DIR)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8200)
-    ap.add_argument("--max-batch", type=int, default=8)
+    ap.add_argument("--max-batch", type=int, default=64)
     ap.add_argument("--num-pages", type=int, default=1024,
                     help="per-global-layer page budget PER SEQUENCE; "
                          "1024*16 = the 16384-token serve window")
