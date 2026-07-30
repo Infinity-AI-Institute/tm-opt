@@ -543,6 +543,33 @@ def sconv_decode_batch(x, weight, rings):
     return (conv[:, :, 0] + x.float()).to(x.dtype)
 
 
+def sconv_decode_batch_pooled(x, weight, tails, slots):
+    """Window-4 sconv, POOLED batched decode form (exp-0008) — x [B, C]
+    as sconv_decode_batch; tails [S, kernel-1, C] is the site's slot pool
+    (kv.SconvPool), slots [B] the co-resident rows' slot ids. BITWISE
+    equal to sconv_decode_batch on the same state: the [B, kernel, C]
+    window holds the same values whether assembled by ONE gather + ONE
+    cat (here) or B per-row cat/stack chains (there) — assembly is
+    copying — and the depthwise conv + fp32 residual are the same ops on
+    the same shapes in the same order. The rolled tails written back by
+    ONE index_put_ are the same win[:, 1:] rows the per-ring rebind kept,
+    through the storage the per-seq ring views alias (kv.SconvRing
+    backing), so per-seq prefill/decode interleave stays coherent. slots
+    are distinct by construction (one scheduler slot per sequence) and
+    every index is a pure function of the schedule — same-schedule
+    bitwise determinism holds."""
+    #1. all B windows in one gather+cat; roll all tails in one write
+    win = torch.cat([tails[slots], x[:, None, :]], dim=1)  # [B, k, C]
+    tails[slots] = win[:, 1:]
+    wf = weight.float()
+    #2. one depthwise conv over the batch (sconv_decode_batch #2)
+    conv = torch.nn.functional.conv1d(
+        win.float().permute(0, 2, 1), wf, bias=None, padding=0,
+        groups=wf.shape[0])
+    #3. own-input residual in fp32, then downcast (sconv_decode #3)
+    return (conv[:, :, 0] + x.float()).to(x.dtype)
+
+
 def attn_decode_batch(x, wq, wk, wv, wr, wo, w_k_sconv, w_v_sconv, w_q_norm,
                       w_k_norm, rel_proj, states, pos, head_dim, is_global,
                       alpha=None, n_floor=None, eps=1e-6):
@@ -648,13 +675,14 @@ def attn_decode_batch_pooled(x, wq, wk, wv, wr, wo, w_k_sconv, w_v_sconv,
     F = torch.nn.functional
     B = ctx["B"]
     n_heads, n_kv = wq.shape[0] // head_dim, wk.shape[0] // head_dim
-    #1. shared-weight projections; k/v raw through their per-row sconv
-    #   rings (ring rolls stay per-row — attack #3 is a separate spec)
+    #1. shared-weight projections; k/v raw through the pooled sconv step
+    #   (exp-0008, attack #3: one gather+cat+conv per site instead of B
+    #   per-row ring chains — bitwise equal, sconv_decode_batch_pooled)
     q = F.linear(x, wq)
-    k = sconv_decode_batch(F.linear(x, wk), w_k_sconv,
-                           [s.k_ring for s in states])
-    v = sconv_decode_batch(F.linear(x, wv), w_v_sconv,
-                           [s.v_ring for s in states])
+    k = sconv_decode_batch_pooled(F.linear(x, wk), w_k_sconv,
+                                  pool.sconv.kt, ctx["slots"])
+    v = sconv_decode_batch_pooled(F.linear(x, wv), w_v_sconv,
+                                  pool.sconv.vt, ctx["slots"])
     r = F.linear(x, wr)
     #2. per-head q/k rmsnorm across the whole batch (rowwise op)
     q = rmsnorm(q.view(B, n_heads, head_dim), w_q_norm, eps)
@@ -740,14 +768,16 @@ def layer_decode_batch(x, w, states, pos, mc, layer_idx, ctx=None,
             w["vsc"], w["qn"], w["kn"], w["proj"], states, pool, ctx,
             mc.head_dim, is_global, alpha=mc.log_alpha,
             n_floor=mc.log_floor, eps=mc.rms_eps)
+        h = sconv_decode_batch_pooled(h, w["attn_sconv"], pool.sconv.at,
+                                      ctx["slots"])
     else:
         h = attn_decode_batch(
             h, w["wq"], w["wk"], w["wv"], w["wr"], w["wo"], w["ksc"],
             w["vsc"], w["qn"], w["kn"], w["proj"], states, pos,
             mc.head_dim, is_global, alpha=mc.log_alpha,
             n_floor=mc.log_floor, eps=mc.rms_eps)
-    h = sconv_decode_batch(h, w["attn_sconv"],
-                           [s.attn_ring for s in states])
+        h = sconv_decode_batch(h, w["attn_sconv"],
+                               [s.attn_ring for s in states])
     x = x + h
     #2. MLP half: dense MLP / MoE consume the [B, hidden] token batch
     h = rmsnorm(x, w["mlp_norm"], mc.rms_eps)
@@ -758,7 +788,12 @@ def layer_decode_batch(x, w, states, pos, mc, layer_idx, ctx=None,
         h = moe(h, w["gate_w"], w["gate_b"], w["gate_gs"], w["gu"],
                 w["w2"], w["shg"], w["shu"], w["shd"], mc.topk,
                 mc.n_shared, mc.route_scale)
-    h = sconv_decode_batch(h, w["mlp_sconv"], [s.mlp_ring for s in states])
+    if ctx is not None:
+        h = sconv_decode_batch_pooled(h, w["mlp_sconv"], pool.sconv.mt,
+                                      ctx["slots"])
+    else:
+        h = sconv_decode_batch(h, w["mlp_sconv"],
+                               [s.mlp_ring for s in states])
     return x + h
 
 
