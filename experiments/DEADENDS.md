@@ -282,3 +282,23 @@ the integrator: the k-loop is unmasked — BLOCK_K must divide K (engine
 shapes 6144/3072 are fine; the wrapper auto-picks). Copy into
 engine/pyengine/kernels/ in the exp-0015a worktree; do NOT land on main
 outside the dispatcher path.
+ADDENDUM 3 (arm M — the decode vehicle EXISTS and RUNS): the public CUTLASS
+repo ships a purpose-built MoE example, examples/python/CuTeDSL/cute/
+blackwell/kernel/moe/torch_scaled_grouped_mm.py — "Scaled Grouped GEMM for
+MoE operations with block scaling (MXFP8, MXFP4, NVFP4)", torch 2Dx3D offs
+interface (tokens_sum,K)x(E,K,N), warp-specialized (scheduler warp +
+tcgen05.mma.block_scale + epilogue with GLOBAL_SCALE multiply built in —
+risk (c) solved in-kernel), with an sm103-specific variant next to it
+(sm103_grouped_blockscaled_gemm.py; "SM103 only supports Float4E2M1FN" —
+NVFP4 is THE native dtype on our arch). Fetched to
+/workspace/logs/cutlass-dsl-examples (BSD-3, package tree reconstructed
+under cute/). RAN it on GPU 4: `--kind nvfp4 --tokens 384 --experts 256
+--top_k_select 6 --hidden 6144 --intermediate 6144` -> "Validation PASSED
+(exact match)", DSL kernel 408 us at default (128,128,128) tiles vs the
+current Triton W4A16's ~4.2 ms/layer decode share. exp-0015b is now a
+WIRING job (adapt tensor prep to our PackedExperts + pooled step, verify
+capture-safety + determinism arms, tune tiles), not kernel R&D. Constraint
+flagged in source for the integrator: divisibility_ab=32 for fp4 (K=6144,
+N=6144/3072 all satisfy); check per-group M handling ("scheduler handles
+fake dimensions by computing token_offset from offs") against ragged 1-2
+row decode segments early.
