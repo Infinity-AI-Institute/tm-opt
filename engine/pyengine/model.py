@@ -16,6 +16,11 @@ from engine.pyengine.kernels.moe_gemm import moe_experts_packed
 # the life of the process so captured graphs match the eager warmups)
 _FUSED_ATTN = os.environ.get("PYENGINE_FUSED_ATTN", "1") != "0"
 
+# exp-0015b kill switch: PYENGINE_W4A4_DECODE=0 sends the decode paths back
+# to the W4A16 Triton grouped GEMM (prefill stays W4A4 — that is exp-0015a's
+# accepted variable). Read once at import for the same reason as above.
+_W4A4_DECODE = os.environ.get("PYENGINE_W4A4_DECODE", "1") != "0"
+
 
 def rmsnorm(x, weight, eps=1e-6):
     """Torch-reference RMSNorm with exact InklingRMSNorm semantics
@@ -213,11 +218,19 @@ def moe_experts(x, w_gate_up, w_down, topk_indices, topk_weights,
     if hasattr(w_gate_up, "packed"):
         #0'. exp-0015a: PREFILL routes to the native-FP4-MMA W4A4 grouped
         #    GEMM (the reference's own numeric recipe for these layers —
-        #    kernels/moe_gemm_w4a4.py docstring); decode paths — including
-        #    the CUDA-graph-captured batched step — keep the W4A16 Triton
-        #    kernels unchanged. Lazy import: the CUTLASS DSL stack loads
-        #    only when a prefill first needs it.
-        if phase == "prefill" and w_gate_up.input_amax is not None:
+        #    kernels/moe_gemm_w4a4.py docstring). exp-0015b: DECODE routes
+        #    there too, including the CUDA-graph-captured batched step —
+        #    the same kernel, same recipe, no phase distinction left. The
+        #    graphed step's routed-expert GEMMs were 266.4 of its 322.7 ms
+        #    (exp-0012 kernel table) because the W4A16 Triton kernel pays
+        #    the exp-0010 convert-ALU floor per weight element; native FP4
+        #    MMA deletes that pipe and leaves the decode MoE weight-traffic
+        #    bound. Capture-safety, replay-vs-eager bitwise equality and
+        #    same-schedule determinism are probed in tests/t_w4a4_capture.
+        #    Kill switch PYENGINE_W4A4_DECODE=0 restores the W4A16 decode.
+        #    Lazy import: the CUTLASS DSL stack loads on first use.
+        if w_gate_up.input_amax is not None and (
+                phase == "prefill" or _W4A4_DECODE):
             from engine.pyengine.kernels.moe_gemm_w4a4 import (
                 moe_experts_w4a4)
             return moe_experts_w4a4(x, w_gate_up, w_down, topk_indices,

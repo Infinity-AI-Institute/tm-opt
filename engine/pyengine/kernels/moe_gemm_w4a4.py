@@ -189,12 +189,22 @@ def moe_experts_w4a4(x, pack13, pack2, topk_indices, topk_weights):
     flat = topk_indices.reshape(-1)
     P = flat.shape[0]
     sorted_e, perm = torch.sort(flat, stable=True)
-    cnt = torch.bincount(sorted_e, minlength=E)
+    #   per-expert boundaries by searchsorted on the sorted pair list, NOT
+    #   bincount: torch's CUDA bincount sizes its histogram from
+    #   self.max().cpu(), a device->host copy that is illegal inside a CUDA
+    #   graph capture (exp-0015b probe t_w4a4_capture arm b). searchsorted
+    #   over 0..E gives the same exact integers with no sync and no atomics
+    #   (bounds[e] = index of the first pair with expert >= e), so every
+    #   downstream tensor — and the prefill path's numerics — is unchanged
+    #   bit for bit; it also replaces the second cumsum (starts_real).
+    bounds = torch.searchsorted(
+        sorted_e, torch.arange(E + 1, device=dev, dtype=sorted_e.dtype))
+    starts_real = bounds[:E]
+    cnt = bounds[1:] - starts_real
     pad_cnt = ((cnt + 127) // 128) * 128
     ends = torch.cumsum(pad_cnt, 0)
     offs = ends.to(torch.int32)
     starts_pad = ends - pad_cnt
-    starts_real = torch.cumsum(cnt, 0) - cnt
     rank = torch.arange(P, device=dev) - starts_real[sorted_e]
     dst = (starts_pad[sorted_e] + rank).to(torch.int32)
     src = (perm // top_k).to(torch.int32)
