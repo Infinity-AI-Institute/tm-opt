@@ -138,8 +138,15 @@ class GraphRunner:
                                    pin_memory=True)
                     for k in ("prev", "pos", "slots")}
         #5. capture cache: L_pad -> program; shared per-device mem pools
+        #   and per-device CAPTURE STREAMS — torch.cuda.graph's implicit
+        #   default_capture_stream is a class-level singleton created on
+        #   the first capture's device, so a second device's capture
+        #   would record on the wrong device's stream (observed: empty /
+        #   invalidated captures); an explicit stream per device is
+        #   required, and pool sharing wants the same stream per pool
         self.programs = {}
         self.mempool = {}
+        self.capstream = {}
         self.hiwater = 0
 
     # ---- capture-time program construction -------------------------
@@ -278,8 +285,10 @@ class GraphRunner:
                 torch.cuda.synchronize()
                 if item.dev not in self.mempool:
                     self.mempool[item.dev] = torch.cuda.graph_pool_handle()
+                    self.capstream[item.dev] = torch.cuda.Stream()
                 g = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(g, pool=self.mempool[item.dev]):
+                with torch.cuda.graph(g, pool=self.mempool[item.dev],
+                                      stream=self.capstream[item.dev]):
                     item.fn()
                 item.graph = g
         self.programs[L_pad] = program
