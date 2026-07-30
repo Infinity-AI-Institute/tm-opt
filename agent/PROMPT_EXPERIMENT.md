@@ -14,33 +14,39 @@ engines. If either is missing, write nothing and exit.
    write nothing, exit. The dispatcher is behind; more specs help nobody.
 3. Form ONE hypothesis: a single mechanism with a predicted effect on the
    canonical workload, grounded in a ledger observation or a roofline number,
-   not vibes. CURRENT STATE OF THE WORLD (2026-07-30): decode_heavy best =
-   15.3 tok/s timeboxed(600s, conc=64) — 9.6x over start via batched decode
-   (iter 2), bit-exact Triton dequant (iter 3), conc-64 (iter 4), grouped
-   packed-NVFP4 MoE GEMM (iter 5, merged to main). Two findings BIND the
-   next hypotheses:
-   (a) conc 8->64 gained only +7% — per-step wall scales ~linearly with
-   tokens, so batch-amortizable work is nearly gone; (b) grouped GEMM
-   gained only +51% despite deleting the dominant MoE weight traffic —
-   the residual step wall is NOT weight traffic. Prime suspect: per-layer
-   Python + launch storm (66 layers x dozens of eager Triton/torch calls
-   per step) + the per-layer unique().tolist() device sync flagged in the
-   iter-5 hypothesis. The ranked attack surface (STEP B — kernel/dispatch
-   consolidation):
-     #1 PROFILE FIRST: one instrumentation-only experiment — time the
-        batched decode step's components at conc 64 (attention / sconv /
-        gate / expert GEMM / Python-between-kernels), write the breakdown
-        into the ledger row's hypothesis field; every later spec cites it.
-     #2 CUDA-graph or torch.compile the decode step (deletes Python
-        dispatch wholesale; likely the biggest single win),
-     #3 fused sconv (3 convs x 66 layers x step = launch storm),
-     #4 fused MoE gate (sigmoid+top6+norm in one kernel; kill the
-        unique().tolist() sync),
-     #5 two-shape attention w/ fused rel-bias,
-     #6 conc 64->128->256 re-pushes AFTER dispatch overhead falls
-        (they were blocked by per-token wall before; may not be after),
-     #7 chunked prefill, #8 scheduler specialization at conc 512,
-     #9 TP comm overlap, #10 topology A/B (2xTP=4 vs 8).
+   not vibes. CURRENT STATE OF THE WORLD (2026-07-31): decode_heavy best =
+   89.7 tok/s timeboxed(600s, conc=64) — 56x over start. Iters 8-15 landed
+   pooled batched attention (iter 8, 4.14x step wall), pooled sconv tails
+   (iter 9), prefill GEMM BLOCK_M (iter 10), hardware FP4 cvt dequant
+   (iter 11), the CUDA-graphed decode step (iter 13 — dispatch floor
+   LOCKED: the step is now GPU-BOUND; its kernel table is the current
+   ground truth), and fused two-shape flash-decode attention (iter 14,
+   -150 ms/step). Rejected-but-instructive: exp-0011 (in-situ phase
+   profile — wall-share profiling cannot see GPU near-parity) and
+   exp-0014 (batched group prefill — 1.30x engine-level ceiling is real
+   but arrival-race fragmentation ate it in situ; post-mortem in
+   DEADENDS). The exp-0012 graphed-step kernel table + exp-0013 residuals
+   rank the surface:
+     #1 exp-0015 NATIVE FP4 MMA WIRING: the CUTE DSL NVFP4 grouped MoE
+        kernel is exact-validated on GPU 4 (DEADENDS addendum 3; 408 us
+        vs ~4.2 ms/layer Triton W4A16 decode share) — integrate into
+        PackedExperts + the graphed pooled step per the committed split
+        plan (exp-0015a activation-quant kernel is bitwise-validated
+        groundwork). Worth up to ~220 ms of the ~320 ms decode step AND
+        the dominant prefill GEMM term simultaneously. Verify EARLY:
+        capture-safety under CUDA graphs, ragged 1-2-row decode segments
+        (the source's fake-dimension token_offset handling), and both
+        determinism arms.
+     #2 batched-prefill RETRY with the arrival race fixed (exp-0014
+        post-mortem: length-sorted grouping works at engine level, 1.30x;
+        the loss was admission fragmentation + 3 dropped bench threads),
+     #3 conc 64->128 re-push AFTER #1 lands (native MMA changes the
+        rows-per-expert batch calculus),
+     #4 remaining copy elimination per the exp-0012 kernel table,
+     #5 chunked prefill, #6 scheduler specialization at conc 512,
+     #7 TP comm overlap, #8 topology A/B (2xTP=4 vs 8).
+   The cycle is PREFILL-TERM-DOMINATED (~2/3 of cohort wall) — attack #1
+   moves both terms at once.
    Determinism rule for CUDA graphs / compiled paths: same-schedule
    bitwise repeatability still binds (D13 envelope + the t_b3 batch
    determinism arm) — capture/compile must not introduce run-to-run
