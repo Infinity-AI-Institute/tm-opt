@@ -11,6 +11,7 @@ from engine.pyengine.kernels.attn_global import attn_global
 from engine.pyengine.kernels.attn_prefill import attn_prefill_fused
 from engine.pyengine.kernels.attn_swa import attn_swa
 from engine.pyengine.kernels.moe_gemm import moe_experts_packed
+from engine.pyengine.kernels.rmsnorm import rmsnorm as rmsnorm_fused
 
 # exp-0013 kill switch: PYENGINE_FUSED_ATTN=0 restores the eager pooled
 # attention chain unchanged (read once at import — must be constant for
@@ -46,6 +47,14 @@ _FUSED_PREFILL_ATTN = os.environ.get("PYENGINE_FUSED_PREFILL_ATTN",
 # what they hand downstream is not, and downstream kernels tile by it).
 _FUSED_SCONV = os.environ.get("PYENGINE_FUSED_SCONV", "1") != "0"
 
+# exp-0026 kill switch: PYENGINE_FUSED_RMSNORM=0 restores the torch-reference
+# rmsnorm chain at the four PREFILL norm sites. Read at CALL time (unlike the
+# switches above): the sites it guards are all on the prefill path, which is
+# not CUDA-graph captured, so the two arms may interleave inside one process
+# and the in-situ arm needs exactly that. Every decode site keeps calling
+# rmsnorm() directly, so nothing inside the captured step moves.
+_FUSED_RMSNORM = os.environ.get("PYENGINE_FUSED_RMSNORM", "1") != "0"
+
 
 def experts_capturable(w_gate_up):
     """True when this MoE layer's routed-expert GEMMs are legal inside
@@ -79,6 +88,39 @@ def rmsnorm(x, weight, eps=1e-6):
     var = xf.pow(2).mean(-1, keepdim=True)
     #2. normalize in fp32, downcast, THEN scale by weight (bf16 x bf16)
     return weight * (xf * torch.rsqrt(var + eps)).to(x.dtype)
+
+
+def rmsnorm_prefill(x, weight, eps=1e-6):
+    """exp-0026: the PREFILL norm sites, on B2.3's Triton kernel.
+
+    rmsnorm() above is the numeric REFERENCE (bit-exact vs transformers,
+    B2.2) and it is written as six torch ops, so it moves ~36 bytes of HBM
+    per element to do a 4-byte job: bf16 -> fp32 upcast (r2 w4), pow (r4
+    w4), mean reduction (r4), the fp32 normalize (r4 w4), the downcast
+    (r4 w2) and the weight multiply (r2 w2). The kernel does the whole
+    thing in one pass — read bf16, reduce in fp32 in registers, write bf16
+    — for 4 bytes per element, and it is the SAME arithmetic in the same
+    order except for the fp32 variance reduction (a tree over the row
+    instead of torch's; few-ulp fp32, at most 1-2 bf16 ulp after the
+    downcast — exactly what t_b2's B2.3 arm has gated since bring-up).
+
+    Four sites per prefill layer read this: the two hidden-width norms in
+    layer_prefill (input_layernorm, post_attention_layernorm; 6144 wide)
+    and the two per-head norms in attn_prefill (q 64x128, k 16x128 on SWA
+    layers / 8x128 on global ones). That is 22,528 elements per token per
+    layer, so a 66-layer traversal of a canonical 6-row cohort (~4,200
+    tokens) moves ~200 GB it does not need to.
+
+    Falls back to the reference for anything the kernel does not claim:
+    CPU tensors (the bring-up tests), a weight dtype that is not the
+    input's, rows wider than one 16,384-lane block, and empty inputs. The
+    kernel takes any input layout (it flattens to rows itself) and always
+    returns a CONTIGUOUS tensor, which is what its consumers want."""
+    if (_FUSED_RMSNORM and x.is_cuda and weight.is_cuda
+            and weight.dtype == x.dtype and x.shape[-1] <= 16384
+            and x.numel()):
+        return rmsnorm_fused(x, weight, eps)
+    return rmsnorm(x, weight, eps)
 
 
 def embed(input_ids, w_embed, w_norm, eps=1e-6):
@@ -449,8 +491,9 @@ def attn_prefill(x, wq, wk, wv, wr, wo, w_k_sconv, w_v_sconv, w_q_norm,
     r = F.linear(x, wr)
     #2. per-head q/k rmsnorm over head_dim, then [B,T,H,D] -> [B,H,T,D]
     #   (:233-235; v is not normalized)
-    q = rmsnorm(q.view(B, T, n_heads, head_dim), w_q_norm, eps).transpose(1, 2)
-    kn = rmsnorm(k.view(B, T, n_kv, head_dim), w_k_norm, eps)
+    q = rmsnorm_prefill(
+        q.view(B, T, n_heads, head_dim), w_q_norm, eps).transpose(1, 2)
+    kn = rmsnorm_prefill(k.view(B, T, n_kv, head_dim), w_k_norm, eps)
     vv = v.view(B, T, n_kv, head_dim)
     k = kn.transpose(1, 2)
     v = vv.transpose(1, 2)
@@ -541,7 +584,7 @@ def layer_prefill(x, w, mask, pos, mc, layer_idx, state=None, trace=None,
     is_global = layer_idx in mc.global_layers
     #1. attention half: pre-norm, attention, attn_sconv, outer residual
     #   in the ref's order residual + hidden (:574-583)
-    h = rmsnorm(x, w["attn_norm"], mc.rms_eps)
+    h = rmsnorm_prefill(x, w["attn_norm"], mc.rms_eps)
     h = attn_prefill(h, w["wq"], w["wk"], w["wv"], w["wr"], w["wo"],
                      w["ksc"], w["vsc"], w["qn"], w["kn"], w["proj"],
                      mask, pos, pos, mc.head_dim, is_global,
@@ -557,7 +600,7 @@ def layer_prefill(x, w, mask, pos, mc, layer_idx, state=None, trace=None,
     x = x + h
     #2. MLP half: pre-norm, dense MLP or MoE block, mlp_sconv, residual
     #   (:585-591)
-    h = rmsnorm(x, w["mlp_norm"], mc.rms_eps)
+    h = rmsnorm_prefill(x, w["mlp_norm"], mc.rms_eps)
     if trace is not None:
         trace["x1"] = x
         trace["mlpin"] = h
