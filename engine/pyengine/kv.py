@@ -144,11 +144,25 @@ class PagedKV:
         self.n = 0       # tokens stored
 
     def _flat_slots(self, pos):
-        #1. logical positions -> flat pool rows through the page table
+        #1. logical positions -> flat pool rows through the page table.
+        #   exp-0018: pool-backed caches already carry a device mirror of
+        #   the table (table_dev_row, kept current by ensure_pages #2), so
+        #   the lookup is a pure device gather. The host form below costs
+        #   a .tolist() DEVICE->HOST SYNC per call — 2 per global layer per
+        #   prefill traversal (append + gather; the exp-0005 finding) — and
+        #   each of those syncs pins the host to one device's progress,
+        #   which is what stops the NEXT traversal from being enqueued and
+        #   forces the layer-split model to run one GPU at a time.
+        #   Value-identical either way: table_dev_row[i] == table[i] for
+        #   every i < len(table) (ensure_pages mirrors on every allocation)
+        #   and both callers index only positions < n.
         ps = self.page_size
-        page_ids = torch.tensor([self.table[i] for i in
-                                 torch.div(pos, ps, rounding_mode="floor")
-                                 .tolist()], device=pos.device)
+        pages = torch.div(pos, ps, rounding_mode="floor")
+        if self.table_dev_row is not None:
+            page_ids = self.table_dev_row[pages]
+        else:
+            page_ids = torch.tensor([self.table[i] for i in pages.tolist()],
+                                    device=pos.device)
         return page_ids * ps + pos % ps
 
     def ensure_pages(self, last_page):

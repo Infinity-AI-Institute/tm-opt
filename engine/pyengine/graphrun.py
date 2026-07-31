@@ -311,7 +311,19 @@ class GraphRunner:
         """One graphed decode step for the live rows `reqs` (row order =
         the scheduler's admission order). Returns the B greedy tokens.
         Host work: page-boundary allocation, 3 pinned stages + fan-out
-        copies, segment replays + islands, ONE argmax readback sync."""
+        copies, segment replays + islands, ONE argmax readback sync.
+        Kept as the enqueue+readback composition (exp-0021) so every
+        caller outside the scheduler keeps a synchronous entry point."""
+        self.step_enqueue(reqs, pos, slots)
+        return self.step_pick(reqs, len(reqs))
+
+    def step_enqueue(self, reqs, pos, slots):
+        """step()'s work up to but excluding its ONE readback sync — the
+        replays are handed to the devices and the host returns
+        immediately. exp-0021: the scheduler issues this BEFORE the
+        prefill traversal, whose ~700-1200 ms is pure host time with an
+        idle device tail (t_traversal_sync_probe arm b), so the graphed
+        step's GPU work executes underneath it instead of after it."""
         e, mc = self.eng, self.eng.mc
         B = len(reqs)
         ps = pkv.PAGE_SIZE
@@ -347,16 +359,22 @@ class GraphRunner:
                 self.hin[di].copy_(self.hout[di - 1], non_blocking=True)
             else:
                 self._run_island(item[1], B)
-        #5. outputs: one batched-argmax readback (the step's single
-        #   sync); fp32 logits rows for capture consumers (D13 gate
-        #   form — same values the eager per-row .float() produced)
+        #5. pooled appends bypass per-seq .append — keep host counters
+        #   truthful (release/gather safety; scheduler.decode_batch #4).
+        #   Pure host bookkeeping, so it stays on the enqueue side
+        for r in reqs:
+            for st in r.states:
+                st.cache.n += 1
+
+    def step_pick(self, reqs, B):
+        """The readback half of step_enqueue: one batched-argmax readback
+        (the step's single sync); fp32 logits rows for capture consumers
+        (D13 gate form — same values the eager per-row .float()
+        produced). The static buffers it reads are only rewritten by the
+        NEXT replay, and a step has exactly one, so deferring this past
+        the step's prefill traversal reads the same bytes it always did."""
         toks = self.argmax_buf[:B].cpu().tolist()
         for i, r in enumerate(reqs):
             if r.capture is not None:
                 r.capture.append(self.logits_buf[i].cpu())
-        #6. pooled appends bypass per-seq .append — keep host counters
-        #   truthful (release/gather safety; scheduler.decode_batch #4)
-        for r in reqs:
-            for st in r.states:
-                st.cache.n += 1
         return toks

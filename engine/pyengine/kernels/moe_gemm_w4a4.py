@@ -50,6 +50,8 @@ cumsum, fixed grids, static tile scheduler, no atomics, each output row
 written exactly once; pad rows are exact zeros end to end, and slack rows
 beyond offs[-1] are never read by any consumer. Two runs of the same
 schedule are bitwise identical (t_moe_w4a4 arm d)."""
+import os
+
 import torch
 
 import cuda.bindings.driver as cuda_drv
@@ -61,7 +63,16 @@ import cutlass.utils as utils
 from engine.pyengine.vendor.cutlass_moe.torch_scaled_grouped_mm import (
     ScaledGroupedGemmKernel,
 )
-from engine.pyengine.kernels.fp4_quant import nvfp4_quant, nvfp4_quant_scatter
+from engine.pyengine.kernels.fp4_quant import (
+    nvfp4_quant, nvfp4_quant_scatter, nvfp4_quant_silu,
+)
+
+#exp-0022 kill switch: PYENGINE_FUSED_EPILOGUE=0 restores the eager
+#silu*up chain + separate activation quant (read once at import — it must
+#be constant for the life of the process so captured graphs match the
+#eager warmups, the exp-0013 convention)
+_FUSED_EPILOGUE = os.environ.get("PYENGINE_FUSED_EPILOGUE", "1") != "0"
+
 
 #launch config, fixed (no autotune: deterministic, one JIT specialization) —
 #the exact configuration the GPU-4 validation ran (DEADENDS addendum 3)
@@ -213,20 +224,33 @@ def moe_experts_w4a4(x, pack13, pack2, topk_indices, topk_weights):
     m_cap = (P + 127 * min(E, P) + 127) // 128 * 128
 
     #2. gate/up: quant-scatter x rows into the padded space, grouped GEMM
-    #   (alpha = input_scale*scale2 in-kernel), silu*up mirroring the eager
-    #   rounding chain (interleaved rows -> interleaved output columns)
+    #   (alpha = input_scale*scale2 in-kernel); interleaved w13 rows ->
+    #   interleaved output columns
     a1, sfa1 = nvfp4_quant_scatter(x, src, dst, m_cap, prep.gs13)
     c1 = torch.empty(m_cap, 2 * ffn, device=dev, dtype=torch.bfloat16)
     _run_gemm(K, 2 * ffn, a1, sfa1.view(m_cap, K // 16), prep.b13,
               prep.sfb13_c, c1, offs, prep.gsa13_c, prep.gsb13_c)
-    gu = c1.view(m_cap, ffn, 2)
-    g = gu[..., 0].float()
-    u = gu[..., 1].float()
-    act = ((g * torch.sigmoid(g)).to(torch.bfloat16).float()
-           * u).to(torch.bfloat16).contiguous()
 
-    #3. down: re-quant the activations (w2's own input_scale), grouped GEMM
-    a2, sfa2 = nvfp4_quant(act, prep.gs2)
+    #3. inter-GEMM epilogue + down-GEMM quant in ONE kernel (exp-0022):
+    #   silu*up on the interleaved pairs at the SAME rounding chain the
+    #   other two grouped GEMMs fuse into their own epilogues
+    #   (moe_gemm.py:183, moe_gemm_bf16.py:104), feeding w2's input_scale
+    #   quantization from registers. The eager chain below (kill switch
+    #   PYENGINE_FUSED_EPILOGUE=0) made 9 passes over m_cap x ffn (2 fp32
+    #   gathers, sigmoid, 2 fp32 multiplies, 3 rounding casts) plus the
+    #   quant kernel's own read of the materialized activation; the fused
+    #   kernel is BITWISE equal to it on both phases' real shapes
+    #   (tests/t_fused_epilogue arm a: 0 of 50.5M / 91.2M packed bytes
+    #   differ, scales bitwise, dequant max|d| exactly 0).
+    if _FUSED_EPILOGUE:
+        a2, sfa2 = nvfp4_quant_silu(c1, ffn, prep.gs2)
+    else:
+        gu = c1.view(m_cap, ffn, 2)
+        g = gu[..., 0].float()
+        u = gu[..., 1].float()
+        act = ((g * torch.sigmoid(g)).to(torch.bfloat16).float()
+               * u).to(torch.bfloat16).contiguous()
+        a2, sfa2 = nvfp4_quant(act, prep.gs2)
     c2 = torch.empty(m_cap, K, device=dev, dtype=torch.bfloat16)
     _run_gemm(ffn, K, a2, sfa2.view(m_cap, ffn // 16), prep.b2,
               prep.sfb2_c, c2, offs, prep.gsa2_c, prep.gsb2_c)
