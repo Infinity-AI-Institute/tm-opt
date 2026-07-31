@@ -21,6 +21,35 @@ _FUSED_ATTN = os.environ.get("PYENGINE_FUSED_ATTN", "1") != "0"
 # accepted variable). Read once at import for the same reason as above.
 _W4A4_DECODE = os.environ.get("PYENGINE_W4A4_DECODE", "1") != "0"
 
+# exp-0019 kill switch: PYENGINE_BF16_GROUPED=0 sends the ONE un-exported MoE
+# layer (dense_mlp_idx = 2, bf16 routed experts) back to the reference
+# per-hit-expert loop — and with it restores graphrun's eager island, since
+# experts_capturable() below is the single predicate both sites read. Read
+# once at import for the same reason as above: it must be constant for the
+# life of the process so captured graphs match the eager warmups.
+_BF16_GROUPED = os.environ.get("PYENGINE_BF16_GROUPED", "1") != "0"
+
+
+def experts_capturable(w_gate_up):
+    """True when this MoE layer's routed-expert GEMMs are legal inside
+    CUDA-graph capture — i.e. grouped, sync-free and fixed-shape at fixed T.
+    The NVFP4 layers 3-65 always are (loader.PackedExperts -> moe_gemm /
+    moe_gemm_w4a4); layer 2's plain bf16 stacks are iff exp-0019's grouped
+    bf16 twin is on, because the reference loop it otherwise takes does a
+    per-traversal unique().tolist() device->host sync. graphrun reads this
+    to decide which layers must be carved out as eager islands, so the two
+    sites can never disagree about what got captured."""
+    if hasattr(w_gate_up, "packed"):
+        return True
+    #1. the grouped bf16 twin is specialized to 128-multiple shapes (the
+    #   checkpoint's hidden 6144 / ffn 3072 — its k-loop and n-tiles are
+    #   unmasked); the toy stacks the bring-up tests build keep the
+    #   reference loop, as does any future non-conforming layer
+    return (_BF16_GROUPED and w_gate_up.dim() == 3
+            and w_gate_up.dtype == torch.bfloat16
+            and w_gate_up.shape[2] % 128 == 0
+            and (w_gate_up.shape[1] // 2) % 128 == 0)
+
 
 def rmsnorm(x, weight, eps=1e-6):
     """Torch-reference RMSNorm with exact InklingRMSNorm semantics
@@ -237,6 +266,20 @@ def moe_experts(x, w_gate_up, w_down, topk_indices, topk_weights,
                                     topk_weights)
         return moe_experts_packed(x, w_gate_up, w_down, topk_indices,
                                   topk_weights)
+    #0''. exp-0019: the ONE MoE layer the NVFP4 export skipped (layer
+    #    dense_mlp_idx = 2, bf16 routed experts) takes the same grouped
+    #    structure on plain bf16 stacks. Below this line lives the reference
+    #    loop, whose torch.unique(...).tolist() is a device->host sync per
+    #    traversal and whose ~2 x 200 launches serve 1-2 rows each; that sync
+    #    is the reason exp-0012 could not capture layer 2 and carved it out
+    #    as graphrun's eager island. The grouped twin is sync-free and
+    #    fixed-shape, so the island disappears (see experts_capturable) and
+    #    device 0's segment captures as ONE graph.
+    #    Kill switch PYENGINE_BF16_GROUPED=0 restores this loop + the island.
+    if experts_capturable(w_gate_up):
+        from engine.pyengine.kernels.moe_gemm_bf16 import moe_experts_bf16
+        return moe_experts_bf16(x, w_gate_up, w_down, topk_indices,
+                                topk_weights)
     #1. accumulator in the input dtype, like the ref (:321)
     out = torch.zeros_like(x)
     #2. hit experts in ascending id order (:323-327)

@@ -99,11 +99,16 @@ class GraphRunner:
         assert e.w_fn.device == ranges[-1][0], "unembed off last segment"
         self.ranges = [tuple(r) for r in ranges]
         self.ndev = len(ranges)
-        #2. eager islands: MoE layers without packed experts (the bf16-
-        #   unquantized layer dense_idx; data-dependent host loop)
+        #2. eager islands: MoE layers whose routed-expert GEMMs are not
+        #   capture-legal — i.e. still on the reference loop with its
+        #   data-dependent unique().tolist() sync. Historically that was the
+        #   bf16-unquantized layer dense_idx; exp-0019 gave it the grouped
+        #   bf16 twin, so with PYENGINE_BF16_GROUPED on this list is EMPTY
+        #   and each device captures as one segment (model.experts_capturable
+        #   is the single predicate — the two sites cannot disagree)
         self.islands = [L for L in range(mc.num_layers)
                         if L >= mc.dense_idx
-                        and not hasattr(e.layers[L]["gu"], "packed")]
+                        and not pmodel.experts_capturable(e.layers[L]["gu"])]
         for L in self.islands:
             dev, lo, hi = next(r for r in self.ranges if r[1] <= L < r[2])
             assert L + 1 < hi, "island at a segment tail unsupported"
