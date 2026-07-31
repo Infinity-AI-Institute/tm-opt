@@ -70,7 +70,7 @@ def t_scratch_pools():
     assert gp.kp.shape[0] == total + 1
     assert gp.table_dev.shape[0] == mb + 1
     assert (gp.table_dev[mb] == total).all()
-    assert gp.free == list(range(total))          # scratch never free
+    assert list(gp.free) == list(range(total))    # scratch never free
     sc = pkv.SconvPool(mb, 4, 8, 16, "cpu")
     assert sc.kt.shape[0] == mb + 1 and sc.at.shape[0] == mb + 1
     print("t_scratch_pools OK")

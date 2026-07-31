@@ -11,6 +11,8 @@ the 512 edge. B2.7's boundary fact: a token influences SWA output for
 window + sconv_k - 1 = 515 positions — the last sconv_k-1 = 3 RAW pre-conv
 inputs live in the SconvRing, separate state from the 512 post-conv KV
 entries. Single-sequence scope here; the B3.3 scheduler owns multi-seq."""
+import collections
+
 import torch
 
 PAGE_SIZE = 16  # tokens per global-KV page (PROGRESS B3.1 "paged global (page 16)")
@@ -134,8 +136,8 @@ class PagedKV:
             self.kp = torch.zeros(num_pages, page_size, kv_heads, head_dim,
                                   device=device, dtype=dtype)
             self.vp = torch.zeros_like(self.kp)
-            self.free = list(free_order) if free_order is not None else list(
-                range(num_pages))
+            self.free = collections.deque(
+                free_order if free_order is not None else range(num_pages))
             assert sorted(self.free) == list(range(num_pages)), \
                 "bad free order"
             self.table_dev_row = None
@@ -167,13 +169,22 @@ class PagedKV:
 
     def ensure_pages(self, last_page):
         """Allocate pages until the table covers `last_page` — free-list
-        pop(0) order, deterministic given the schedule — mirroring new ids
+        FIFO order, deterministic given the schedule — mirroring new ids
         into table_dev_row when pool-backed (the batched decode core reads
         the device table, model.attn_decode_batch_pooled)."""
-        #1. pop pages in free-list order; remember where the new ids start
+        #1. pop pages in free-list order; remember where the new ids start.
+        #   exp-0024: popleft() off a deque, not pop(0) off a list. SAME
+        #   element, SAME order (the structure is a FIFO either way:
+        #   release_states extends the tail, ensure_pages takes the head),
+        #   so every page table — hence every KV placement, hence every
+        #   tensor value — is bit-identical; list.pop(0) is O(len) and the
+        #   shared pool is max_batch * num_pages = 65,536 entries at the
+        #   canonical point, i.e. a ~0.4 MB memmove per page, 7.7 us
+        #   measured (tests/t_pagefree arm c), paid on the host thread
+        #   inside the prefill traversal and the decode step
         first_new = len(self.table)
         while len(self.table) <= last_page:
-            self.table.append(self.free.pop(0))
+            self.table.append(self.free.popleft())
         #2. mirror the new entries on-device for batched append/gather
         if self.table_dev_row is not None and len(self.table) > first_new:
             self.table_dev_row[first_new:len(self.table)] = torch.tensor(
@@ -244,7 +255,10 @@ class GlobalPool:
                               device=device, dtype=dtype)
         self.vp = torch.zeros_like(self.kp)
         self.page_size = page_size
-        self.free = list(range(total))
+        #   deque, not list: ensure_pages pops the head every
+        #   PAGE_SIZE tokens per global layer per sequence and
+        #   list.pop(0) is O(len) on a 65,536-entry pool (exp-0024)
+        self.free = collections.deque(range(total))
         #2. table mirror; entries beyond a sequence's live table are stale
         #   — never read (flat-slot gather is masked to positions < n).
         #   Row max_batch is the scratch slot: every entry points at the
