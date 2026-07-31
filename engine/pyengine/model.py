@@ -329,7 +329,7 @@ def dense_mlp(x, w_gate, w_up, w_down, global_scale):
 def attn_prefill(x, wq, wk, wv, wr, wo, w_k_sconv, w_v_sconv, w_q_norm,
                  w_k_norm, rel_proj, attn_mask, q_positions, kv_positions,
                  head_dim, is_global, alpha=None, n_floor=None, eps=1e-6,
-                 state=None):
+                 state=None, states=None, lens=None):
     """One attention layer, PREFILL (no-cache) form — exact InklingAttention
     semantics (transformers models/inkling/modeling_inkling.py:217-282 with
     eager_attention_forward :157-182). Both layer shapes run through here:
@@ -343,7 +343,12 @@ def attn_prefill(x, wq, wk, wv, wr, wo, w_k_sconv, w_v_sconv, w_q_norm,
     post-sconv V into the cache, raw pre-conv k/v tails into the sconv
     rings — with numerics untouched (same ops either way; B3.1).
     attn_decode is the cached single-token form; fused kernels are Stage-3
-    work (D4)."""
+    work (D4). `states` + `lens` (exp-0009 batched group prefill) is the
+    multi-row form of `state`: rows are RIGHT-padded to a common T, so with
+    the causal mask a real position never attends a pad (pads sit at future
+    key positions) and row i's live values are exactly the [:lens[i]]
+    slices — each row seeds its own LayerKV through the same per-seq
+    seed/append calls."""
     F = torch.nn.functional
     B, T = x.shape[0], x.shape[1]
     n_heads, n_kv = wq.shape[0] // head_dim, wk.shape[0] // head_dim
@@ -369,6 +374,11 @@ def attn_prefill(x, wq, wk, wv, wr, wo, w_k_sconv, w_v_sconv, w_q_norm,
         state.k_ring.seed(k_raw[0])
         state.v_ring.seed(v_raw[0])
         state.cache.append(kn[0], vv[0])
+    elif states is not None:
+        for i, st in enumerate(states):
+            st.k_ring.seed(k_raw[i, : lens[i]])
+            st.v_ring.seed(v_raw[i, : lens[i]])
+            st.cache.append(kn[i, : lens[i]], vv[i, : lens[i]])
     #3. rel-pos bias from the relative states (:248-251)
     bias = rel_bias(r.view(B, T, n_heads, -1), rel_proj, q_positions,
                     kv_positions)
@@ -398,7 +408,8 @@ def attn_prefill(x, wq, wk, wv, wr, wo, w_k_sconv, w_v_sconv, w_q_norm,
     return F.linear(out.reshape(B, T, n_heads * head_dim), wo)
 
 
-def layer_prefill(x, w, mask, pos, mc, layer_idx, state=None, trace=None):
+def layer_prefill(x, w, mask, pos, mc, layer_idx, state=None, trace=None,
+                  states=None, lens=None):
     """One full decoder layer, PREFILL form — exact InklingDecoderLayer
     op order (transformers models/inkling/modeling_inkling.py:566-591):
     input_layernorm -> attention (B2.6 global / B2.7 SWA) -> attn_sconv
@@ -415,7 +426,10 @@ def layer_prefill(x, w, mask, pos, mc, layer_idx, state=None, trace=None):
     verified ModelConfig; the caller's mask must match the layer type
     (window=mc.window on SWA layers). `state` (kv.LayerKV, batch-1)
     additionally populates the layer's KV cache + all four sconv rings —
-    same numerics either way (B3.1). `trace` (a dict, tests only) records
+    same numerics either way (B3.1). `states` + `lens` (exp-0009) is the
+    multi-row form: right-padded rows, row i seeding states[i] from its
+    [:lens[i]] slices (attn_prefill docstring — causality isolates real
+    rows from pads). `trace` (a dict, tests only) records
     the attention-half residual stream ('x1') and the MLP input stream
     ('mlpin'), mirroring layer_decode's hook (B3.2) — references only,
     numerics untouched."""
@@ -427,9 +441,12 @@ def layer_prefill(x, w, mask, pos, mc, layer_idx, state=None, trace=None):
                      w["ksc"], w["vsc"], w["qn"], w["kn"], w["proj"],
                      mask, pos, pos, mc.head_dim, is_global,
                      alpha=mc.log_alpha, n_floor=mc.log_floor,
-                     eps=mc.rms_eps, state=state)
+                     eps=mc.rms_eps, state=state, states=states, lens=lens)
     if state is not None:
         state.attn_ring.seed(h[0])
+    elif states is not None:
+        for i, st in enumerate(states):
+            st.attn_ring.seed(h[i, : lens[i]])
     h = sconv_prefill(h, w["attn_sconv"])
     x = x + h
     #2. MLP half: pre-norm, dense MLP or MoE block, mlp_sconv, residual
@@ -447,6 +464,9 @@ def layer_prefill(x, w, mask, pos, mc, layer_idx, state=None, trace=None):
                 mc.n_shared, mc.route_scale, phase="prefill")
     if state is not None:
         state.mlp_ring.seed(h[0])
+    elif states is not None:
+        for i, st in enumerate(states):
+            st.mlp_ring.seed(h[i, : lens[i]])
     h = sconv_prefill(h, w["mlp_sconv"])
     return x + h
 
