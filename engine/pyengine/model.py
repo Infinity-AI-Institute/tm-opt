@@ -38,6 +38,14 @@ _BF16_GROUPED = os.environ.get("PYENGINE_BF16_GROUPED", "1") != "0"
 _FUSED_PREFILL_ATTN = os.environ.get("PYENGINE_FUSED_PREFILL_ATTN",
                                      "1") != "0"
 
+# exp-0025 kill switch: PYENGINE_FUSED_SCONV=0 restores sconv_prefill's
+# eager fp32 conv1d chain unchanged (and with it the channel-major output
+# layout it leaks into the residual stream). Read once at import for the
+# same reason as above; the two paths must not alternate within a process
+# (they are bitwise equal today — t_fused_sconv arm a — but the layout of
+# what they hand downstream is not, and downstream kernels tile by it).
+_FUSED_SCONV = os.environ.get("PYENGINE_FUSED_SCONV", "1") != "0"
+
 
 def experts_capturable(w_gate_up):
     """True when this MoE layer's routed-expert GEMMs are legal inside
@@ -122,7 +130,21 @@ def sconv_prefill(x, weight):
     back (residual INSIDE the module, in fp32, :515+:542) and downcasts to
     the input dtype. x [B, T, C]; weight (C, 1, k). The decode form (ring
     state, causal_conv1d_update :441-457) is B3.1's job; the fused Triton
-    kernel is Stage-3 work (D4)."""
+    kernel is Stage-3 work (D4).
+
+    exp-0025: with PYENGINE_FUSED_SCONV=1 (default) and a 3-D CUDA input,
+    #1-#3 run as ONE Triton kernel (kernels/sconv_prefill.py) that reads
+    the bf16 input once, does the 4-tap dot and the own-input residual in
+    fp32 registers, and stores one bf16 round into a CONTIGUOUS output.
+    Same tap order, same fp32 arithmetic, so it is BITWISE equal to the
+    chain below (t_fused_sconv arm a) — what changes is HBM traffic
+    (~36 bytes/element -> 4) and the output LAYOUT: the eager form's
+    `conv.transpose(1, 2) + xf` inherits the transposed operand's
+    channel-major strides and hands them to every downstream consumer."""
+    if _FUSED_SCONV and x.is_cuda and x.dim() == 3 and weight.dim() == 3 \
+            and weight.shape[1] == 1 and weight.shape[0] == x.shape[2]:
+        from engine.pyengine.kernels.sconv_prefill import sconv_prefill_fused
+        return sconv_prefill_fused(x, weight)
     #1. fp32 upcast — module computes everything in fp32
     xf = x.float()
     w = weight.float()

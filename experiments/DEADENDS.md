@@ -671,3 +671,17 @@ python process was reparented to PID 1 and sat on 165-177 GiB per device
 after the gate returned; `nvidia-smi --query-compute-apps` found it and a
 direct kill -9 on THAT pid took GPUs 4-7 back to 4 MiB. Always verify the
 4 MiB, never trust the job-control kill.
+<<<<<<< HEAD
+=======
+
+## Process note (exp-0024): merge commits need the [ralph] prefix too
+The engine lineage lives on branches — main has carried only spec JSONs and
+docs since 99f6bbc — so every iteration since exp-0016 builds on the accepted
+tip and merges current main in to satisfy the spec's
+`git merge-base --is-ancestor main <commit>` rule. `git merge` writes its own
+default message ("Merge branch 'main' into HEAD"), and when that merge is the
+commit the spec pins, the worker logs `WARNING: candidate commit <sha> lacks
+[ralph] prefix` (seen on exp-0022's b1a28ba and exp-0024's b6f8831; it is
+non-blocking, both ran). Use `git merge --no-edit -m "[ralph] exp(<id>): merge
+main"` so the pinned commit carries the prefix like every other one.
+>>>>>>> 839a3b5
