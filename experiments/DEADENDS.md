@@ -561,3 +561,113 @@ resident on GPUs 4-7. An iteration that finds the dispatcher "busy" for far
 longer than 13 minutes should read the worktree's serve.log BEFORE assuming
 the run is healthy; that file is the only copy of the trace and it dies with
 the worktree.
+
+## exp-0023 finding 1: the prefill traversal's ACTIVE GPU is SATURATED —
+## exp-0021 arm 2's "prefill is PYTHON-limited" is WRONG (existing evidence)
+The exp-0021 post-mortem left this open and told the next iteration what to
+run ("per-device GPU-BUSY time ... has still not been run"). It did not need
+a new run: the arm already exists in the tree, from exp-0018.
+/workspace/logs/t_pipeline_bubble_exp0018_util.log samples
+`nvidia-smi --query-gpu=utilization.gpu` every 0.4 s on GPUs 4-7 DURING the
+worker's own canonical bench of exp-0017 (accepted-lineage engine, conc 64).
+The prefill phase is the marching wave, and every sample in it reads
+92-100% on exactly ONE device and 0% on the other three (99/0/0/0,
+0/100/0/0, 0/0/100/0, 0/0/0/99, ...). utilization.gpu is the fraction of the
+sample window in which at least one kernel was resident, so a device being
+fed by a host that cannot keep up would read FAR below 100% — a traversal
+issuing ~14k ops in 696 ms with pure-dispatch gaps would show tens of
+percent, not 99%. The tail of the same log (35-40% on all four at once) is
+the decode phase and agrees from the other side: a 168 ms graphed step with
+one device active at a time is 25-42% of a 0.4 s window per device.
+So arm b's "696 ms host enqueue / 0.1 ms device tail" is exactly what the
+post-mortem's caveat predicted — the host was BLOCKING INSIDE the launch
+path of a saturated device, and 696 ms is device time seen from the host.
+CONSEQUENCES, and they re-rank the surface:
+(1) Deleting DEVICE work from the prefill traversal PAYS at face value.
+    "Delete Python from prefill" (CUDA-graphing a shape-bucketed traversal,
+    a large and memory-hungry change) is NOT the lever exp-0021 thought it
+    was and should stay unbuilt.
+(2) The binding structural loss is the same in BOTH phases: the 66 layers
+    are split [16,17,16,17] across 4 devices and walked serially, so at
+    every instant THREE of four GPUs are idle. The engine is running on
+    ~1/4 of the node's HBM bandwidth and ~1/4 of its FLOPs. That is the
+    D4 #7/#8 lever (TP / topology), it is the largest one left, and
+    nothing has attacked it yet. Microbatching the layer-split pipeline
+    is NOT the way in (exp-0021 arm 1 measured zero overlap, and the
+    reason is now visible: it issued each sub-group as a whole 4-device
+    traversal back to back, which is the serial schedule by construction —
+    a real pipeline needs per-stage issue, and under (1) the stages are
+    saturated anyway, so the honest fix is intra-layer parallelism, not
+    inter-microbatch).
+Fairness caveat, stated so nobody over-reads this: utilization.gpu is a
+kernel-resident fraction, not occupancy. A device can read 99% while its
+kernels use a fraction of its SMs. The claim this evidence supports is the
+narrow one that matters here — there is no host-side gap to reclaim in a
+prefill traversal — not that every prefill kernel is efficient.
+
+## exp-0023 groundwork: fused two-shape PREFILL attention (the prefill twin
+## of exp-0013), and why this iteration submitted no spec
+Under finding 1 the ranking question becomes "which device term in the
+prefill traversal is fat?", and prefill attention is the one part of the
+engine still running the bring-up eager chain over a materialized
+[B, heads, T, T] tensor. model.attn_prefill #3-#8 at the canonical cohort
+shape (B=6 rows, T=1536 padded, 64 heads, bf16 scores = 1.81 GB per
+tensor): rel_bias materializes the [B,H,T,E] logit mix (604 MB), gathers it
+into a [B,H,T,T] bias (1.81 GB) and masked_fills that (read+write); then
+matmul writes scores, `* scale` reads+writes them, `+ bias` reads+writes,
+`+ mask` reads+writes, softmax(dtype=fp32) writes a 3.62 GB fp32 copy and
+`.to(bf16)` reads it back, and the PV matmul reads the result — plus the
+GQA repeat_kv materializing K and V at 64 heads (302 MB/layer). That is
+~26 GB of HBM traffic per layer to produce a [B,T,H,D] output worth 19 MB,
+~1.7 TB per traversal over 66 layers, on devices finding 1 says are
+saturated. A flash-style kernel that reads K/V in place, gathers the rel
+bias in-kernel by distance and never materializes a score tile is ~1 GB per
+layer, and on the 55 SWA layers it also drops the out-of-window half of the
+QK/PV work (window 512 vs T=1536).
+The causal half is free too: the eager chain computes the whole T x T grid
+and then adds finfo.min to the upper triangle, so even the 11 global layers
+do ~2x the QK/PV work they need, and the 55 SWA layers do ~3x at T=1536
+(window 512). The kernel simply never visits those tiles.
+FOUND BY THE CPU PRE-GATE, and it is load-bearing for the kernel: K and V
+do NOT arrive at attention in a [.., .., T, head_dim]-contiguous layout.
+sconv_prefill returns `conv.transpose(1,2) + xf`, and that add keeps the
+channel-major layout of its non-contiguous operand, so post-sconv K/V carry
+strides (96, 12288, 1, 96) at [B,HK,T,D] — stride 1 along T, stride T along
+head_dim (t_fused_prefill_attn arm b, run on the engine's own ops). The
+first draft of the kernel asserted last-dim contiguity and tripped on it;
+it now takes explicit head_dim strides for q/k/v and requires contiguity
+only of the rel mix (which comes from a matmul and has it). The same fact
+says the eager chain's matmul is paying a contiguity copy on K and V that
+the fused path deletes as well — the prefill twin of the 128 ms/step of
+`direct_copy` exp-0013 found on the decode side.
+THE SESSION STARTED WITH NO GPU AT ALL — the dispatcher was running
+exp-0022 on GPUs 4-7 (203-213 GiB per device) and GPUs 0-3 hold the frozen
+vLLM baseline (254 GiB, 4-day resident, off-limits by the hard rule) — so
+the kernel was written and pre-gated on CPU first, and this section was
+originally written to say no spec would be submitted. GPUs 4-7 FREED AT
+18:58 when exp-0022 finished (accepted, 353.6 tok/s), and the GPU arms, the
+in-situ arm and the D13 gate all fit in the remaining budget, so exp-0023
+WAS submitted. The CPU-first order is worth keeping as a habit anyway: it
+caught a real bug before any GPU time was spent (below), and the CPU arms
+are GREEN
+(/workspace/logs/t_fused_prefill_attn_exp0023_sim.log): a literal torch
+transcription of the kernel — same block bounds, same distance/band/mask
+expressions, same online-softmax update — matches the engine's own eager
+chain in fp32 to 4.8e-07 on both layer shapes (arm a), padded rows are
+bit-exact against the same rows run alone with garbage pads left in place
+(arm c), tau-on-the-mix equals tau-on-the-gathered-bias with the floor
+lowered so tau actually varies (arm d, 1.000-1.249), the kernel's mask
+predicate is bitwise additive_causal_mask's for both window forms (arm e),
+and the eager call site still runs end to end with the switch off (arm d2).
+What the CPU arms could NOT cover — Triton codegen, tile choice, the real
+bf16 drift, every timing claim — the GPU arms then did, and all of it is in
+the exp-0023 spec: isolated 12.0x (SWA) / 3.5x (global) per layer, IN SITU
+1.32x on the mixed step, D13 gate green and CLOSER to the goldens than the
+accepted lineage (delta_mean 0.052153 vs 0.056637).
+ONE OPERATIONAL TRAP, recorded because exp-0018's post-mortem says a leaked
+server destroys the NEXT experiment: killing the shell job that launched
+`nohup python -m engine.pyengine.server` did NOT kill the server. The
+python process was reparented to PID 1 and sat on 165-177 GiB per device
+after the gate returned; `nvidia-smi --query-compute-apps` found it and a
+direct kill -9 on THAT pid took GPUs 4-7 back to 4 MiB. Always verify the
+4 MiB, never trust the job-control kill.
